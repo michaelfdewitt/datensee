@@ -1,6 +1,6 @@
 plugins {
     java
-    id("com.github.johnrengelman.shadow") version "8.1.1"
+    id("com.gradleup.shadow") version "8.3.6"
     checkstyle
 }
 
@@ -62,6 +62,7 @@ tasks.shadowJar {
     archiveBaseName.set("gee-df-pipeline")
     archiveClassifier.set("")
     archiveVersion.set(version.toString())
+    isZip64 = true
     mergeServiceFiles()
     manifest {
         attributes["Main-Class"] = "com.geedf.GeeDataflowPipeline"
