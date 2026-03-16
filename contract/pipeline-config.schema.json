@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/gee-df/contract/pipeline-config.schema.json",
+  "title": "PipelineConfig",
+  "description": "Contract between the Python CLI and the Java Beam pipeline.",
+  "type": "object",
+  "required": ["ee_expression", "tile_grid", "output"],
+  "additionalProperties": false,
+  "properties": {
+    "ee_expression": {
+      "type": "string",
+      "description": "Serialized Earth Engine computation (opaque JSON string). Never interpreted by the pipeline."
+    },
+    "tile_grid": {
+      "type": "object",
+      "required": ["crs", "scale_meters", "tiles"],
+      "additionalProperties": false,
+      "properties": {
+        "crs": {
+          "type": "string",
+          "description": "EPSG code or proj string, e.g. 'EPSG:4326'."
+        },
+        "scale_meters": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Pixel size in meters."
+        },
+        "tiles": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["x_min", "y_min", "x_max", "y_max", "row", "col"],
+            "additionalProperties": false,
+            "properties": {
+              "x_min": { "type": "number" },
+              "y_min": { "type": "number" },
+              "x_max": { "type": "number" },
+              "y_max": { "type": "number" },
+              "row":   { "type": "integer", "minimum": 0 },
+              "col":   { "type": "integer", "minimum": 0 }
+            }
+          }
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "required": ["gcs_path"],
+      "additionalProperties": false,
+      "properties": {
+        "gcs_path": {
+          "type": "string",
+          "pattern": "^gs://",
+          "description": "GCS URI prefix for output files."
+        },
+        "cog": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "overview_levels": {
+              "type": "array",
+              "items": { "type": "integer", "minimum": 2 },
+              "default": [2, 4, 8, 16, 32]
+            },
+            "blocksize": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 512
+            },
+            "compress": {
+              "type": "string",
+              "enum": ["lzw", "deflate", "zstd", "none"],
+              "default": "lzw"
+            },
+            "predictor": {
+              "type": "integer",
+              "enum": [1, 2, 3],
+              "default": 2
+            }
+          }
+        }
+      }
+    },
+    "runner": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["local", "dataflow"],
+          "default": "local"
+        },
+        "dataflow": {
+          "type": "object",
+          "required": ["project", "region", "temp_location", "staging_location"],
+          "additionalProperties": false,
+          "properties": {
+            "project":           { "type": "string" },
+            "region":            { "type": "string" },
+            "temp_location":     { "type": "string", "pattern": "^gs://" },
+            "staging_location":  { "type": "string", "pattern": "^gs://" },
+            "machine_type":      { "type": "string", "default": "n2-standard-4" },
+            "max_workers":       { "type": "integer", "minimum": 1, "default": 100 },
+            "service_account_email": { "type": "string" },
+            "network":           { "type": "string" },
+            "subnetwork":        { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

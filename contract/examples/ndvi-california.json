@@ -1,0 +1,25 @@
+{
+  "ee_expression": "{\"result\":\"0\",\"values\":{\"0\":{\"functionInvocationValue\":{\"functionName\":\"Image.normalizedDifference\",\"arguments\":{\"input\":{\"functionInvocationValue\":{\"functionName\":\"Image.select\",\"arguments\":{\"input\":{\"functionInvocationValue\":{\"functionName\":\"ImageCollection.mosaic\",\"arguments\":{\"collection\":{\"functionInvocationValue\":{\"functionName\":\"Collection.filter\",\"arguments\":{\"collection\":{\"functionInvocationValue\":{\"functionName\":\"ImageCollection.load\",\"arguments\":{\"id\":{\"constantValue\":\"LANDSAT/LC09/C02/T1_L2\"}}}},\"filter\":{\"functionInvocationValue\":{\"functionName\":\"Filter.date\",\"arguments\":{\"start\":{\"constantValue\":\"2023-06-01\"},\"end\":{\"constantValue\":\"2023-09-01\"}}}}}}}}}}}},\"bandSelectors\":{\"constantValue\":[\"SR_B5\",\"SR_B4\"]}}}}}}}",
+  "tile_grid": {
+    "crs": "EPSG:4326",
+    "scale_meters": 30.0,
+    "tiles": [
+      { "x_min": -122.5, "y_min": 37.5, "x_max": -122.0, "y_max": 38.0, "row": 0, "col": 0 },
+      { "x_min": -122.0, "y_min": 37.5, "x_max": -121.5, "y_max": 38.0, "row": 0, "col": 1 },
+      { "x_min": -122.5, "y_min": 38.0, "x_max": -122.0, "y_max": 38.5, "row": 1, "col": 0 },
+      { "x_min": -122.0, "y_min": 38.0, "x_max": -121.5, "y_max": 38.5, "row": 1, "col": 1 }
+    ]
+  },
+  "output": {
+    "gcs_path": "gs://my-bucket/exports/ndvi-california-2023",
+    "cog": {
+      "overview_levels": [2, 4, 8, 16, 32],
+      "blocksize": 512,
+      "compress": "lzw",
+      "predictor": 2
+    }
+  },
+  "runner": {
+    "mode": "local"
+  }
+}
