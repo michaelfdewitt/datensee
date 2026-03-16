@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<!DOCTYPE module PUBLIC
+    "-//Checkstyle//DTD Checkstyle Configuration 1.3//EN"
+    "https://checkstyle.org/dtds/configuration_1_3.dtd">
+<!--
+    Google Java Style Guide — trimmed to essentials.
+    Full reference: https://google.github.io/styleguide/javaguide.html
+-->
+<module name="Checker">
+    <property name="charset" value="UTF-8"/>
+    <property name="severity" value="error"/>
+    <property name="fileExtensions" value="java"/>
+
+    <module name="TreeWalker">
+        <!-- Imports -->
+        <module name="UnusedImports"/>
+        <module name="RedundantImport"/>
+        <module name="IllegalImport"/>
+
+        <!-- Naming -->
+        <module name="TypeName"/>
+        <module name="MethodName"/>
+        <module name="ParameterName"/>
+        <module name="LocalVariableName"/>
+        <module name="ConstantName"/>
+
+        <!-- Whitespace -->
+        <module name="WhitespaceAround"/>
+        <module name="NoWhitespaceAfter"/>
+        <module name="NoWhitespaceBefore"/>
+
+        <!-- Blocks -->
+        <module name="NeedBraces"/>
+        <module name="LeftCurly"/>
+        <module name="RightCurly"/>
+
+        <!-- Misc -->
+        <module name="EqualsHashCode"/>
+        <module name="SimplifyBooleanReturn"/>
+        <module name="StringLiteralEquality"/>
+    </module>
+
+    <module name="FileTabCharacter">
+        <property name="eachLine" value="true"/>
+    </module>
+    <module name="NewlineAtEndOfFile"/>
+</module>
