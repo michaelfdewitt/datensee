@@ -18,6 +18,7 @@ from datensee.config import (
     DataflowRunnerConfig,
     OutputConfig,
     PipelineConfig,
+    RateLimitConfig,
     RunnerConfig,
 )
 from datensee.expression import clip_expression
@@ -355,6 +356,14 @@ def export(
         Path,
         typer.Option("--jar", help="Path to the compiled pipeline JAR."),
     ] = _DEFAULT_JAR,
+    max_qps: Annotated[
+        int,
+        typer.Option(
+            "--max-qps",
+            help="Max queries per second to the EE HV API (shared across all workers).",
+            min=1,
+        ),
+    ] = 100,
     dry_run: Annotated[
         bool,
         typer.Option("--dry-run", help="Print the pipeline command without executing."),
@@ -417,6 +426,7 @@ def export(
         tile_grid=tile_grid,
         output=OutputConfig(output_path=output),
         runner=runner_config,
+        rate_limit=RateLimitConfig(max_qps=max_qps),
     )
 
     job_id = submit_job(pipeline_config, jar_path=jar, dry_run=dry_run)
@@ -424,6 +434,7 @@ def export(
         console.print(f"[green]Job submitted:[/green] {job_id}")
 
     if not dry_run and assemble and runner == "local" and not output.startswith("gs://"):
+        # Dataflow mode: VRT is assembled inside the pipeline (VrtAssembler.java)
         console.print("\n[bold]Assembling VRT mosaic[/bold]")
         vrt = write_vrt(pipeline_config, Path(output))
         console.print(f"  → {vrt}")

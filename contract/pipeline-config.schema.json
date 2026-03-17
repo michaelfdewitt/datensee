@@ -17,7 +17,7 @@
     },
     "tile_grid": {
       "type": "object",
-      "required": ["crs", "scale_meters", "tiles"],
+      "required": ["crs", "scale_meters"],
       "additionalProperties": false,
       "properties": {
         "crs": {
@@ -51,8 +51,16 @@
               "col":   { "type": "integer", "minimum": 0 }
             }
           }
+        },
+        "tiles_file": {
+          "type": "string",
+          "description": "GCS URI or local path to NDJSON file of tile coordinates. Mutually exclusive with 'tiles'."
         }
-      }
+      },
+      "oneOf": [
+        { "required": ["tiles"] },
+        { "required": ["tiles_file"] }
+      ]
     },
     "output": {
       "type": "object",
@@ -100,6 +108,18 @@
               "default": 2
             }
           }
+        }
+      }
+    },
+    "rate_limit": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_qps": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 100,
+          "description": "Maximum queries per second to the EE HV API across all workers."
         }
       }
     },

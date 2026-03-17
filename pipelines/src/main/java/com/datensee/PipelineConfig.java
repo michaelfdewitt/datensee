@@ -14,7 +14,8 @@ public record PipelineConfig(
     @JsonProperty("gee_project") String geeProject,
     @JsonProperty("tile_grid") TileGridConfig tileGrid,
     @JsonProperty("output") OutputConfig output,
-    @JsonProperty("runner") RunnerConfig runner
+    @JsonProperty("runner") RunnerConfig runner,
+    @JsonProperty("rate_limit") RateLimitConfig rateLimit
 ) {
 
     /** Convenience method for logging. */
@@ -22,16 +23,27 @@ public record PipelineConfig(
         return tileGrid != null && tileGrid.tiles() != null ? tileGrid.tiles().size() : 0;
     }
 
+    /** Returns effective rate limit config with defaults. */
+    public RateLimitConfig effectiveRateLimit() {
+        return rateLimit != null ? rateLimit : new RateLimitConfig(100);
+    }
+
     /** Tile grid configuration. */
     public record TileGridConfig(
         String crs,
         @JsonProperty("scale_meters") double scaleMeters,
         @JsonProperty("tile_size_pixels") int tileSizePixels,
-        List<TileCoordinate> tiles
+        List<TileCoordinate> tiles,
+        @JsonProperty("tiles_file") String tilesFile
     ) {
         /** Returns tile size in pixels, defaulting to 512 if not set. */
         public int effectiveTileSize() {
             return tileSizePixels > 0 ? tileSizePixels : 512;
+        }
+
+        /** Whether tiles are provided via external file rather than inline. */
+        public boolean hasExternalTiles() {
+            return tilesFile != null && !tilesFile.isBlank();
         }
     }
 
@@ -59,13 +71,23 @@ public record PipelineConfig(
         int blocksize,
         String compress,
         int predictor
-    ) {}
+    ) { }
+
+    /** Rate limiting configuration. */
+    public record RateLimitConfig(
+        @JsonProperty("max_qps") int maxQps
+    ) {
+        /** Returns QPS, defaulting to 100 if not set. */
+        public int effectiveMaxQps() {
+            return maxQps > 0 ? maxQps : 100;
+        }
+    }
 
     /** Runner mode. */
     public record RunnerConfig(
         String mode,
         @JsonProperty("dataflow") DataflowConfig dataflow
-    ) {}
+    ) { }
 
     /** Dataflow-specific runner options. */
     public record DataflowConfig(
@@ -75,5 +97,5 @@ public record PipelineConfig(
         @JsonProperty("staging_location") String stagingLocation,
         @JsonProperty("machine_type") String machineType,
         @JsonProperty("max_workers") int maxWorkers
-    ) {}
+    ) { }
 }

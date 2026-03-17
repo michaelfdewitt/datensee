@@ -30,12 +30,27 @@ class TileGrid(BaseModel):
     crs: str = Field(description="EPSG code or proj string, e.g. 'EPSG:4326'")
     scale_meters: float = Field(gt=0, description="Pixel size in meters at the native CRS")
     tile_size_pixels: int = Field(default=512, gt=0, description="Tile edge length in pixels")
-    tiles: list[TileCoordinate]
+    tiles: list[TileCoordinate] | None = Field(
+        default=None,
+        description="Inline tile coordinates (mutually exclusive with tiles_file)",
+    )
+    tiles_file: str | None = Field(
+        default=None,
+        description="GCS URI or local path to NDJSON file of tile coordinates",
+    )
 
     @model_validator(mode="after")
-    def tiles_not_empty(self) -> TileGrid:
-        if not self.tiles:
-            raise ValueError("TileGrid must contain at least one tile")
+    def exactly_one_tile_source(self) -> TileGrid:
+        has_inline = self.tiles is not None and len(self.tiles) > 0
+        has_file = self.tiles_file is not None and self.tiles_file.strip() != ""
+        if not has_inline and not has_file:
+            raise ValueError(
+                "TileGrid must have either inline tiles or a tiles_file path"
+            )
+        if has_inline and has_file:
+            raise ValueError(
+                "TileGrid cannot have both inline tiles and tiles_file — use one or the other"
+            )
         return self
 
 
@@ -66,6 +81,16 @@ class OutputConfig(BaseModel):
         "float32", "float64", "int16", "int32", "uint8", "uint16"
     ] = Field(default="float32", description="Pixel data type for output raster")
     cog: CogParameters = Field(default_factory=CogParameters)
+
+
+class RateLimitConfig(BaseModel):
+    """Rate limiting for the EE High Volume API."""
+
+    max_qps: int = Field(
+        default=100,
+        gt=0,
+        description="Maximum queries per second across all workers",
+    )
 
 
 class DataflowRunnerConfig(BaseModel):
@@ -111,6 +136,7 @@ class PipelineConfig(BaseModel):
     tile_grid: TileGrid
     output: OutputConfig
     runner: RunnerConfig = Field(default_factory=RunnerConfig)
+    rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
 
     @model_validator(mode="after")
     def ee_expression_is_valid_json(self) -> PipelineConfig:
@@ -124,7 +150,7 @@ class PipelineConfig(BaseModel):
 
     def write_json(self, path: Path) -> None:
         """Serialize config to JSON file for handoff to the Java pipeline."""
-        path.write_text(self.model_dump_json(indent=2))
+        path.write_text(self.model_dump_json(indent=2, exclude_none=True))
 
     @classmethod
     def read_json(cls, path: Path) -> PipelineConfig:

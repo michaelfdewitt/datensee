@@ -1,12 +1,13 @@
 package com.datensee;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
-import java.util.List;
 import org.junit.jupiter.api.Test;
 
 /** Tests for PipelineConfig JSON deserialization. */
@@ -48,6 +49,7 @@ class PipelineConfigTest {
         assertEquals(1, config.output().effectiveBandCount());
         assertEquals("float32", config.output().effectiveDataType());
         assertEquals("local", config.runner().mode());
+        assertFalse(config.tileGrid().hasExternalTiles());
     }
 
     @Test
@@ -86,6 +88,9 @@ class PipelineConfigTest {
                   "machine_type": "n2-standard-8",
                   "max_workers": 50
                 }
+              },
+              "rate_limit": {
+                "max_qps": 200
               }
             }
             """;
@@ -103,6 +108,7 @@ class PipelineConfigTest {
         assertEquals("dataflow", config.runner().mode());
         assertNotNull(config.runner().dataflow());
         assertEquals(50, config.runner().dataflow().maxWorkers());
+        assertEquals(200, config.rateLimit().effectiveMaxQps());
     }
 
     @Test
@@ -152,5 +158,50 @@ class PipelineConfigTest {
         PipelineConfig config = MAPPER.readValue(json, PipelineConfig.class);
         assertEquals(1, config.output().effectiveBandCount());
         assertEquals("float32", config.output().effectiveDataType());
+    }
+
+    @Test
+    void defaultsForMissingRateLimit() throws Exception {
+        String json = """
+            {
+              "ee_expression": "{}",
+              "gee_project": "p",
+              "tile_grid": {
+                "crs": "EPSG:4326",
+                "scale_meters": 30.0,
+                "tiles": [
+                  {"x_min": 0, "y_min": 0, "x_max": 1, "y_max": 1, "row": 0, "col": 0}
+                ]
+              },
+              "output": { "output_path": "/tmp/out" },
+              "runner": { "mode": "local" }
+            }
+            """;
+
+        PipelineConfig config = MAPPER.readValue(json, PipelineConfig.class);
+        assertNull(config.rateLimit());
+        assertEquals(100, config.effectiveRateLimit().effectiveMaxQps());
+    }
+
+    @Test
+    void deserializesFileTilesConfig() throws Exception {
+        String json = """
+            {
+              "ee_expression": "{}",
+              "gee_project": "p",
+              "tile_grid": {
+                "crs": "EPSG:4326",
+                "scale_meters": 30.0,
+                "tiles_file": "gs://bucket/tiles.ndjson"
+              },
+              "output": { "output_path": "gs://bucket/output" },
+              "runner": { "mode": "local" }
+            }
+            """;
+
+        PipelineConfig config = MAPPER.readValue(json, PipelineConfig.class);
+        assertTrue(config.tileGrid().hasExternalTiles());
+        assertEquals("gs://bucket/tiles.ndjson", config.tileGrid().tilesFile());
+        assertNull(config.tileGrid().tiles());
     }
 }

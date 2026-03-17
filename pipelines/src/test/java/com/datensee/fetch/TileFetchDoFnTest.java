@@ -1,7 +1,9 @@
 package com.datensee.fetch;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.datensee.TileCoordinate;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -9,7 +11,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import java.lang.reflect.Method;
 import org.junit.jupiter.api.Test;
 
-/** Tests for TileFetchDoFn request body construction. */
+/** Tests for TileFetchDoFn request body construction and EeApiException classification. */
 class TileFetchDoFnTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -19,7 +21,9 @@ class TileFetchDoFnTest {
             "{\"result\":\"0\",\"values\":{}}",
             "test-project",
             256,
-            crs
+            crs,
+            100.0,
+            1
         );
         Method method = TileFetchDoFn.class.getDeclaredMethod(
             "buildRequestBody", TileCoordinate.class
@@ -78,5 +82,52 @@ class TileFetchDoFnTest {
         assertEquals(4202560.0, affine.get("translateY").asDouble());
         assertEquals(10.0, affine.get("scaleX").asDouble(), 0.001);
         assertEquals(-10.0, affine.get("scaleY").asDouble(), 0.001);
+    }
+
+    // --- EeApiException classification tests ---
+
+    @Test
+    void rateLimited429IsRetryable() {
+        EeApiException ex = new EeApiException(429, "tile[r=0,c=0]", "rate limited");
+        assertTrue(ex.isRetryable());
+        assertEquals(429, ex.httpStatus());
+    }
+
+    @Test
+    void serviceUnavailable503IsRetryable() {
+        EeApiException ex = new EeApiException(503, "tile[r=0,c=0]", "unavailable");
+        assertTrue(ex.isRetryable());
+    }
+
+    @Test
+    void other5xxIsRetryable() {
+        EeApiException ex = new EeApiException(502, "tile[r=0,c=0]", "bad gateway");
+        assertTrue(ex.isRetryable());
+    }
+
+    @Test
+    void badRequest400IsNotRetryable() {
+        EeApiException ex = new EeApiException(400, "tile[r=0,c=0]", "bad request");
+        assertFalse(ex.isRetryable());
+    }
+
+    @Test
+    void forbidden403IsNotRetryable() {
+        EeApiException ex = new EeApiException(403, "tile[r=0,c=0]", "forbidden");
+        assertFalse(ex.isRetryable());
+    }
+
+    @Test
+    void notFound404IsNotRetryable() {
+        EeApiException ex = new EeApiException(404, "tile[r=0,c=0]", "not found");
+        assertFalse(ex.isRetryable());
+    }
+
+    @Test
+    void truncatesLongResponseBody() {
+        String longBody = "x".repeat(1000);
+        EeApiException ex = new EeApiException(500, "tile[r=0,c=0]", longBody);
+        assertTrue(ex.truncatedBody().length() <= 500);
+        assertTrue(ex.getMessage().length() < longBody.length());
     }
 }

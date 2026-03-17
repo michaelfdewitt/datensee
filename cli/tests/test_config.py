@@ -11,6 +11,7 @@ from datensee.config import (
     DataflowRunnerConfig,
     OutputConfig,
     PipelineConfig,
+    RateLimitConfig,
     RunnerConfig,
     TileCoordinate,
     TileGrid,
@@ -37,8 +38,33 @@ def test_minimal_config_is_valid() -> None:
 
 
 def test_empty_tile_grid_raises() -> None:
-    with pytest.raises(ValidationError, match="at least one tile"):
+    with pytest.raises(ValidationError, match="either inline tiles or a tiles_file"):
         TileGrid(crs="EPSG:4326", scale_meters=30.0, tiles=[])
+
+
+def test_no_tile_source_raises() -> None:
+    with pytest.raises(ValidationError, match="either inline tiles or a tiles_file"):
+        TileGrid(crs="EPSG:4326", scale_meters=30.0)
+
+
+def test_both_tile_sources_raises() -> None:
+    with pytest.raises(ValidationError, match="cannot have both"):
+        TileGrid(
+            crs="EPSG:4326",
+            scale_meters=30.0,
+            tiles=[TileCoordinate(x_min=0, y_min=0, x_max=1, y_max=1, row=0, col=0)],
+            tiles_file="gs://bucket/tiles.ndjson",
+        )
+
+
+def test_tiles_file_config() -> None:
+    grid = TileGrid(
+        crs="EPSG:4326",
+        scale_meters=30.0,
+        tiles_file="gs://bucket/tiles.ndjson",
+    )
+    assert grid.tiles_file == "gs://bucket/tiles.ndjson"
+    assert grid.tiles is None
 
 
 def test_dataflow_mode_requires_dataflow_config() -> None:
@@ -75,6 +101,18 @@ def test_roundtrip_json_serialization() -> None:
     assert restored.runner.mode == config.runner.mode
     assert len(restored.tile_grid.tiles) == len(config.tile_grid.tiles)
 
+    path.unlink()
+
+
+def test_roundtrip_excludes_none_fields() -> None:
+    config = _minimal_config()
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        path = Path(f.name)
+
+    config.write_json(path)
+    raw = path.read_text()
+
+    assert "tiles_file" not in raw
     path.unlink()
 
 
@@ -150,3 +188,20 @@ def test_invalid_band_count_raises() -> None:
 def test_invalid_data_type_raises() -> None:
     with pytest.raises(ValidationError):
         OutputConfig(output_path="/tmp/out", data_type="complex128")
+
+
+def test_rate_limit_defaults() -> None:
+    config = _minimal_config()
+    assert config.rate_limit.max_qps == 100
+
+
+def test_rate_limit_custom() -> None:
+    config = _minimal_config().model_copy(
+        update={"rate_limit": RateLimitConfig(max_qps=50)}
+    )
+    assert config.rate_limit.max_qps == 50
+
+
+def test_rate_limit_invalid_zero() -> None:
+    with pytest.raises(ValidationError):
+        RateLimitConfig(max_qps=0)

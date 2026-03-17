@@ -13,4 +13,4 @@ public record FetchedTile(
     byte[] imageBytes,
     int widthPixels,
     int heightPixels
-) implements Serializable {}
+) implements Serializable { }

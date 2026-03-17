@@ -2,16 +2,23 @@ package com.datensee;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import com.datensee.fetch.TileFetchDoFn;
 import com.datensee.fetch.TileFetchTransform;
 import com.datensee.io.CogWriter;
+import com.datensee.io.FailedTileWriter;
+import com.datensee.io.TileCoordinateParser;
+import com.datensee.io.VrtAssembler;
 import com.datensee.options.DatensEEOptions;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import org.apache.beam.sdk.Pipeline;
+import org.apache.beam.sdk.io.TextIO;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.transforms.Create;
+import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.PCollectionTuple;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -21,6 +28,9 @@ import org.slf4j.LoggerFactory;
  * <p>Reads a {@code pipeline-config.json} describing the EE computation,
  * tile grid, and output destination; then orchestrates distributed tile
  * fetching via the Earth Engine High Volume API and COG assembly.
+ *
+ * <p>M3 features: partial failure tolerance (dead-letter), per-worker rate
+ * limiting, smart retry classification, file-based tile input, VRT assembly.
  */
 public final class DatensEEPipeline {
 
@@ -28,7 +38,7 @@ public final class DatensEEPipeline {
     private static final ObjectMapper MAPPER = new ObjectMapper()
         .registerModule(new JavaTimeModule());
 
-    private DatensEEPipeline() {}
+    private DatensEEPipeline() { }
 
     public static void main(String[] args) throws IOException {
         DatensEEOptions options = PipelineOptionsFactory
@@ -50,36 +60,98 @@ public final class DatensEEPipeline {
 
         int tileSize = config.tileGrid().effectiveTileSize();
         String crs = config.tileGrid().crs();
+        PipelineConfig.RateLimitConfig rateLimit = config.effectiveRateLimit();
+        int maxWorkers = resolveMaxWorkers(config);
 
         LOG.info(
-            "Pipeline config: project={}, tiles={}, tileSize={}px, crs={}, output={}",
+            "Pipeline config: project={}, tiles={}, tileSize={}px, crs={}, "
+            + "output={}, maxQps={}, maxWorkers={}",
             config.geeProject(),
-            config.tileCount(),
+            config.tileGrid().hasExternalTiles() ? "(file)" : config.tileCount(),
             tileSize,
             crs,
-            config.output().outputPath()
+            config.output().outputPath(),
+            rateLimit.effectiveMaxQps(),
+            maxWorkers
         );
 
         Pipeline pipeline = Pipeline.create(options);
 
-        PCollection<TileCoordinate> tiles = pipeline.apply(
-            "CreateTiles",
-            Create.of(config.tileGrid().tiles())
-        );
+        // --- Tile source: inline or file-based ---
+        PCollection<TileCoordinate> tiles;
+        if (config.tileGrid().hasExternalTiles()) {
+            LOG.info("Reading tiles from file: {}", config.tileGrid().tilesFile());
+            tiles = pipeline
+                .apply("ReadTileFile", TextIO.read().from(config.tileGrid().tilesFile()))
+                .apply("ParseTileCoordinates", ParDo.of(new TileCoordinateParser()));
+        } else {
+            tiles = pipeline.apply(
+                "CreateTiles",
+                Create.of(config.tileGrid().tiles())
+            );
+        }
 
-        PCollection<FetchedTile> fetched = tiles.apply(
+        // --- Fetch tiles with dead-letter support ---
+        PCollectionTuple fetchResult = tiles.apply(
             "FetchTiles",
             new TileFetchTransform(
-                config.eeExpression(), config.geeProject(), tileSize, crs
+                config.eeExpression(), config.geeProject(), tileSize, crs,
+                rateLimit.effectiveMaxQps(), maxWorkers
             )
         );
 
+        PCollection<FetchedTile> fetched = fetchResult.get(TileFetchDoFn.SUCCESS_TAG);
+        PCollection<TileCoordinate> failed = fetchResult.get(TileFetchDoFn.FAILED_TAG);
+
+        // --- Write successful tiles ---
         fetched.apply(
             "WriteTiles",
             new CogWriter(config.output().outputPath())
         );
 
+        // --- Write failure report ---
+        String failuresPath = failuresOutputPath(config.output().outputPath());
+        failed
+            .apply("FormatFailedTiles", ParDo.of(new FailedTileWriter()))
+            .apply("WriteFailures", TextIO.write()
+                .to(failuresPath)
+                .withoutSharding()
+                .withSuffix(".json"));
+
+        // --- VRT assembly (Dataflow mode) ---
+        boolean isDataflow = config.runner() != null
+            && "dataflow".equals(config.runner().mode());
+        if (isDataflow) {
+            fetched.apply(
+                "AssembleVrt",
+                new VrtAssembler(
+                    config.output().outputPath(),
+                    crs,
+                    config.output().effectiveBandCount(),
+                    config.output().effectiveDataType(),
+                    tileSize
+                )
+            );
+        }
+
         pipeline.run().waitUntilFinish();
+    }
+
+    private static int resolveMaxWorkers(PipelineConfig config) {
+        if (config.runner() != null
+            && config.runner().dataflow() != null
+            && config.runner().dataflow().maxWorkers() > 0) {
+            return config.runner().dataflow().maxWorkers();
+        }
+        // Local runner: single JVM, typically 1 effective worker
+        return 1;
+    }
+
+    private static String failuresOutputPath(String outputPath) {
+        if (outputPath.endsWith("/")) {
+            return outputPath + "_failures";
+        }
+        return outputPath + "/_failures";
     }
 
     private static PipelineConfig loadConfig(String configFile) throws IOException {
@@ -94,11 +166,15 @@ public final class DatensEEPipeline {
                 + "with the Earth Engine API enabled."
             );
         }
-        if (config.tileGrid() == null || config.tileGrid().tiles() == null
-            || config.tileGrid().tiles().isEmpty()) {
+        boolean hasInlineTiles = config.tileGrid() != null
+            && config.tileGrid().tiles() != null
+            && !config.tileGrid().tiles().isEmpty();
+        boolean hasFileTiles = config.tileGrid() != null
+            && config.tileGrid().hasExternalTiles();
+        if (!hasInlineTiles && !hasFileTiles) {
             throw new IllegalArgumentException(
-                "tile_grid must contain at least one tile. Check that the region "
-                + "intersects the tile grid."
+                "tile_grid must contain either inline tiles or a tiles_file path. "
+                + "Check that the region intersects the tile grid."
             );
         }
         if (config.output() == null || config.output().outputPath() == null
