@@ -28,7 +28,7 @@ app = typer.Typer(
 console = Console()
 
 _DEFAULT_JAR = (
-    Path(__file__).parents[5] / "pipelines" / "build" / "libs" / "datensee-pipeline.jar"
+    Path(__file__).parents[3] / "pipelines" / "build" / "libs" / "datensee-pipeline.jar"
 )
 
 # ---------------------------------------------------------------------------
@@ -36,7 +36,11 @@ _DEFAULT_JAR = (
 # ---------------------------------------------------------------------------
 
 # Landsat 9 summer-2023 NDVI, serialized EE expression.
-# Regenerate with: ee.serializer.encode(image, for_cloud=True)
+# Generated with: ee.serializer.encode(image, for_cloud_api=True) where:
+#   image = (ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+#            .filterDate('2023-06-01', '2023-09-01')
+#            .median()
+#            .normalizedDifference(['SR_B5', 'SR_B4']))
 _DEMO_EXPRESSION = json.dumps(
     {
         "result": "0",
@@ -45,41 +49,57 @@ _DEMO_EXPRESSION = json.dumps(
                 "functionInvocationValue": {
                     "functionName": "Image.normalizedDifference",
                     "arguments": {
-                        "input": {"valueReference": "1"},
                         "bandNames": {"constantValue": ["SR_B5", "SR_B4"]},
+                        "input": {
+                            "functionInvocationValue": {
+                                "functionName": "reduce.median",
+                                "arguments": {
+                                    "collection": {
+                                        "functionInvocationValue": {
+                                            "functionName": "Collection.filter",
+                                            "arguments": {
+                                                "collection": {
+                                                    "functionInvocationValue": {
+                                                        "functionName": "ImageCollection.load",
+                                                        "arguments": {
+                                                            "id": {
+                                                                "constantValue": "LANDSAT/LC09/C02/T1_L2"
+                                                            }
+                                                        },
+                                                    }
+                                                },
+                                                "filter": {
+                                                    "functionInvocationValue": {
+                                                        "functionName": "Filter.dateRangeContains",
+                                                        "arguments": {
+                                                            "leftValue": {
+                                                                "functionInvocationValue": {
+                                                                    "functionName": "DateRange",
+                                                                    "arguments": {
+                                                                        "end": {
+                                                                            "constantValue": "2023-09-01"
+                                                                        },
+                                                                        "start": {
+                                                                            "constantValue": "2023-06-01"
+                                                                        },
+                                                                    },
+                                                                }
+                                                            },
+                                                            "rightField": {
+                                                                "constantValue": "system:time_start"
+                                                            },
+                                                        },
+                                                    }
+                                                },
+                                            },
+                                        }
+                                    }
+                                },
+                            }
+                        },
                     },
                 }
-            },
-            "1": {
-                "functionInvocationValue": {
-                    "functionName": "ImageCollection.mosaic",
-                    "arguments": {"collection": {"valueReference": "2"}},
-                }
-            },
-            "2": {
-                "functionInvocationValue": {
-                    "functionName": "Collection.filter",
-                    "arguments": {
-                        "collection": {"valueReference": "3"},
-                        "filter": {"valueReference": "4"},
-                    },
-                }
-            },
-            "3": {
-                "functionInvocationValue": {
-                    "functionName": "ImageCollection.load",
-                    "arguments": {"id": {"constantValue": "LANDSAT/LC09/C02/T1_L2"}},
-                }
-            },
-            "4": {
-                "functionInvocationValue": {
-                    "functionName": "Filter.date",
-                    "arguments": {
-                        "start": {"constantValue": "2023-06-01"},
-                        "end": {"constantValue": "2023-09-01"},
-                    },
-                }
-            },
+            }
         },
     }
 )

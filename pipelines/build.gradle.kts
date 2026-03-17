@@ -61,7 +61,7 @@ tasks.test {
 tasks.shadowJar {
     archiveBaseName.set("datensee-pipeline")
     archiveClassifier.set("")
-    archiveVersion.set(version.toString())
+    archiveVersion.set("")
     isZip64 = true
     mergeServiceFiles()
     manifest {

@@ -70,7 +70,7 @@ public final class DatensEEPipeline {
 
         fetched.apply(
             "WriteTiles",
-            new CogWriter(config.output())
+            new CogWriter(config.output().outputPath())
         );
 
         pipeline.run().waitUntilFinish();

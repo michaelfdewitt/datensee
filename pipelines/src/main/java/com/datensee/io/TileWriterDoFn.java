@@ -1,7 +1,6 @@
 package com.datensee.io;
 
 import com.datensee.FetchedTile;
-import com.datensee.PipelineConfig.OutputConfig;
 import com.google.cloud.storage.BlobId;
 import com.google.cloud.storage.BlobInfo;
 import com.google.cloud.storage.Storage;
@@ -17,7 +16,7 @@ import org.slf4j.LoggerFactory;
 /**
  * Writes a single fetched tile to either GCS or the local filesystem.
  *
- * <p>Routing: if {@code output_path} starts with {@code gs://}, writes to GCS.
+ * <p>Routing: if {@code outputPath} starts with {@code gs://}, writes to GCS.
  * Otherwise, treats it as a local directory path (useful for Direct runner
  * local testing without requiring GCS credentials).
  *
@@ -29,18 +28,17 @@ public final class TileWriterDoFn extends DoFn<FetchedTile, Void> {
 
     private static final Logger LOG = LoggerFactory.getLogger(TileWriterDoFn.class);
 
-    private final OutputConfig outputConfig;
+    private final String outputPath;
 
-    // GCS client is transient; not needed for local writes and only initialized if needed.
     private transient Storage storage;
 
-    public TileWriterDoFn(OutputConfig outputConfig) {
-        this.outputConfig = outputConfig;
+    public TileWriterDoFn(String outputPath) {
+        this.outputPath = outputPath;
     }
 
     @Setup
     public void setup() {
-        if (outputConfig.outputPath().startsWith("gs://")) {
+        if (outputPath.startsWith("gs://")) {
             storage = StorageOptions.getDefaultInstance().getService();
         }
     }
@@ -53,7 +51,7 @@ public final class TileWriterDoFn extends DoFn<FetchedTile, Void> {
             tile.coordinate().col()
         );
 
-        if (outputConfig.outputPath().startsWith("gs://")) {
+        if (outputPath.startsWith("gs://")) {
             writeToGcs(tile, tifName);
         } else {
             writeToLocal(tile, tifName);
@@ -61,7 +59,7 @@ public final class TileWriterDoFn extends DoFn<FetchedTile, Void> {
     }
 
     private void writeToGcs(FetchedTile tile, String tifName) {
-        URI gcsUri = URI.create(outputConfig.outputPath());
+        URI gcsUri = URI.create(outputPath);
         String bucket = gcsUri.getHost();
         String prefix = gcsUri.getPath().replaceFirst("^/", "");
         String blobName = prefix.isEmpty() ? tifName : prefix + "/" + tifName;
@@ -79,7 +77,7 @@ public final class TileWriterDoFn extends DoFn<FetchedTile, Void> {
     }
 
     private void writeToLocal(FetchedTile tile, String tifName) throws IOException {
-        Path outDir = Path.of(outputConfig.outputPath());
+        Path outDir = Path.of(outputPath);
         Files.createDirectories(outDir);
         Path dest = outDir.resolve(tifName);
         Files.write(dest, tile.imageBytes());

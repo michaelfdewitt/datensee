@@ -58,3 +58,4 @@ credentials.json
 
 # Dataflow staging artifacts
 dataflow-staging/
+cli/m1-output/

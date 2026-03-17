@@ -109,6 +109,7 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
             .uri(URI.create(String.format(HV_ENDPOINT, geeProject)))
             .header("Content-Type", "application/json")
             .header("Authorization", "Bearer " + token)
+            .header("x-goog-user-project", geeProject)
             .POST(HttpRequest.BodyPublishers.ofString(requestBody))
             .timeout(Duration.ofSeconds(120))
             .build();
