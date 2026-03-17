@@ -11,6 +11,7 @@ import java.util.List;
  */
 public record PipelineConfig(
     @JsonProperty("ee_expression") String eeExpression,
+    @JsonProperty("gee_project") String geeProject,
     @JsonProperty("tile_grid") TileGridConfig tileGrid,
     @JsonProperty("output") OutputConfig output,
     @JsonProperty("runner") RunnerConfig runner
@@ -25,12 +26,18 @@ public record PipelineConfig(
     public record TileGridConfig(
         String crs,
         @JsonProperty("scale_meters") double scaleMeters,
+        @JsonProperty("tile_size_pixels") int tileSizePixels,
         List<TileCoordinate> tiles
-    ) {}
+    ) {
+        /** Returns tile size in pixels, defaulting to 512 if not set. */
+        public int effectiveTileSize() {
+            return tileSizePixels > 0 ? tileSizePixels : 512;
+        }
+    }
 
     /** Output destination and COG parameters. */
     public record OutputConfig(
-        @JsonProperty("gcs_path") String gcsPath,
+        @JsonProperty("output_path") String outputPath,
         CogConfig cog
     ) {}
 

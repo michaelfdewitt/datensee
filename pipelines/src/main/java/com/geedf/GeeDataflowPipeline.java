@@ -9,7 +9,6 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import org.apache.beam.sdk.Pipeline;
-import org.apache.beam.sdk.io.GenerateSequence;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.transforms.Create;
 import org.apache.beam.sdk.values.PCollection;
@@ -47,7 +46,15 @@ public final class GeeDataflowPipeline {
      */
     static void run(GeeDataflowOptions options) throws IOException {
         PipelineConfig config = loadConfig(options.getConfigFile());
-        LOG.info("Loaded pipeline config: {} tiles, output={}", config.tileCount(), config.output().gcsPath());
+        int tileSize = config.tileGrid().effectiveTileSize();
+
+        LOG.info(
+            "Pipeline config: project={}, tiles={}, tileSize={}px, output={}",
+            config.geeProject(),
+            config.tileCount(),
+            tileSize,
+            config.output().outputPath()
+        );
 
         Pipeline pipeline = Pipeline.create(options);
 
@@ -58,11 +65,11 @@ public final class GeeDataflowPipeline {
 
         PCollection<FetchedTile> fetched = tiles.apply(
             "FetchTiles",
-            new TileFetchTransform(config.eeExpression())
+            new TileFetchTransform(config.eeExpression(), config.geeProject(), tileSize)
         );
 
         fetched.apply(
-            "WriteCog",
+            "WriteTiles",
             new CogWriter(config.output())
         );
 

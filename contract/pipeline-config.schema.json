@@ -4,12 +4,16 @@
   "title": "PipelineConfig",
   "description": "Contract between the Python CLI and the Java Beam pipeline.",
   "type": "object",
-  "required": ["ee_expression", "tile_grid", "output"],
+  "required": ["ee_expression", "gee_project", "tile_grid", "output"],
   "additionalProperties": false,
   "properties": {
     "ee_expression": {
       "type": "string",
       "description": "Serialized Earth Engine computation (opaque JSON string). Never interpreted by the pipeline."
+    },
+    "gee_project": {
+      "type": "string",
+      "description": "GCP project ID with Earth Engine API enabled. Used in the HV API URL."
     },
     "tile_grid": {
       "type": "object",
@@ -24,6 +28,12 @@
           "type": "number",
           "exclusiveMinimum": 0,
           "description": "Pixel size in meters."
+        },
+        "tile_size_pixels": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 512,
+          "description": "Tile edge length in pixels. Must match the HV API grid dimensions."
         },
         "tiles": {
           "type": "array",
@@ -46,13 +56,12 @@
     },
     "output": {
       "type": "object",
-      "required": ["gcs_path"],
+      "required": ["output_path"],
       "additionalProperties": false,
       "properties": {
-        "gcs_path": {
+        "output_path": {
           "type": "string",
-          "pattern": "^gs://",
-          "description": "GCS URI prefix for output files."
+          "description": "Output path: GCS URI prefix (gs://…) or local directory."
         },
         "cog": {
           "type": "object",

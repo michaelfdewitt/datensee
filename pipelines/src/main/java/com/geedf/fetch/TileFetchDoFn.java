@@ -1,13 +1,18 @@
 package com.geedf.fetch;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.geedf.FetchedTile;
 import com.geedf.TileCoordinate;
+import com.google.auth.oauth2.GoogleCredentials;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.Collections;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -15,33 +20,47 @@ import org.slf4j.LoggerFactory;
 /**
  * DoFn that fetches a single tile from the EE High Volume API.
  *
- * <p>Auth: expects Application Default Credentials to be available on the worker.
- * Rate limiting: each worker self-limits via a simple sleep-based backoff.
- * TODO: Replace per-worker rate limiting with coordinated global rate limiting
- * (Beam state or Memorystore token bucket) once the basic flow works.
+ * <p>Auth: uses Application Default Credentials with the Earth Engine scope.
+ * Credentials are initialized once per worker in {@code @Setup} and refreshed
+ * as needed before each request.
+ *
+ * <p>Rate limiting: each worker uses exponential backoff with jitter on 429/503
+ * responses. Coordinated global rate limiting (Beam state or token bucket) is
+ * a TODO for M3 once we have observed real quota pressure.
  */
 public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
 
     private static final Logger LOG = LoggerFactory.getLogger(TileFetchDoFn.class);
     private static final String HV_ENDPOINT =
-        "https://earthengine-highvolume.googleapis.com/v1/projects/{project}/image:computePixels";
+        "https://earthengine-highvolume.googleapis.com/v1/projects/%s/image:computePixels";
+    private static final String EE_SCOPE = "https://www.googleapis.com/auth/earthengine";
     private static final int MAX_RETRIES = 5;
     private static final Duration INITIAL_BACKOFF = Duration.ofSeconds(1);
 
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
     private final String eeExpression;
+    private final String geeProject;
+    private final int tileSizePixels;
 
-    // Transient so Beam can serialize this DoFn without capturing the HttpClient.
+    // Transient: not serialized by Beam; recreated on each worker in @Setup.
     private transient HttpClient httpClient;
+    private transient GoogleCredentials credentials;
 
-    public TileFetchDoFn(String eeExpression) {
+    public TileFetchDoFn(String eeExpression, String geeProject, int tileSizePixels) {
         this.eeExpression = eeExpression;
+        this.geeProject = geeProject;
+        this.tileSizePixels = tileSizePixels;
     }
 
     @Setup
-    public void setup() {
+    public void setup() throws IOException {
+        credentials = GoogleCredentials.getApplicationDefault()
+            .createScoped(Collections.singleton(EE_SCOPE));
         httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(30))
             .build();
+        LOG.info("Worker setup complete: ADC credentials initialized for project={}", geeProject);
     }
 
     @ProcessElement
@@ -50,8 +69,7 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
         OutputReceiver<FetchedTile> out
     ) throws IOException, InterruptedException {
         byte[] imageBytes = fetchWithRetry(tile);
-        // TODO: parse width/height from GeoTIFF header instead of hardcoding.
-        out.output(new FetchedTile(tile, imageBytes, 512, 512));
+        out.output(new FetchedTile(tile, imageBytes, tileSizePixels, tileSizePixels));
     }
 
     private byte[] fetchWithRetry(TileCoordinate tile)
@@ -64,9 +82,13 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
                 return fetchTile(tile);
             } catch (IOException e) {
                 lastException = e;
-                LOG.warn("{}: fetch attempt {}/{} failed: {}", tile.id(), attempt, MAX_RETRIES, e.getMessage());
+                LOG.warn(
+                    "{}: attempt {}/{} failed: {}",
+                    tile.id(), attempt, MAX_RETRIES, e.getMessage()
+                );
                 if (attempt < MAX_RETRIES) {
-                    Thread.sleep(backoff.toMillis());
+                    long jitter = (long) (Math.random() * backoff.toMillis() * 0.2);
+                    Thread.sleep(backoff.toMillis() + jitter);
                     backoff = backoff.multipliedBy(2);
                 }
             }
@@ -79,14 +101,14 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
     }
 
     private byte[] fetchTile(TileCoordinate tile) throws IOException, InterruptedException {
-        // TODO: Replace placeholder with real EE HV API request body.
-        // See: https://developers.google.com/earth-engine/reference/rest/v1/projects.image/computePixels
+        credentials.refreshIfExpired();
+        String token = credentials.getAccessToken().getTokenValue();
         String requestBody = buildRequestBody(tile);
 
         HttpRequest request = HttpRequest.newBuilder()
-            .uri(URI.create(HV_ENDPOINT.replace("{project}", "earthengine-public")))
+            .uri(URI.create(String.format(HV_ENDPOINT, geeProject)))
             .header("Content-Type", "application/json")
-            // TODO: Add Authorization header using ADC token.
+            .header("Authorization", "Bearer " + token)
             .POST(HttpRequest.BodyPublishers.ofString(requestBody))
             .timeout(Duration.ofSeconds(120))
             .build();
@@ -96,43 +118,63 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
             HttpResponse.BodyHandlers.ofByteArray()
         );
 
-        if (response.statusCode() != 200) {
+        int status = response.statusCode();
+        if (status == 429 || status == 503) {
+            // Surface as IOException so retry logic handles it.
             throw new IOException(
-                String.format("EE HV API returned HTTP %d for %s", response.statusCode(), tile.id())
+                String.format("EE HV API rate-limited (HTTP %d) for %s", status, tile.id())
+            );
+        }
+        if (status != 200) {
+            String body = new String(response.body());
+            throw new IOException(
+                String.format(
+                    "EE HV API returned HTTP %d for %s: %s",
+                    status, tile.id(), body.length() > 200 ? body.substring(0, 200) : body
+                )
             );
         }
 
+        LOG.debug("{}: fetched {} bytes", tile.id(), response.body().length);
         return response.body();
     }
 
-    private String buildRequestBody(TileCoordinate tile) {
-        // TODO: Build proper EE computePixels request body.
-        // The eeExpression is passed as-is; EE evaluates it bounded to this tile.
-        return String.format(
-            """
-            {
-              "expression": %s,
-              "fileFormat": "GEO_TIFF",
-              "bandIds": [],
-              "grid": {
-                "dimensions": { "width": 512, "height": 512 },
-                "affineTransform": {
-                  "scaleX": %f,
-                  "shearX": 0,
-                  "translateX": %f,
-                  "shearY": 0,
-                  "scaleY": %f,
-                  "translateY": %f
-                },
-                "crsCode": "EPSG:4326"
-              }
-            }
-            """,
-            eeExpression,
-            (tile.xMax() - tile.xMin()) / 512.0,
-            tile.xMin(),
-            -(tile.yMax() - tile.yMin()) / 512.0,
-            tile.yMax()
-        );
+    /**
+     * Build the EE computePixels JSON request body using Jackson.
+     *
+     * <p>The {@code eeExpression} is a JSON string containing the serialized
+     * EE computation graph. We parse it into a {@link JsonNode} and embed it
+     * as the {@code expression} field — the HV API expects a JSON object there,
+     * not a quoted string.
+     */
+    private String buildRequestBody(TileCoordinate tile) throws IOException {
+        JsonNode expressionNode = MAPPER.readTree(eeExpression);
+
+        double pixelWidth = (tile.xMax() - tile.xMin()) / tileSizePixels;
+        double pixelHeight = (tile.yMax() - tile.yMin()) / tileSizePixels;
+
+        ObjectNode affine = MAPPER.createObjectNode();
+        affine.put("scaleX", pixelWidth);
+        affine.put("shearX", 0.0);
+        affine.put("translateX", tile.xMin());
+        affine.put("shearY", 0.0);
+        affine.put("scaleY", -pixelHeight);
+        affine.put("translateY", tile.yMax());
+
+        ObjectNode dimensions = MAPPER.createObjectNode();
+        dimensions.put("width", tileSizePixels);
+        dimensions.put("height", tileSizePixels);
+
+        ObjectNode grid = MAPPER.createObjectNode();
+        grid.set("dimensions", dimensions);
+        grid.set("affineTransform", affine);
+        grid.put("crsCode", "EPSG:4326");
+
+        ObjectNode request = MAPPER.createObjectNode();
+        request.set("expression", expressionNode);
+        request.put("fileFormat", "GEO_TIFF");
+        request.set("grid", grid);
+
+        return MAPPER.writeValueAsString(request);
     }
 }

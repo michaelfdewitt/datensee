@@ -28,6 +28,7 @@ class TileGrid(BaseModel):
 
     crs: str = Field(description="EPSG code or proj string, e.g. 'EPSG:4326'")
     scale_meters: float = Field(gt=0, description="Pixel size in meters at the native CRS")
+    tile_size_pixels: int = Field(default=512, gt=0, description="Tile edge length in pixels")
     tiles: list[TileCoordinate]
 
     @model_validator(mode="after")
@@ -50,10 +51,14 @@ class CogParameters(BaseModel):
 
 
 class OutputConfig(BaseModel):
-    """Destination and format config for pipeline output."""
+    """Destination and format config for pipeline output.
 
-    gcs_path: str = Field(
-        description="GCS URI prefix, e.g. gs://my-bucket/exports/ndvi"
+    output_path accepts either a GCS URI (gs://bucket/prefix) or a local
+    directory path for local-runner mode.
+    """
+
+    output_path: str = Field(
+        description="Output path: GCS URI (gs://…) or local directory"
     )
     cog: CogParameters = Field(default_factory=CogParameters)
 
@@ -94,6 +99,9 @@ class PipelineConfig(BaseModel):
 
     ee_expression: str = Field(
         description="Serialized EE computation (opaque JSON string)"
+    )
+    gee_project: str = Field(
+        description="GCP project ID with Earth Engine API enabled (used in HV API URL)"
     )
     tile_grid: TileGrid
     output: OutputConfig

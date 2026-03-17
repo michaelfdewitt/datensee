@@ -10,6 +10,7 @@ import typer
 from rich.console import Console
 
 from gee_df import __version__
+from gee_df.assemble import write_vrt
 from gee_df.config import (
     DataflowRunnerConfig,
     OutputConfig,
@@ -26,7 +27,81 @@ app = typer.Typer(
 )
 console = Console()
 
-_DEFAULT_JAR = Path(__file__).parents[5] / "pipelines" / "build" / "libs" / "gee-df-pipeline.jar"
+_DEFAULT_JAR = (
+    Path(__file__).parents[5] / "pipelines" / "build" / "libs" / "gee-df-pipeline.jar"
+)
+
+# ---------------------------------------------------------------------------
+# Hardcoded M1 demo assets
+# ---------------------------------------------------------------------------
+
+# Landsat 9 summer-2023 NDVI, serialized EE expression.
+# Regenerate with: ee.serializer.encode(image, for_cloud=True)
+_DEMO_EXPRESSION = json.dumps(
+    {
+        "result": "0",
+        "values": {
+            "0": {
+                "functionInvocationValue": {
+                    "functionName": "Image.normalizedDifference",
+                    "arguments": {
+                        "input": {"valueReference": "1"},
+                        "bandNames": {"constantValue": ["SR_B5", "SR_B4"]},
+                    },
+                }
+            },
+            "1": {
+                "functionInvocationValue": {
+                    "functionName": "ImageCollection.mosaic",
+                    "arguments": {"collection": {"valueReference": "2"}},
+                }
+            },
+            "2": {
+                "functionInvocationValue": {
+                    "functionName": "Collection.filter",
+                    "arguments": {
+                        "collection": {"valueReference": "3"},
+                        "filter": {"valueReference": "4"},
+                    },
+                }
+            },
+            "3": {
+                "functionInvocationValue": {
+                    "functionName": "ImageCollection.load",
+                    "arguments": {"id": {"constantValue": "LANDSAT/LC09/C02/T1_L2"}},
+                }
+            },
+            "4": {
+                "functionInvocationValue": {
+                    "functionName": "Filter.date",
+                    "arguments": {
+                        "start": {"constantValue": "2023-06-01"},
+                        "end": {"constantValue": "2023-09-01"},
+                    },
+                }
+            },
+        },
+    }
+)
+
+# 0.25° × 0.25° SF Bay Area bounding box — produces ~4 tiles at 30 m/px.
+_DEMO_REGION = {
+    "type": "Polygon",
+    "coordinates": [
+        [
+            [-122.5, 37.75],
+            [-122.25, 37.75],
+            [-122.25, 38.0],
+            [-122.5, 38.0],
+            [-122.5, 37.75],
+        ]
+    ],
+}
+
+
+# ---------------------------------------------------------------------------
+# Version callback
+# ---------------------------------------------------------------------------
 
 
 def _version_callback(value: bool) -> None:
@@ -43,6 +118,86 @@ def main(
     ] = False,
 ) -> None:
     pass
+
+
+# ---------------------------------------------------------------------------
+# demo command
+# ---------------------------------------------------------------------------
+
+
+@app.command()
+def demo(
+    project: Annotated[
+        str,
+        typer.Option(
+            "--project",
+            "-p",
+            help="GCP project ID with Earth Engine API enabled.",
+        ),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Local directory for output tiles + VRT. Created if absent.",
+        ),
+    ] = Path("./gee-df-output"),
+    jar: Annotated[
+        Path,
+        typer.Option("--jar", help="Path to the compiled pipeline JAR."),
+    ] = _DEFAULT_JAR,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Print the pipeline command without executing."),
+    ] = False,
+) -> None:
+    """M1 proof-of-life: fetch Landsat 9 NDVI tiles over SF Bay Area locally.
+
+    Uses a hardcoded 0.25°×0.25° region at 30 m/pixel (~4 tiles). Output
+    tiles are written to OUTPUT_DIR as individual GeoTIFFs plus a mosaic.vrt.
+
+    To convert the VRT to a Cloud Optimized GeoTIFF:
+        gdal_translate -of COG -co COMPRESS=LZW OUTPUT_DIR/mosaic.vrt ndvi.tif
+    """
+    output.mkdir(parents=True, exist_ok=True)
+
+    console.print("[bold]gee-df M1 demo[/bold] — Landsat 9 NDVI, SF Bay Area")
+    console.print(f"  project : {project}")
+    console.print(f"  output  : {output.resolve()}")
+
+    console.print("\n[bold]Tiling region[/bold] (30 m/px, EPSG:4326)")
+    grid = decompose_region(
+        geojson_geometry=_DEMO_REGION,
+        scale_meters=30.0,
+        crs="EPSG:4326",
+        tile_size_pixels=512,
+    )
+    console.print(f"  → {len(grid.tiles)} tiles")
+
+    config = PipelineConfig(
+        ee_expression=_DEMO_EXPRESSION,
+        gee_project=project,
+        tile_grid=grid,
+        output=OutputConfig(output_path=str(output.resolve())),
+        runner=RunnerConfig(mode="local"),
+    )
+
+    submit_job(config, jar_path=jar, dry_run=dry_run)
+
+    if not dry_run:
+        console.print("\n[bold]Assembling VRT mosaic[/bold]")
+        vrt = write_vrt(config, output)
+        console.print(f"  → {vrt}")
+        console.print(
+            "\n[green]Done.[/green] Convert to COG with:\n"
+            f"  gdal_translate -of COG -co COMPRESS=LZW {vrt} ndvi.tif"
+        )
+
+
+# ---------------------------------------------------------------------------
+# export command
+# ---------------------------------------------------------------------------
 
 
 @app.command()
@@ -63,9 +218,17 @@ def export(
             readable=True,
         ),
     ],
+    project: Annotated[
+        str,
+        typer.Option("--project", "-p", help="GCP project ID with EE API enabled."),
+    ],
     output: Annotated[
         str,
-        typer.Option("--output", "-o", help="GCS destination URI prefix."),
+        typer.Option(
+            "--output",
+            "-o",
+            help="Output path: GCS URI (gs://…) or local directory.",
+        ),
     ],
     scale: Annotated[
         float,
@@ -83,10 +246,6 @@ def export(
         str,
         typer.Option("--runner", help="Runner mode: 'local' or 'dataflow'."),
     ] = "local",
-    project: Annotated[
-        str | None,
-        typer.Option("--project", help="GCP project ID (required for Dataflow)."),
-    ] = None,
     region_gcp: Annotated[
         str,
         typer.Option("--region-gcp", help="Dataflow region."),
@@ -103,8 +262,15 @@ def export(
         bool,
         typer.Option("--dry-run", help="Print the pipeline command without executing."),
     ] = False,
+    assemble: Annotated[
+        bool,
+        typer.Option(
+            "--assemble/--no-assemble",
+            help="Write a VRT mosaic after pipeline completes (local mode only).",
+        ),
+    ] = True,
 ) -> None:
-    """Submit an Earth Engine export job to Cloud Dataflow."""
+    """Submit an Earth Engine export job to Cloud Dataflow (or local runner)."""
     ee_expression = expression_file.read_text().strip()
     geojson_geometry = json.loads(region_file.read_text())
 
@@ -118,9 +284,6 @@ def export(
     console.print(f"  → {len(tile_grid.tiles)} tiles")
 
     if runner == "dataflow":
-        if not project:
-            console.print("[red]--project is required for Dataflow mode[/red]")
-            raise typer.Exit(code=1)
         if not temp_location:
             console.print("[red]--temp-location is required for Dataflow mode[/red]")
             raise typer.Exit(code=1)
@@ -138,14 +301,25 @@ def export(
 
     pipeline_config = PipelineConfig(
         ee_expression=ee_expression,
+        gee_project=project,
         tile_grid=tile_grid,
-        output=OutputConfig(gcs_path=output),
+        output=OutputConfig(output_path=output),
         runner=runner_config,
     )
 
     job_id = submit_job(pipeline_config, jar_path=jar, dry_run=dry_run)
     if job_id:
         console.print(f"[green]Job submitted:[/green] {job_id}")
+
+    if not dry_run and assemble and runner == "local" and not output.startswith("gs://"):
+        console.print("\n[bold]Assembling VRT mosaic[/bold]")
+        vrt = write_vrt(pipeline_config, Path(output))
+        console.print(f"  → {vrt}")
+
+
+# ---------------------------------------------------------------------------
+# status command
+# ---------------------------------------------------------------------------
 
 
 @app.command()
@@ -158,10 +332,10 @@ def status(
     ] = "us-central1",
 ) -> None:
     """Poll a Dataflow job until it reaches a terminal state."""
+    from gee_df.auth import get_access_token
     from gee_df.status import poll_job
 
-    # Access token sourced from ADC — placeholder for now.
-    access_token = _get_access_token()
+    access_token = get_access_token()
     final_state = poll_job(
         job_id=job_id,
         project=project,
@@ -173,14 +347,3 @@ def status(
     else:
         console.print(f"[red]Job ended in state: {final_state.value}[/red]")
         raise typer.Exit(code=1)
-
-
-def _get_access_token() -> str:
-    """Retrieve an OAuth2 access token from Application Default Credentials.
-
-    TODO: Implement via google-auth library once added as a dependency.
-    """
-    raise NotImplementedError(
-        "ADC token retrieval not yet implemented. "
-        "Add google-auth to dependencies and implement here."
-    )

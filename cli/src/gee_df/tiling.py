@@ -91,4 +91,4 @@ def decompose_region(
                 )
             )
 
-    return TileGrid(crs=crs, scale_meters=scale_meters, tiles=tiles)
+    return TileGrid(crs=crs, scale_meters=scale_meters, tile_size_pixels=tile_size_pixels, tiles=tiles)

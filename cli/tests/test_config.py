@@ -1,6 +1,5 @@
 """Tests for Pydantic config models."""
 
-import json
 import tempfile
 from pathlib import Path
 
@@ -20,19 +19,21 @@ from gee_df.config import (
 
 def _minimal_config() -> PipelineConfig:
     return PipelineConfig(
-        ee_expression='{"type":"Image","bandNames":["NDVI"]}',
+        ee_expression='{"result":"0","values":{}}',
+        gee_project="my-gcp-project",
         tile_grid=TileGrid(
             crs="EPSG:4326",
             scale_meters=30.0,
             tiles=[TileCoordinate(x_min=0, y_min=0, x_max=1, y_max=1, row=0, col=0)],
         ),
-        output=OutputConfig(gcs_path="gs://my-bucket/exports/test"),
+        output=OutputConfig(output_path="gs://my-bucket/exports/test"),
     )
 
 
 def test_minimal_config_is_valid() -> None:
     config = _minimal_config()
     assert config.runner.mode == "local"
+    assert config.gee_project == "my-gcp-project"
 
 
 def test_empty_tile_grid_raises() -> None:
@@ -52,6 +53,15 @@ def test_cog_defaults_are_sensible() -> None:
     assert 2 in cog.overview_levels
 
 
+def test_tile_grid_default_tile_size() -> None:
+    grid = TileGrid(
+        crs="EPSG:4326",
+        scale_meters=30.0,
+        tiles=[TileCoordinate(x_min=0, y_min=0, x_max=1, y_max=1, row=0, col=0)],
+    )
+    assert grid.tile_size_pixels == 512
+
+
 def test_roundtrip_json_serialization() -> None:
     config = _minimal_config()
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
@@ -61,6 +71,7 @@ def test_roundtrip_json_serialization() -> None:
     restored = PipelineConfig.read_json(path)
 
     assert restored.ee_expression == config.ee_expression
+    assert restored.gee_project == config.gee_project
     assert restored.runner.mode == config.runner.mode
     assert len(restored.tile_grid.tiles) == len(config.tile_grid.tiles)
 
@@ -79,3 +90,10 @@ def test_dataflow_runner_config() -> None:
     )
     assert runner.dataflow is not None
     assert runner.dataflow.max_workers == 100
+
+
+def test_local_output_path_accepted() -> None:
+    config = _minimal_config().model_copy(
+        update={"output": OutputConfig(output_path="/tmp/gee-df-output")}
+    )
+    assert config.output.output_path == "/tmp/gee-df-output"

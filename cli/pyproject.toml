@@ -12,6 +12,7 @@ dependencies = [
     "jsonschema>=4.0",
     "pyproj>=3.6",
     "shapely>=2.0",
+    "google-auth>=2.0",
 ]
 
 [project.scripts]
