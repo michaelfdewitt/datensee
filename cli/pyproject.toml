@@ -28,6 +28,7 @@ package = true
 
 [dependency-groups]
 dev = [
+    "numpy>=2.4.3",
     "pytest>=8.0",
     "pytest-httpx>=0.30",
     "ruff>=0.4",

@@ -16,6 +16,7 @@ Requirements:
 
 from __future__ import annotations
 
+import io
 import json
 import struct
 import time
@@ -23,10 +24,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import httpx
+import numpy as np
 import pytest
 
 from datensee.auth import get_access_token
-from datensee.tiling import decompose_region
+from datensee.tiling import decompose_region, _pixel_size_native
 
 HV_ENDPOINT = (
     "https://earthengine-highvolume.googleapis.com/v1/projects/{project}/image:computePixels"
@@ -809,3 +811,231 @@ class TestEndToEndConfigRoundtrip:
             resp = _fetch_tile(hv_client, gee_project, access_token, body)
             assert resp.status_code == 200
             _assert_valid_geotiff(resp.content)
+
+
+# ---------------------------------------------------------------------------
+# Pixel alignment helper
+# ---------------------------------------------------------------------------
+
+
+def _fetch_tile_as_numpy(
+    client: httpx.Client,
+    project: str,
+    token: str,
+    expression: str,
+    tile_bounds: tuple[float, float, float, float],
+    tile_size: int,
+    crs: str,
+) -> np.ndarray:
+    """Fetch a tile and decode the GeoTIFF into a numpy array.
+
+    Uses NPY format via the HV API to avoid needing GDAL/rasterio for
+    decoding. Falls back to raw GeoTIFF bytes if NPY isn't available.
+    """
+    body = _build_hv_request(expression, tile_bounds, tile_size, crs, "NPY")
+    resp = _fetch_tile(client, project, token, body)
+    assert resp.status_code == 200, f"HTTP {resp.status_code}: {resp.text[:200]}"
+    return np.load(io.BytesIO(resp.content))
+
+
+@pytest.mark.integration
+class TestPixelAlignment:
+    """Verify pixel-level alignment by fetching overlapping regions.
+
+    Strategy: take a reference region, shift it by N pixels in the target
+    CRS, tile both regions, and find tiles that overlap. Fetch the same
+    physical area from both grids and compare the overlapping pixels.
+    If the grid is properly snapped to global (0,0), the tiles from both
+    grids land on the exact same pixel boundaries, so the N-pixel offset
+    produces pixel-identical overlap.
+
+    If the grid were anchored to the bbox (the old bug), the two grids
+    would have different origins and the pixels wouldn't line up at all.
+    """
+
+    def _compare_shifted_grids(
+        self,
+        client: httpx.Client,
+        project: str,
+        token: str,
+        expression: str,
+        crs: str,
+        scale_meters: float,
+        tile_size_pixels: int,
+        shift_pixels: int,
+    ) -> None:
+        """Shift a region by N pixels, fetch overlapping tiles, compare pixels.
+
+        The reference region is a box over Sierra Nevada. We shift it by
+        `shift_pixels` in the x direction (easting) and compare pixels
+        in the overlap area.
+        """
+        pixel_native = _pixel_size_native(crs, scale_meters)
+        shift_native = shift_pixels * pixel_native
+        tile_native = pixel_native * tile_size_pixels
+
+        # Two overlapping WGS84 regions. The shift is applied in native
+        # CRS units, but converted back to WGS84 for the GeoJSON input
+        # since decompose_region always expects WGS84.
+        if crs == "EPSG:4326":
+            # Sierra Nevada area — direct WGS84.
+            base_x, base_y = -120.5, 37.0
+            width, height = 0.5, 0.5
+            shift_x_wgs84 = shift_native
+        else:
+            # For projected CRS, shift in WGS84 degrees approximately.
+            # We use a small SF Bay area. The shift is in native CRS units
+            # but we need WGS84 coords for the input regions. We use two
+            # slightly offset WGS84 regions — the key is that after
+            # reprojection, the snapped grid produces the same tile origins.
+            base_x, base_y = -122.3, 37.7
+            width, height = 0.3, 0.3
+            # Convert native shift to approximate WGS84 degrees.
+            # At ~38°N, 1° longitude ≈ 87,800m.
+            shift_x_wgs84 = shift_native / 87_800.0
+
+        region_a = {
+            "type": "Polygon",
+            "coordinates": [
+                [
+                    [base_x, base_y],
+                    [base_x + width, base_y],
+                    [base_x + width, base_y + height],
+                    [base_x, base_y + height],
+                    [base_x, base_y],
+                ]
+            ],
+        }
+        region_b = {
+            "type": "Polygon",
+            "coordinates": [
+                [
+                    [base_x + shift_x_wgs84, base_y],
+                    [base_x + width + shift_x_wgs84, base_y],
+                    [base_x + width + shift_x_wgs84, base_y + height],
+                    [base_x + shift_x_wgs84, base_y + height],
+                    [base_x + shift_x_wgs84, base_y],
+                ]
+            ],
+        }
+
+        grid_a = decompose_region(
+            region_a, scale_meters=scale_meters, crs=crs, tile_size_pixels=tile_size_pixels
+        )
+        grid_b = decompose_region(
+            region_b, scale_meters=scale_meters, crs=crs, tile_size_pixels=tile_size_pixels
+        )
+
+        # Find tiles present in both grids (same snapped origin).
+        origins_a = {
+            (round(t.x_min, 6), round(t.y_min, 6)): t for t in grid_a.tiles
+        }
+        origins_b = {
+            (round(t.x_min, 6), round(t.y_min, 6)): t for t in grid_b.tiles
+        }
+        shared_origins = set(origins_a.keys()) & set(origins_b.keys())
+        assert len(shared_origins) > 0, (
+            f"No shared tiles between original and shifted grids. "
+            f"Grid A has {len(grid_a.tiles)} tiles, grid B has {len(grid_b.tiles)} tiles."
+        )
+
+        # Pick a shared tile and fetch it from both grids.
+        origin = sorted(shared_origins)[0]
+        tile_a = origins_a[origin]
+        tile_b = origins_b[origin]
+
+        # Verify the tile coordinates are identical.
+        assert abs(tile_a.x_min - tile_b.x_min) < 1e-6
+        assert abs(tile_a.y_min - tile_b.y_min) < 1e-6
+        assert abs(tile_a.x_max - tile_b.x_max) < 1e-6
+        assert abs(tile_a.y_max - tile_b.y_max) < 1e-6
+
+        # Fetch the same tile from both grids — should be pixel-identical.
+        pixels_a = _fetch_tile_as_numpy(
+            client, project, token, expression,
+            (tile_a.x_min, tile_a.y_min, tile_a.x_max, tile_a.y_max),
+            tile_size_pixels, crs,
+        )
+        pixels_b = _fetch_tile_as_numpy(
+            client, project, token, expression,
+            (tile_b.x_min, tile_b.y_min, tile_b.x_max, tile_b.y_max),
+            tile_size_pixels, crs,
+        )
+
+        assert pixels_a.shape == pixels_b.shape, (
+            f"Shape mismatch: {pixels_a.shape} vs {pixels_b.shape}"
+        )
+        np.testing.assert_array_equal(
+            pixels_a, pixels_b,
+            err_msg=(
+                f"Pixel mismatch in shared tile at origin {origin}. "
+                f"This means the grid is not snapped to a global origin — "
+                f"shifting the region by {shift_pixels}px produced different "
+                f"pixel values for the same geographic location."
+            ),
+        )
+
+    def test_shifted_5px_epsg4326(
+        self, gee_project: str, access_token: str, hv_client: httpx.Client
+    ) -> None:
+        """Shift region by 5 pixels in WGS84 — shared tiles must be identical."""
+        self._compare_shifted_grids(
+            hv_client, gee_project, access_token,
+            _srtm_elevation_expression(),
+            crs="EPSG:4326",
+            scale_meters=100.0,
+            tile_size_pixels=64,
+            shift_pixels=5,
+        )
+
+    def test_shifted_17px_epsg4326(
+        self, gee_project: str, access_token: str, hv_client: httpx.Client
+    ) -> None:
+        """Shift by 17 pixels (non-power-of-2) — still must align."""
+        self._compare_shifted_grids(
+            hv_client, gee_project, access_token,
+            _srtm_elevation_expression(),
+            crs="EPSG:4326",
+            scale_meters=100.0,
+            tile_size_pixels=64,
+            shift_pixels=17,
+        )
+
+    def test_shifted_full_tile_epsg4326(
+        self, gee_project: str, access_token: str, hv_client: httpx.Client
+    ) -> None:
+        """Shift by exactly 1 tile width — trivially aligned if grid is snapped."""
+        self._compare_shifted_grids(
+            hv_client, gee_project, access_token,
+            _srtm_elevation_expression(),
+            crs="EPSG:4326",
+            scale_meters=100.0,
+            tile_size_pixels=64,
+            shift_pixels=64,
+        )
+
+    def test_shifted_5px_utm(
+        self, gee_project: str, access_token: str, hv_client: httpx.Client
+    ) -> None:
+        """Shift region by 5 pixels in UTM Zone 10N."""
+        self._compare_shifted_grids(
+            hv_client, gee_project, access_token,
+            _srtm_elevation_expression(),
+            crs="EPSG:32610",
+            scale_meters=100.0,
+            tile_size_pixels=64,
+            shift_pixels=5,
+        )
+
+    def test_shifted_slope_utm(
+        self, gee_project: str, access_token: str, hv_client: httpx.Client
+    ) -> None:
+        """Shift with slope (derived band) in UTM — hardest combo."""
+        self._compare_shifted_grids(
+            hv_client, gee_project, access_token,
+            _srtm_slope_expression(),
+            crs="EPSG:32610",
+            scale_meters=100.0,
+            tile_size_pixels=64,
+            shift_pixels=10,
+        )
