@@ -192,8 +192,14 @@ Run integration tests:
 cd cli && uv run pytest tests/test_integration_ee.py --integration --gee-project=datensee-testing -v
 ```
 
-These tests use `ee.Image.constant()` and trivial band math to minimize EECU cost
-while exercising the full request/response cycle (auth, CRS, multi-band, throughput).
+Tests use SRTM DEM (`USGS/SRTMGL1_003`) — pre-cached and cheap but spatially varying,
+so tiling and alignment bugs are caught that constant images would miss.
+
+EECU usage is tracked automatically: `conftest.py` records wall time at session start
+and queries Cloud Monitoring (`earthengine.googleapis.com/project/cpu/usage_time`) at
+session end, printing a usage report. Baseline for a full 21-test run: **~64 EECU-seconds
+(~1 EECU-minute, ~0.018 EECU-hours)**. If this number grows significantly, investigate
+which tests became more expensive.
 
 Unit tests (no network):
 ```bash
