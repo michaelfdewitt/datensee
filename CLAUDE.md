@@ -181,6 +181,25 @@ These are the areas where the real complexity lives:
 4. **M4: UX Polish** — Rich progress output, log streaming, `status` / `logs` / `cancel` subcommands, cost estimation.
 5. **M5: Distribution** — `pip install datensee`, prebuilt pipeline JARs, documentation, quickstart guide.
 
+## Testing
+
+### Integration tests (EE HV API)
+
+GCP project for testing: **`datensee-testing`** (registered for non-commercial EE use).
+
+Run integration tests:
+```bash
+cd cli && uv run pytest tests/test_integration_ee.py --integration --gee-project=datensee-testing -v
+```
+
+These tests use `ee.Image.constant()` and trivial band math to minimize EECU cost
+while exercising the full request/response cycle (auth, CRS, multi-band, throughput).
+
+Unit tests (no network):
+```bash
+cd cli && uv run pytest -v
+```
+
 ## Notes for Claude
 
 - When generating code, always include type hints (Python) or type annotations (Java). No untyped code.
