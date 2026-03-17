@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -23,6 +24,7 @@ from datensee.config import (
 from datensee.display import render_export_summary, render_post_run_summary
 from datensee.estimate import estimate_cost
 from datensee.expression import clip_expression
+from datensee.jar import build_jar, download_jar, find_jar
 from datensee.submit import submit_job
 from datensee.tiling import decompose_region
 
@@ -31,11 +33,9 @@ app = typer.Typer(
     help="DatensEE: Parallelize Google Earth Engine exports via Cloud Dataflow.",
     no_args_is_help=True,
 )
+jar_app = typer.Typer(help="Manage the pipeline JAR (build, download, locate).")
+app.add_typer(jar_app, name="jar")
 console = Console()
-
-_DEFAULT_JAR = (
-    Path(__file__).parents[3] / "pipelines" / "build" / "libs" / "datensee-pipeline.jar"
-)
 
 # ---------------------------------------------------------------------------
 # Hardcoded M1 demo assets
@@ -241,23 +241,25 @@ def demo(
         ),
     ] = Path("./datensee-output"),
     jar: Annotated[
-        Path,
-        typer.Option("--jar", help="Path to the compiled pipeline JAR."),
-    ] = _DEFAULT_JAR,
+        Path | None,
+        typer.Option("--jar", help="Path to the pipeline JAR (auto-detected if omitted)."),
+    ] = None,
     dry_run: Annotated[
         bool,
         typer.Option("--dry-run", help="Print the pipeline command without executing."),
     ] = False,
 ) -> None:
-    """M1 proof-of-life: fetch Landsat 9 NDVI tiles over SF Bay Area locally.
+    """Fetch Landsat 9 NDVI tiles over SF Bay Area locally.
 
-    Uses a hardcoded 0.25°×0.25° region at 30 m/pixel (~4 tiles). Output
+    Uses a hardcoded 0.25 x 0.25 degree region at 30 m/pixel (~4 tiles). Output
     tiles are written to OUTPUT_DIR as individual GeoTIFFs plus a mosaic.vrt.
 
     To convert the VRT to a Cloud Optimized GeoTIFF:
         gdal_translate -of COG -co COMPRESS=LZW OUTPUT_DIR/mosaic.vrt ndvi.tif
     """
     import time as _time
+
+    jar_path = find_jar(jar)
 
     output.mkdir(parents=True, exist_ok=True)
 
@@ -288,7 +290,7 @@ def demo(
     console.print(render_export_summary(config, estimate))
 
     t0 = _time.monotonic()
-    submit_job(config, jar_path=jar, dry_run=dry_run)
+    submit_job(config, jar_path=jar_path, dry_run=dry_run)
     duration = _time.monotonic() - t0
 
     if not dry_run:
@@ -362,9 +364,9 @@ def export(
         typer.Option("--temp-location", help="GCS URI for Dataflow temp files."),
     ] = None,
     jar: Annotated[
-        Path,
-        typer.Option("--jar", help="Path to the compiled pipeline JAR."),
-    ] = _DEFAULT_JAR,
+        Path | None,
+        typer.Option("--jar", help="Path to the pipeline JAR (auto-detected if omitted)."),
+    ] = None,
     max_qps: Annotated[
         int,
         typer.Option(
@@ -399,6 +401,8 @@ def export(
 ) -> None:
     """Submit an Earth Engine export job to Cloud Dataflow (or local runner)."""
     import time as _time
+
+    jar_path = find_jar(jar)
 
     ee_expression = expression_file.read_text().strip()
     geojson_geometry = json.loads(region_file.read_text())
@@ -463,7 +467,7 @@ def export(
         typer.confirm("This is a large job. Proceed?", abort=True)
 
     t0 = _time.monotonic()
-    job_id = submit_job(pipeline_config, jar_path=jar, dry_run=dry_run)
+    job_id = submit_job(pipeline_config, jar_path=jar_path, dry_run=dry_run)
     duration = _time.monotonic() - t0
 
     if job_id:
@@ -507,3 +511,49 @@ def status(
     else:
         console.print(f"[red]Job ended in state: {final_state.value}[/red]")
         raise typer.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# jar subcommands
+# ---------------------------------------------------------------------------
+
+
+@jar_app.command("path")
+def jar_path_cmd() -> None:
+    """Show the path to the pipeline JAR (or error if not found)."""
+    from datensee.jar import jar_path as _jar_path
+
+    path = _jar_path()
+    if path:
+        console.print(str(path))
+    else:
+        console.print("[red]Pipeline JAR not found.[/red]")
+        console.print("Install it with: datensee jar download  or  datensee jar build")
+        raise typer.Exit(code=1)
+
+
+@jar_app.command("download")
+def jar_download_cmd(
+    version: Annotated[
+        str,
+        typer.Option("--version", "-v", help="Release version to download."),
+    ] = __version__,
+) -> None:
+    """Download a prebuilt pipeline JAR from GitHub Releases."""
+    try:
+        path = download_jar(version)
+        console.print(f"[green]JAR ready:[/green] {path}")
+    except FileNotFoundError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
+@jar_app.command("build")
+def jar_build_cmd() -> None:
+    """Build the pipeline JAR from source (requires Java 25+ and Gradle)."""
+    try:
+        path = build_jar()
+        console.print(f"[green]JAR built:[/green] {path}")
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        console.print(f"[red]Build failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc

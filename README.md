@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <code>pip install datensee</code>&nbsp;&nbsp;(soon)
+  <code>pip install datensee</code>
 </p>
 
 ---
@@ -81,15 +81,35 @@ and stitch the results together.
 - `gcloud auth application-default login` (ADC configured)
 - A GCP project with the [Earth Engine API](https://console.cloud.google.com/apis/library/earthengine.googleapis.com) enabled
 
-### Install & build
+### Install
 
 ```bash
-# Python CLI
-cd cli && uv sync
-
-# Java pipeline (fat JAR for Dataflow / local runner)
-cd pipelines && ./gradlew shadowJar
+pip install datensee
 ```
+
+Or from source:
+
+```bash
+cd cli && uv sync
+```
+
+### Pipeline JAR
+
+The Java pipeline JAR is required to run exports. Install it with:
+
+```bash
+# Download a prebuilt JAR from GitHub Releases
+datensee jar download
+
+# Or build from source (requires Java 25+ and Gradle)
+datensee jar build
+```
+
+The CLI searches for the JAR in this order:
+1. `--jar <path>` flag (explicit)
+2. `DATENSEE_JAR` environment variable
+3. `~/.datensee/jars/datensee-pipeline.jar` (from `datensee jar download`)
+4. Development repo path (`pipelines/build/libs/datensee-pipeline.jar`)
 
 ### Demo: Landsat 9 NDVI over SF Bay Area
 
@@ -226,13 +246,13 @@ The integration suite includes:
 |-----------|--------|-------------|
 | M1: Proof of Life | Done | End-to-end: CLI → Dataflow → HV API → GeoTIFF |
 | M2: Real Config | Done | Arbitrary expressions, CRS, multi-band, validation |
-| M3: Scale | Next | Rate limiting, retry, adaptive tiling, COG output |
-| M4: UX Polish | Planned | Rich progress, log streaming, cost estimation |
-| M5: Distribution | Planned | `pip install datensee`, prebuilt JARs, docs |
+| M3: Scale | Done | Rate limiting, retry, adaptive tiling, COG output |
+| M4: UX Polish | Done | Rich progress, cost estimation, summary panels |
+| M5: Distribution | Done | `pip install datensee`, prebuilt JARs, JAR management |
 
 ## License
 
-TBD
+Apache License 2.0 — see [LICENSE](LICENSE).
 
 <!--
   If you're reading the source of this README, hi Steve!

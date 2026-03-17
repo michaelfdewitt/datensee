@@ -68,16 +68,20 @@ The pipeline config passed from Python → Java. Defines:
 ```
 datensee/
 ├── CLAUDE.md
+├── LICENSE
 ├── cli/
 │   ├── pyproject.toml
 │   ├── src/
 │   │   └── datensee/
 │   │       ├── __init__.py
-│   │       ├── main.py          ← Typer app entrypoint
+│   │       ├── main.py          ← Typer app entrypoint + jar subcommands
 │   │       ├── config.py        ← Pydantic models for pipeline config
 │   │       ├── tiling.py        ← Region → tile grid decomposition
-│   │       ├── submit.py        ← Dataflow job submission
-│   │       └── status.py        ← Job polling, log streaming
+│   │       ├── submit.py        ← Dataflow job submission + local progress
+│   │       ├── status.py        ← Job polling with Dataflow metrics
+│   │       ├── estimate.py      ← Cost estimation (EECU, Dataflow, storage)
+│   │       ├── display.py       ← Rich panels (export summary, post-run)
+│   │       └── jar.py           ← Pipeline JAR discovery, download, build
 │   └── tests/
 ├── pipelines/
 │   ├── build.gradle.kts
@@ -171,7 +175,7 @@ These are the areas where the real complexity lives:
 
 ## Current Status
 
-🟢 **M2: Real Config** — Arbitrary EE expressions, regions, scales, and CRS supported. Input validation, multi-band VRT, CRS propagation to Java pipeline.
+🟢 **M5: Distribution** — `pip install datensee` works. Smart JAR discovery (env var → cache → repo), `datensee jar` subcommands (download/build/path), Apache 2.0 license, full PyPI metadata. All milestones M1–M5 complete.
 
 ## Milestones
 
