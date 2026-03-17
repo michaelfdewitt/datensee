@@ -179,11 +179,11 @@ These are the areas where the real complexity lives:
 
 ## Milestones
 
-1. **M1: Proof of Life** — CLI takes a hardcoded NDVI expression + small region, tiles it, submits to Dataflow, fetches tiles via HV API, writes a single GeoTIFF to GCS.
-2. **M2: Real Config** — Pipeline config schema defined. CLI accepts arbitrary EE expressions, regions, scales. Local runner works for small jobs.
-3. **M3: Scale** — Rate limiting, retry logic, adaptive tiling, COG output, large-region support.
-4. **M4: UX Polish** — Rich progress output, log streaming, `status` / `logs` / `cancel` subcommands, cost estimation.
-5. **M5: Distribution** — `pip install datensee`, prebuilt pipeline JARs, documentation, quickstart guide.
+1. **M1: Proof of Life** ✅ — CLI takes a hardcoded NDVI expression + small region, tiles it, submits to Dataflow, fetches tiles via HV API, writes a single GeoTIFF to GCS.
+2. **M2: Real Config** ✅ — Pipeline config schema defined. CLI accepts arbitrary EE expressions, regions, scales. Local runner works for small jobs.
+3. **M3: Scale** ✅ — Partial failure tolerance, per-worker rate limiting, smart retry classification, file-based tile input, VRT assembly.
+4. **M4: UX Polish** ✅ — Rich progress bar (local mode), cost estimation (EECU range, Dataflow USD, storage), summary panels, confirmation for large jobs, enhanced Dataflow status polling with metrics.
+5. **M5: Distribution** ✅ — `pip install datensee`, smart JAR discovery, `datensee jar` subcommands (download/build/path), Apache 2.0 license, full PyPI metadata.
 
 ## Testing
 
