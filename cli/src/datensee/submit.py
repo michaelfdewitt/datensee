@@ -1,7 +1,8 @@
 """Dataflow job submission.
 
 Writes the pipeline config to a temp file and invokes the compiled Beam
-JAR via subprocess. For local mode, runs the Direct runner in-process.
+JAR via subprocess. For local mode, runs the Direct runner in-process
+with a Rich progress bar driven by output file polling.
 
 For large tile counts (>5000), uploads tile coordinates as NDJSON to the
 output path and references the file in the config instead of inlining.
@@ -12,9 +13,11 @@ from __future__ import annotations
 import json
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 from rich.console import Console
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 from datensee.config import PipelineConfig, TileGrid
 
@@ -71,6 +74,11 @@ def submit_job(
     console.print(f"[bold]Submitting pipeline[/bold] (mode={config.runner.mode})")
     console.print(f"Config written to: {tmp_path}")
 
+    if config.runner.mode == "local" and not config.output.output_path.startswith("gs://"):
+        total = _tile_count_from_config(config)
+        _run_local_with_progress(cmd, Path(config.output.output_path), total)
+        return None
+
     subprocess.run(cmd, check=True, text=True)
 
     # For local runs, job ID is not applicable.
@@ -79,6 +87,68 @@ def submit_job(
 
     # TODO: parse Dataflow job ID from stdout/stderr.
     return None
+
+
+def _tile_count_from_config(config: PipelineConfig) -> int:
+    """Extract tile count from config."""
+    if config.tile_grid.tiles is not None:
+        return len(config.tile_grid.tiles)
+    return 0
+
+
+def _run_local_with_progress(
+    cmd: list[str],
+    output_dir: Path,
+    total_tiles: int,
+) -> None:
+    """Run the local pipeline with a Rich progress bar driven by file polling.
+
+    Spawns the Java process and polls output_dir for tile_*.tif files every
+    0.5s to update the progress bar. This avoids parsing Beam's unstable
+    Direct runner stdout format.
+
+    Args:
+        cmd: Java command to execute.
+        output_dir: Directory where tile GeoTIFFs are written.
+        total_tiles: Expected number of tiles (for the progress bar total).
+
+    Raises:
+        subprocess.CalledProcessError: If the Java process exits non-zero.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("{task.completed}/{task.total} tiles"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Fetching tiles", total=total_tiles or 1)
+
+        while process.poll() is None:
+            completed = len(list(output_dir.glob("tile_*.tif")))
+            progress.update(task, completed=min(completed, total_tiles or completed))
+            time.sleep(0.5)
+
+        # Final count after process exits
+        completed = len(list(output_dir.glob("tile_*.tif")))
+        progress.update(task, completed=min(completed, total_tiles or completed))
+
+    if process.returncode != 0:
+        stderr = process.stderr.read() if process.stderr else ""
+        raise subprocess.CalledProcessError(
+            process.returncode, cmd, output="", stderr=stderr
+        )
 
 
 def _maybe_externalize_tiles(

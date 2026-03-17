@@ -1,0 +1,107 @@
+"""Tests for datensee.display — Rich rendering module.
+
+Smoke tests: verify that rendering functions return the expected types
+and don't crash on edge cases.
+"""
+
+from __future__ import annotations
+
+from rich.panel import Panel
+
+from datensee.config import (
+    DataflowRunnerConfig,
+    OutputConfig,
+    PipelineConfig,
+    RateLimitConfig,
+    RunnerConfig,
+    TileCoordinate,
+    TileGrid,
+)
+from datensee.display import render_export_summary, render_post_run_summary
+from datensee.estimate import CostEstimate
+
+
+def _make_tiles(n: int) -> list[TileCoordinate]:
+    return [
+        TileCoordinate(x_min=i, y_min=0, x_max=i + 1, y_max=1, row=0, col=i)
+        for i in range(n)
+    ]
+
+
+def _make_estimate(**overrides: object) -> CostEstimate:
+    defaults = dict(
+        tile_count=100,
+        estimated_wall_seconds=14.3,
+        eecu_seconds_low=100.0,
+        eecu_seconds_typical=300.0,
+        eecu_seconds_high=1000.0,
+        output_size_bytes=52_428_800,
+        storage_cost_usd_per_month=0.001,
+    )
+    defaults.update(overrides)
+    return CostEstimate(**defaults)
+
+
+def _make_local_config() -> PipelineConfig:
+    return PipelineConfig(
+        ee_expression='{"result":"0","values":{"0":{"constantValue":1}}}',
+        gee_project="test",
+        tile_grid=TileGrid(crs="EPSG:4326", scale_meters=30.0, tiles=_make_tiles(100)),
+        output=OutputConfig(output_path="/tmp/output"),
+        runner=RunnerConfig(mode="local"),
+    )
+
+
+def _make_dataflow_config() -> PipelineConfig:
+    return PipelineConfig(
+        ee_expression='{"result":"0","values":{"0":{"constantValue":1}}}',
+        gee_project="test",
+        tile_grid=TileGrid(crs="EPSG:4326", scale_meters=30.0, tiles=_make_tiles(1000)),
+        output=OutputConfig(output_path="gs://bucket/output"),
+        runner=RunnerConfig(
+            mode="dataflow",
+            dataflow=DataflowRunnerConfig(
+                project="test",
+                region="us-central1",
+                temp_location="gs://tmp/temp",
+                staging_location="gs://tmp/staging",
+            ),
+        ),
+        rate_limit=RateLimitConfig(max_qps=200),
+    )
+
+
+class TestRenderExportSummary:
+    def test_returns_panel_local(self) -> None:
+        panel = render_export_summary(_make_local_config(), _make_estimate())
+        assert isinstance(panel, Panel)
+
+    def test_returns_panel_dataflow(self) -> None:
+        est = _make_estimate(
+            tile_count=1000,
+            dataflow_vcpu_hours=1.5,
+            dataflow_memory_gb_hours=6.0,
+            dataflow_cost_usd=0.12,
+        )
+        panel = render_export_summary(_make_dataflow_config(), est)
+        assert isinstance(panel, Panel)
+
+    def test_zero_tiles(self) -> None:
+        config = _make_local_config()
+        est = _make_estimate(tile_count=0, estimated_wall_seconds=0)
+        panel = render_export_summary(config, est)
+        assert isinstance(panel, Panel)
+
+
+class TestRenderPostRunSummary:
+    def test_success(self) -> None:
+        panel = render_post_run_summary(12.5, 100, 0, "/tmp/output/mosaic.vrt")
+        assert isinstance(panel, Panel)
+
+    def test_with_failures(self) -> None:
+        panel = render_post_run_summary(30.0, 95, 5, "gs://bucket/output")
+        assert isinstance(panel, Panel)
+
+    def test_zero_tiles(self) -> None:
+        panel = render_post_run_summary(0.1, 0, 0, "/tmp/empty")
+        assert isinstance(panel, Panel)

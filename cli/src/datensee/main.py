@@ -7,10 +7,9 @@ import os
 from pathlib import Path
 from typing import Annotated, Any
 
+import pyproj
 import typer
 from rich.console import Console
-
-import pyproj
 
 from datensee import __version__
 from datensee.assemble import write_vrt
@@ -21,6 +20,8 @@ from datensee.config import (
     RateLimitConfig,
     RunnerConfig,
 )
+from datensee.display import render_export_summary, render_post_run_summary
+from datensee.estimate import estimate_cost
 from datensee.expression import clip_expression
 from datensee.submit import submit_job
 from datensee.tiling import decompose_region
@@ -158,8 +159,8 @@ def _validate_inputs(
         geom_type = (geojson_geometry.get("geometry") or {}).get("type")
     if geom_type == "FeatureCollection":
         errors.append(
-            f"Region GeoJSON type is 'FeatureCollection', but a single "
-            f"Polygon or MultiPolygon is required. Extract one feature first."
+            "Region GeoJSON type is 'FeatureCollection', but a single "
+            "Polygon or MultiPolygon is required. Extract one feature first."
         )
     elif geom_type not in _VALID_GEOJSON_TYPES:
         errors.append(
@@ -256,9 +257,11 @@ def demo(
     To convert the VRT to a Cloud Optimized GeoTIFF:
         gdal_translate -of COG -co COMPRESS=LZW OUTPUT_DIR/mosaic.vrt ndvi.tif
     """
+    import time as _time
+
     output.mkdir(parents=True, exist_ok=True)
 
-    console.print("[bold]DatensEE M1 demo[/bold] — Landsat 9 NDVI, SF Bay Area")
+    console.print("[bold]DatensEE demo[/bold] — Landsat 9 NDVI, SF Bay Area")
     console.print(f"  project : {project}")
     console.print(f"  output  : {output.resolve()}")
 
@@ -281,14 +284,20 @@ def demo(
         runner=RunnerConfig(mode="local"),
     )
 
+    estimate = estimate_cost(config)
+    console.print(render_export_summary(config, estimate))
+
+    t0 = _time.monotonic()
     submit_job(config, jar_path=jar, dry_run=dry_run)
+    duration = _time.monotonic() - t0
 
     if not dry_run:
         console.print("\n[bold]Assembling VRT mosaic[/bold]")
         vrt = write_vrt(config, output)
-        console.print(f"  → {vrt}")
+        tiles_ok = len(list(output.glob("tile_*.tif")))
+        console.print(render_post_run_summary(duration, tiles_ok, 0, str(vrt)))
         console.print(
-            "\n[green]Done.[/green] Convert to COG with:\n"
+            "\nConvert to COG with:\n"
             f"  gdal_translate -of COG -co COMPRESS=LZW {vrt} ndvi.tif"
         )
 
@@ -375,8 +384,22 @@ def export(
             help="Write a VRT mosaic after pipeline completes (local mode only).",
         ),
     ] = True,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", "-y", help="Skip confirmation prompt for large jobs."),
+    ] = False,
+    eecu_per_tile: Annotated[
+        float,
+        typer.Option(
+            "--eecu-per-tile",
+            help="Override EECU-seconds per tile for cost estimation (from calibration runs).",
+            min=0.01,
+        ),
+    ] = 1.0,
 ) -> None:
     """Submit an Earth Engine export job to Cloud Dataflow (or local runner)."""
+    import time as _time
+
     ee_expression = expression_file.read_text().strip()
     geojson_geometry = json.loads(region_file.read_text())
 
@@ -429,15 +452,29 @@ def export(
         rate_limit=RateLimitConfig(max_qps=max_qps),
     )
 
+    estimate = estimate_cost(pipeline_config, eecu_per_tile=eecu_per_tile)
+    console.print(render_export_summary(pipeline_config, estimate))
+
+    # Confirm before large jobs unless --yes
+    is_large = estimate.tile_count > 10_000 or (
+        estimate.dataflow_cost_usd is not None and estimate.dataflow_cost_usd > 1.0
+    )
+    if is_large and not yes and not dry_run:
+        typer.confirm("This is a large job. Proceed?", abort=True)
+
+    t0 = _time.monotonic()
     job_id = submit_job(pipeline_config, jar_path=jar, dry_run=dry_run)
+    duration = _time.monotonic() - t0
+
     if job_id:
         console.print(f"[green]Job submitted:[/green] {job_id}")
 
     if not dry_run and assemble and runner == "local" and not output.startswith("gs://"):
-        # Dataflow mode: VRT is assembled inside the pipeline (VrtAssembler.java)
         console.print("\n[bold]Assembling VRT mosaic[/bold]")
         vrt = write_vrt(pipeline_config, Path(output))
-        console.print(f"  → {vrt}")
+        tiles_ok = len(list(Path(output).glob("tile_*.tif")))
+        tiles_failed = max(0, estimate.tile_count - tiles_ok)
+        console.print(render_post_run_summary(duration, tiles_ok, tiles_failed, str(vrt)))
 
 
 # ---------------------------------------------------------------------------

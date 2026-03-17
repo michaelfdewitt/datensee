@@ -1,19 +1,20 @@
 """Job status polling and log streaming.
 
-Polls the Dataflow REST API to surface job state and streams
-Cloud Logging output for running jobs.
+Polls the Dataflow REST API to surface job state, elapsed time, and
+tile-level progress metrics. Dataflow metrics lag ~30-60s behind reality.
 """
 
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 
 import httpx
 from rich.console import Console
 from rich.live import Live
-from rich.spinner import Spinner
-from rich.text import Text
+from rich.table import Table
 
 console = Console()
 
@@ -30,6 +31,17 @@ class JobState(StrEnum):
 
 
 TERMINAL_STATES = {JobState.DONE, JobState.FAILED, JobState.CANCELLED}
+
+
+@dataclass
+class JobInfo:
+    """Parsed job state and metrics from the Dataflow API."""
+
+    state: JobState
+    elapsed_seconds: float | None = None
+    elements_produced: int | None = None
+    elements_total: int | None = None
+    current_workers: int | None = None
 
 
 def poll_job(
@@ -57,32 +69,109 @@ def poll_job(
 
     with Live(console=console, refresh_per_second=4) as live:
         while True:
-            state = _fetch_state(url, headers)
-            live.update(_render_status(job_id, state))
+            info = _fetch_job_info(url, headers)
+            live.update(_render_status_table(job_id, info))
 
-            if state in TERMINAL_STATES:
+            if info.state in TERMINAL_STATES:
                 break
 
             time.sleep(poll_interval_seconds)
 
-    return state
+    return info.state
 
 
-def _fetch_state(url: str, headers: dict[str, str]) -> JobState:
-    """Fetch current job state from the Dataflow REST API."""
+def _fetch_job_info(url: str, headers: dict[str, str]) -> JobInfo:
+    """Fetch job state and metrics from the Dataflow REST API.
+
+    Uses ?view=JOB_VIEW_ALL to include metrics (element counts, workers).
+    Metrics lag ~30-60s behind reality.
+    """
     try:
         with httpx.Client(timeout=30) as client:
-            response = client.get(url, headers=headers)
+            response = client.get(url, headers=headers, params={"view": "JOB_VIEW_ALL"})
             response.raise_for_status()
             data = response.json()
-            raw = data.get("currentState", "JOB_STATE_UNKNOWN")
-            return JobState(raw)
     except (httpx.HTTPError, KeyError, ValueError):
-        return JobState.UNKNOWN
+        return JobInfo(state=JobState.UNKNOWN)
+
+    raw_state = data.get("currentState", "JOB_STATE_UNKNOWN")
+    try:
+        state = JobState(raw_state)
+    except ValueError:
+        state = JobState.UNKNOWN
+
+    # Elapsed time from currentStateTime (or createTime as fallback)
+    elapsed = _parse_elapsed(data)
+
+    # Parse metrics for element counts
+    elements_produced, elements_total, workers = _parse_metrics(data)
+
+    return JobInfo(
+        state=state,
+        elapsed_seconds=elapsed,
+        elements_produced=elements_produced,
+        elements_total=elements_total,
+        current_workers=workers,
+    )
 
 
-def _render_status(job_id: str, state: JobState) -> Text:
-    """Render a Rich Text widget showing current job state."""
+def _parse_elapsed(data: dict) -> float | None:
+    """Parse elapsed seconds from job create time."""
+    create_time = data.get("createTime")
+    if not create_time:
+        return None
+    try:
+        created = datetime.fromisoformat(create_time.replace("Z", "+00:00"))
+        return (datetime.now(UTC) - created).total_seconds()
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_metrics(data: dict) -> tuple[int | None, int | None, int | None]:
+    """Extract element counts and worker count from Dataflow job metrics.
+
+    Returns:
+        (elements_produced, elements_total, current_workers) — any may be None.
+    """
+    metrics_list = (data.get("jobMetrics") or {}).get("metrics", [])
+    if not metrics_list:
+        return None, None, None
+
+    elements_produced: int | None = None
+    elements_total: int | None = None
+    current_workers: int | None = None
+
+    for metric in metrics_list:
+        name_obj = metric.get("name", {})
+        name = name_obj.get("name", "")
+        scalar = metric.get("scalar")
+
+        if scalar is None:
+            continue
+
+        try:
+            value = int(scalar)
+        except (ValueError, TypeError):
+            continue
+
+        if name == "elements_produced" and name_obj.get("context", {}).get("output_user_name"):
+            # Sum of all step outputs — take the max as a rough progress indicator
+            if elements_produced is None or value > elements_produced:
+                elements_produced = value
+
+        if name == "elements_added":
+            # Input elements = total tiles
+            if elements_total is None or value > elements_total:
+                elements_total = value
+
+        if name == "current_num_workers":
+            current_workers = value
+
+    return elements_produced, elements_total, current_workers
+
+
+def _render_status_table(job_id: str, info: JobInfo) -> Table:
+    """Render a Rich Table showing current job state and metrics."""
     color_map: dict[JobState, str] = {
         JobState.PENDING: "yellow",
         JobState.RUNNING: "cyan",
@@ -91,5 +180,24 @@ def _render_status(job_id: str, state: JobState) -> Text:
         JobState.CANCELLED: "magenta",
         JobState.UNKNOWN: "dim",
     }
-    color = color_map.get(state, "white")
-    return Text(f"Job {job_id}  state={state.value}", style=color)
+    color = color_map.get(info.state, "white")
+
+    table = Table(show_header=False, show_edge=False, box=None, pad_edge=False)
+    table.add_column("label", style="bold", min_width=12)
+    table.add_column("value")
+
+    table.add_row("Job", job_id)
+    table.add_row("State", f"[{color}]{info.state.value}[/{color}]")
+
+    if info.elapsed_seconds is not None:
+        elapsed_min = info.elapsed_seconds / 60
+        table.add_row("Elapsed", f"{elapsed_min:.1f} min")
+
+    if info.current_workers is not None:
+        table.add_row("Workers", str(info.current_workers))
+
+    if info.elements_produced is not None:
+        total_str = f"/ {info.elements_total}" if info.elements_total else ""
+        table.add_row("Tiles", f"{info.elements_produced} {total_str}  [dim](~30s lag)[/dim]")
+
+    return table
