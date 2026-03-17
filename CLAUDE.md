@@ -162,7 +162,7 @@ These are the areas where the real complexity lives:
 
 ## Design Principles
 
-1. **EE is the computation engine. We are the parallelism engine.** Never interpret or optimize the EE expression — just fetch tiles.
+1. **EE is the computation engine. We are the parallelism engine.** Never interpret or optimize the EE expression — but do compose with it (e.g. wrapping in `Image.clip(region)` for edge tiles).
 2. **The CLI is the UX.** Every rough edge is a user lost. Invest in error messages, progress feedback, and sensible defaults.
 3. **Fail fast, fail loud.** Validate everything in Python before submitting the Dataflow job.
 4. **EE users aren't infra engineers.** Abstract away Dataflow concepts behind opinionated defaults with escape hatches.
@@ -208,4 +208,4 @@ cd cli && uv run pytest -v
 - When in doubt about the EE HV API, check https://developers.google.com/earth-engine/reference — don't guess.
 - The user is a staff engineer. Skip boilerplate explanations; be direct and precise.
 - If a design decision has tradeoffs, name them explicitly rather than picking silently.
-- The EE computation is opaque. Never attempt to parse, optimize, or interpret the EE expression graph.
+- The EE computation is opaque. Never parse, optimize, or interpret the expression graph — but composing with it (wrapping in clip, cast, etc.) is fine.

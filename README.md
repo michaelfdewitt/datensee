@@ -1,0 +1,241 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://em-content.zobj.net/source/apple/391/satellite_1f6f0.png" width="80">
+    <img src="https://em-content.zobj.net/source/apple/391/satellite_1f6f0.png" width="80" alt="satellite">
+  </picture>
+</p>
+
+<h1 align="center">DatensEE</h1>
+
+<p align="center">
+  <strong>Massively parallel Earth Engine exports via Cloud Dataflow</strong>
+</p>
+
+<p align="center">
+  <code>pip install datensee</code>&nbsp;&nbsp;(soon)
+</p>
+
+---
+
+DatensEE takes the computation you already wrote in Earth Engine and runs it at
+continental scale. You bring the expression, the region, and the scale — DatensEE
+handles tiling, parallel fetching across thousands of Dataflow workers, and
+assembly into Cloud Optimized GeoTIFFs on GCS.
+
+```
+datensee export expression.json region.geojson \
+  --project my-gcp-project \
+  --output gs://my-bucket/ndvi-conus \
+  --scale 10 \
+  --crs EPSG:32610
+```
+
+## Why
+
+Earth Engine is great at computing things. It is not great at getting large
+results *out*. The built-in `Export.image.toDrive()` is single-threaded,
+capped at ~1 billion pixels, and silently fails on anything ambitious.
+
+DatensEE doesn't recompile or interpret your computation — EE does that.
+We just call the [High Volume API](https://developers.google.com/earth-engine/reference/rest/v1/projects.image/computePixels)
+thousands of times in parallel, with proper tiling, retries, and rate limiting,
+and stitch the results together.
+
+**EE is the computation engine. We are the parallelism engine.**
+
+## How it works
+
+```
+                          ┌──────────────────────────────┐
+                          │     Earth Engine Backend      │
+                          │  (evaluates your computation  │
+                          │   per-tile via HV endpoint)   │
+                          └──────────▲───────────────────┘
+                                     │ High Volume API
+                                     │ (thousands of concurrent tile fetches)
+                                     │
+┌──────────────┐          ┌──────────┴───────────────────┐          ┌────────────┐
+│  datensee    │─────────▶│     Cloud Dataflow            │─────────▶│    GCS     │
+│  CLI         │ submits   │                               │ writes   │   (COG)    │
+│              │ job       │  Tile coords → ParDo: fetch  │ output   │            │
+│  • Validate  │          │  → Assemble raster            │          │            │
+│  • Tile      │          │  → Write COG                  │          │            │
+│  • Submit    │          │                               │          │            │
+└──────────────┘          └───────────────────────────────┘          └────────────┘
+```
+
+1. **You provide** a serialized EE expression + region GeoJSON + scale + CRS
+2. **Python CLI** validates inputs, decomposes the region into a globally-aligned
+   tile grid, and submits a Dataflow job (or runs locally for small regions)
+3. **Java Beam pipeline** fans out across workers — each fetches tiles via the
+   HV API with exponential backoff and retries
+4. **Output** lands as Cloud Optimized GeoTIFF(s) on GCS, or as local GeoTIFFs
+   with a VRT mosaic for the direct runner
+
+## Quick start
+
+### Prerequisites
+
+- Python 3.12+, [uv](https://docs.astral.sh/uv/)
+- Java 25+, Gradle 9+
+- `gcloud auth application-default login` (ADC configured)
+- A GCP project with the [Earth Engine API](https://console.cloud.google.com/apis/library/earthengine.googleapis.com) enabled
+
+### Install & build
+
+```bash
+# Python CLI
+cd cli && uv sync
+
+# Java pipeline (fat JAR for Dataflow / local runner)
+cd pipelines && ./gradlew shadowJar
+```
+
+### Demo: Landsat 9 NDVI over SF Bay Area
+
+```bash
+datensee demo --project my-gcp-project --output ./ndvi-output
+```
+
+This fetches a small Landsat 9 NDVI composite (~4 tiles at 30m) using the
+local direct runner. Output is individual GeoTIFFs plus a `mosaic.vrt`.
+
+Convert to a single Cloud Optimized GeoTIFF:
+
+```bash
+gdal_translate -of COG -co COMPRESS=LZW ndvi-output/mosaic.vrt ndvi.tif
+```
+
+### Full export
+
+```bash
+# Serialize your EE expression
+python -c "
+import ee, json
+ee.Initialize()
+image = (ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+         .filterDate('2023-06-01', '2023-09-01')
+         .median()
+         .normalizedDifference(['SR_B5', 'SR_B4']))
+with open('expr.json', 'w') as f:
+    json.dump(ee.serializer.encode(image, for_cloud_api=True), f)
+"
+
+# Export at 10m in UTM, multi-band
+datensee export expr.json region.geojson \
+  --project my-gcp-project \
+  --output gs://my-bucket/exports/ndvi \
+  --scale 10 \
+  --crs EPSG:32610 \
+  --runner dataflow \
+  --temp-location gs://my-bucket/tmp
+```
+
+## Tiling & pixel alignment
+
+DatensEE snaps tile grids to a global origin at `(0, 0)` in the target CRS.
+This guarantees:
+
+- **Pixel-perfect alignment** — two independent exports at the same scale and
+  CRS produce identical pixel grids in any overlapping area
+- **Edge clipping** — the EE expression is automatically wrapped in
+  `Image.clip(region)` so edge tiles return nodata outside the boundary
+  instead of wasting EECUs on out-of-bounds pixels. The tile *grid* stays
+  full-size for alignment; only the *computation* is clipped.
+- **Adjacent tile contiguity** — `tile[i].x_max == tile[i+1].x_min` exactly,
+  with no floating-point gaps or overlaps
+
+This is tested via integration tests that shift a region by N pixels, fetch
+tiles from both grids, and assert pixel-by-pixel equality in the overlap.
+
+## Configuration
+
+The pipeline config is a JSON contract between the Python CLI and the Java pipeline:
+
+```jsonc
+{
+  "ee_expression": "{ ... }",       // opaque — EE evaluates this, we don't touch it
+  "gee_project": "my-project",
+  "tile_grid": {
+    "crs": "EPSG:32610",
+    "scale_meters": 10.0,
+    "tile_size_pixels": 512,
+    "tiles": [ ... ]
+  },
+  "output": {
+    "output_path": "gs://bucket/prefix",
+    "band_count": 3,
+    "data_type": "uint8",            // float32, float64, int16, int32, uint8, uint16
+    "cog": { "compress": "lzw", "blocksize": 512 }
+  },
+  "runner": {
+    "mode": "dataflow",              // or "local"
+    "dataflow": { "project": "...", "region": "us-central1", ... }
+  }
+}
+```
+
+Full schema: [`contract/pipeline-config.schema.json`](contract/pipeline-config.schema.json)
+
+## Project structure
+
+```
+datensee/
+├── cli/                 Python CLI (Typer + Pydantic)
+│   ├── src/datensee/
+│   │   ├── main.py      CLI entrypoint
+│   │   ├── config.py    Pipeline config models
+│   │   ├── tiling.py    Region → globally-aligned tile grid
+│   │   ├── assemble.py  VRT mosaic assembly (multi-band, any data type)
+│   │   └── submit.py    Dataflow job submission
+│   └── tests/           78 tests (unit + EE HV API integration)
+├── pipelines/           Java Beam pipeline (Gradle)
+│   └── src/main/java/com/datensee/
+│       ├── DatensEEPipeline.java
+│       ├── fetch/       HV API client, retry, rate limiting
+│       └── io/          COG writer
+├── contract/            JSON schema + examples
+└── CLAUDE.md            Development guide
+```
+
+## Testing
+
+```bash
+# Unit tests (no network, fast)
+cd cli && uv run pytest -v
+
+# Integration tests — hits the real EE HV API
+# Fetches ~4000 SRTM tiles across EPSG:4326, EPSG:32610, EPSG:3857
+cd cli && uv run pytest tests/test_integration_ee.py \
+  --integration --gee-project=YOUR_PROJECT -v
+
+# Java tests
+cd pipelines && ./gradlew test
+```
+
+The integration suite includes:
+- **Single-tile fetches** across 3 CRS variants and 4 expression types (elevation, slope, rescaled, multi-band)
+- **Tiling + fetch** — decompose a region, fetch every tile, validate GeoTIFF responses
+- **High-volume batch** — 1000–2000 concurrent tile fetches with failure rate assertions
+- **Pixel alignment** — shift region by N pixels, fetch overlapping tiles, assert `array_equal`
+- **Config roundtrip** — serialize to JSON, deserialize, fetch from restored config
+
+## Roadmap
+
+| Milestone | Status | Description |
+|-----------|--------|-------------|
+| M1: Proof of Life | Done | End-to-end: CLI → Dataflow → HV API → GeoTIFF |
+| M2: Real Config | Done | Arbitrary expressions, CRS, multi-band, validation |
+| M3: Scale | Next | Rate limiting, retry, adaptive tiling, COG output |
+| M4: UX Polish | Planned | Rich progress, log streaming, cost estimation |
+| M5: Distribution | Planned | `pip install datensee`, prebuilt JARs, docs |
+
+## License
+
+TBD
+
+<!--
+  If you're reading the source of this README, hi Steve!
+  Yes, we are hitting your HV endpoint very hard and we are not sorry.
+  (But we are being polite about rate limiting. Mostly.)
+-->

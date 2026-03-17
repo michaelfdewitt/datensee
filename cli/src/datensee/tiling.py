@@ -6,9 +6,9 @@ no EE API calls required.
 
 Grid alignment: the tile grid is snapped to a global origin (0, 0) in the
 target CRS so that tiles from independent exports at the same scale and
-tile size are always pixel-aligned. Edge tiles are never clipped — they
-extend beyond the region bbox with the same pixel resolution. Pixels
-outside the actual geometry are no-data.
+tile size are always pixel-aligned. Edge tiles extend to full tile size
+(never shrunk) but the EE expression should be clipped to the export
+region so that out-of-bounds pixels are nodata rather than computed.
 """
 
 from __future__ import annotations

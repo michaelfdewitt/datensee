@@ -20,6 +20,7 @@ from datensee.config import (
     PipelineConfig,
     RunnerConfig,
 )
+from datensee.expression import clip_expression
 from datensee.submit import submit_job
 from datensee.tiling import decompose_region
 
@@ -269,8 +270,10 @@ def demo(
     )
     console.print(f"  → {len(grid.tiles)} tiles")
 
+    clipped_expression = clip_expression(_DEMO_EXPRESSION, _DEMO_REGION)
+
     config = PipelineConfig(
-        ee_expression=_DEMO_EXPRESSION,
+        ee_expression=clipped_expression,
         gee_project=project,
         tile_grid=grid,
         output=OutputConfig(output_path=str(output.resolve())),
@@ -379,6 +382,9 @@ def export(
     # Unwrap Feature → geometry for tiling
     if geojson_geometry.get("type") == "Feature":
         geojson_geometry = geojson_geometry["geometry"]
+
+    # Clip expression to region so edge tiles get nodata outside the boundary.
+    ee_expression = clip_expression(ee_expression, geojson_geometry)
 
     console.print(f"[bold]Tiling region[/bold] at scale={scale}m, crs={crs}")
     tile_grid = decompose_region(
