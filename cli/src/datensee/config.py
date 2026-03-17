@@ -6,6 +6,7 @@ The serialized form matches pipeline-config.schema.json in /contract.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Literal
 
@@ -60,6 +61,10 @@ class OutputConfig(BaseModel):
     output_path: str = Field(
         description="Output path: GCS URI (gs://…) or local directory"
     )
+    band_count: int = Field(default=1, gt=0, description="Number of output bands")
+    data_type: Literal[
+        "float32", "float64", "int16", "int32", "uint8", "uint16"
+    ] = Field(default="float32", description="Pixel data type for output raster")
     cog: CogParameters = Field(default_factory=CogParameters)
 
 
@@ -106,6 +111,16 @@ class PipelineConfig(BaseModel):
     tile_grid: TileGrid
     output: OutputConfig
     runner: RunnerConfig = Field(default_factory=RunnerConfig)
+
+    @model_validator(mode="after")
+    def ee_expression_is_valid_json(self) -> PipelineConfig:
+        try:
+            json.loads(self.ee_expression)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError(
+                f"ee_expression must be a valid JSON string: {exc}"
+            ) from exc
+        return self
 
     def write_json(self, path: Path) -> None:
         """Serialize config to JSON file for handoff to the Java pipeline."""

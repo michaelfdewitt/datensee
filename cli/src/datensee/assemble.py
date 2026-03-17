@@ -15,6 +15,21 @@ from pathlib import Path
 
 from datensee.config import PipelineConfig, TileCoordinate
 
+# Map config data_type values to GDAL VRT DataType names.
+_DATA_TYPE_MAP: dict[str, str] = {
+    "float32": "Float32",
+    "float64": "Float64",
+    "int16": "Int16",
+    "int32": "Int32",
+    "uint8": "Byte",
+    "uint16": "UInt16",
+}
+
+
+def _vrt_data_type(config_type: str) -> str:
+    """Convert a config data_type string to the VRT DataType attribute value."""
+    return _DATA_TYPE_MAP.get(config_type, "Float32")
+
 
 def write_vrt(config: PipelineConfig, output_dir: Path) -> Path:
     """Generate a GDAL VRT mosaic from the tile grid and per-tile GeoTIFFs.
@@ -48,6 +63,9 @@ def write_vrt(config: PipelineConfig, output_dir: Path) -> Path:
     pixel_w = (all_x_max - all_x_min) / raster_x
     pixel_h = (all_y_max - all_y_min) / raster_y
 
+    band_count = config.output.band_count
+    data_type = _vrt_data_type(config.output.data_type)
+
     root = ET.Element("VRTDataset", rasterXSize=str(raster_x), rasterYSize=str(raster_y))
 
     ET.SubElement(root, "SRS").text = grid.crs
@@ -56,40 +74,47 @@ def write_vrt(config: PipelineConfig, output_dir: Path) -> Path:
         f"{all_x_min}, {pixel_w}, 0, {all_y_max}, 0, -{pixel_h}"
     )
 
-    band_el = ET.SubElement(root, "VRTRasterBand", dataType="Float32", band="1")
-    ET.SubElement(band_el, "NoDataValue").text = "nan"
-
-    for tile in tiles:
-        tif_name = f"tile_r{tile.row:04d}_c{tile.col:04d}.tif"
-        tif_path = output_dir / tif_name
-
-        # VRT y=0 is at the top (north); our row=0 is at the south.
-        dst_x = tile.col * tile_px
-        dst_y = (max_row - tile.row) * tile_px
-
-        src = ET.SubElement(band_el, "SimpleSource")
-        ET.SubElement(src, "SourceFilename", relativeToVRT="1").text = tif_name
-        ET.SubElement(src, "SourceBand").text = "1"
-        ET.SubElement(
-            src,
-            "SourceProperties",
-            RasterXSize=str(tile_px),
-            RasterYSize=str(tile_px),
-            DataType="Float32",
-            BlockXSize=str(tile_px),
-            BlockYSize="1",
+    for band_idx in range(1, band_count + 1):
+        band_el = ET.SubElement(
+            root, "VRTRasterBand", dataType=data_type, band=str(band_idx)
         )
-        ET.SubElement(
-            src, "SrcRect", xOff="0", yOff="0", xSize=str(tile_px), ySize=str(tile_px)
-        )
-        ET.SubElement(
-            src,
-            "DstRect",
-            xOff=str(dst_x),
-            yOff=str(dst_y),
-            xSize=str(tile_px),
-            ySize=str(tile_px),
-        )
+        ET.SubElement(band_el, "NoDataValue").text = "nan"
+
+        for tile in tiles:
+            tif_name = f"tile_r{tile.row:04d}_c{tile.col:04d}.tif"
+
+            # VRT y=0 is at the top (north); our row=0 is at the south.
+            dst_x = tile.col * tile_px
+            dst_y = (max_row - tile.row) * tile_px
+
+            src = ET.SubElement(band_el, "SimpleSource")
+            ET.SubElement(src, "SourceFilename", relativeToVRT="1").text = tif_name
+            ET.SubElement(src, "SourceBand").text = str(band_idx)
+            ET.SubElement(
+                src,
+                "SourceProperties",
+                RasterXSize=str(tile_px),
+                RasterYSize=str(tile_px),
+                DataType=data_type,
+                BlockXSize=str(tile_px),
+                BlockYSize="1",
+            )
+            ET.SubElement(
+                src,
+                "SrcRect",
+                xOff="0",
+                yOff="0",
+                xSize=str(tile_px),
+                ySize=str(tile_px),
+            )
+            ET.SubElement(
+                src,
+                "DstRect",
+                xOff=str(dst_x),
+                yOff=str(dst_y),
+                xSize=str(tile_px),
+                ySize=str(tile_px),
+            )
 
     tree = ET.ElementTree(root)
     ET.indent(tree, space="  ")

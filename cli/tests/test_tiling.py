@@ -65,3 +65,40 @@ def test_tile_row_col_are_non_negative() -> None:
     for tile in grid.tiles:
         assert tile.row >= 0
         assert tile.col >= 0
+
+
+# --- Projected CRS tests ---
+
+SF_BAY = {
+    "type": "Polygon",
+    "coordinates": [
+        [
+            [-122.5, 37.75],
+            [-122.25, 37.75],
+            [-122.25, 38.0],
+            [-122.5, 38.0],
+            [-122.5, 37.75],
+        ]
+    ],
+}
+
+
+def test_decompose_projected_crs_epsg32610() -> None:
+    """UTM Zone 10N: tile coordinates should be in meters, not degrees."""
+    grid = decompose_region(
+        SF_BAY, scale_meters=10.0, crs="EPSG:32610", tile_size_pixels=256
+    )
+    assert grid.crs == "EPSG:32610"
+    assert len(grid.tiles) >= 1
+
+    # UTM Zone 10N coordinates for SF Bay Area are ~5e5 easting, ~4.2e6 northing
+    for tile in grid.tiles:
+        assert tile.x_min > 1000, "UTM easting should be in meters, not degrees"
+        assert tile.y_min > 1000, "UTM northing should be in meters, not degrees"
+
+
+def test_decompose_projected_crs_produces_different_tiles() -> None:
+    """Same region in different CRS should produce different tile coordinates."""
+    grid_geo = decompose_region(SF_BAY, scale_meters=30.0, crs="EPSG:4326")
+    grid_utm = decompose_region(SF_BAY, scale_meters=30.0, crs="EPSG:32610")
+    assert grid_geo.tiles[0].x_min != grid_utm.tiles[0].x_min

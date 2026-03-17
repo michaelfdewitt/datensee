@@ -38,8 +38,20 @@ public record PipelineConfig(
     /** Output destination and COG parameters. */
     public record OutputConfig(
         @JsonProperty("output_path") String outputPath,
+        @JsonProperty("band_count") int bandCount,
+        @JsonProperty("data_type") String dataType,
         CogConfig cog
-    ) {}
+    ) {
+        /** Returns band count, defaulting to 1 if not set. */
+        public int effectiveBandCount() {
+            return bandCount > 0 ? bandCount : 1;
+        }
+
+        /** Returns data type, defaulting to float32 if not set. */
+        public String effectiveDataType() {
+            return dataType != null && !dataType.isBlank() ? dataType : "float32";
+        }
+    }
 
     /** Cloud Optimized GeoTIFF parameters. */
     public record CogConfig(

@@ -19,18 +19,25 @@ public final class TileFetchTransform
     private final String eeExpression;
     private final String geeProject;
     private final int tileSizePixels;
+    private final String crs;
 
-    public TileFetchTransform(String eeExpression, String geeProject, int tileSizePixels) {
+    public TileFetchTransform(
+        String eeExpression,
+        String geeProject,
+        int tileSizePixels,
+        String crs
+    ) {
         this.eeExpression = eeExpression;
         this.geeProject = geeProject;
         this.tileSizePixels = tileSizePixels;
+        this.crs = crs;
     }
 
     @Override
     public PCollection<FetchedTile> expand(PCollection<TileCoordinate> input) {
         return input.apply(
             "FetchTileFromEE",
-            ParDo.of(new TileFetchDoFn(eeExpression, geeProject, tileSizePixels))
+            ParDo.of(new TileFetchDoFn(eeExpression, geeProject, tileSizePixels, crs))
         );
     }
 }

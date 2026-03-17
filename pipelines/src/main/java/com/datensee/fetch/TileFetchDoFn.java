@@ -42,15 +42,22 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
     private final String eeExpression;
     private final String geeProject;
     private final int tileSizePixels;
+    private final String crs;
 
     // Transient: not serialized by Beam; recreated on each worker in @Setup.
     private transient HttpClient httpClient;
     private transient GoogleCredentials credentials;
 
-    public TileFetchDoFn(String eeExpression, String geeProject, int tileSizePixels) {
+    public TileFetchDoFn(
+        String eeExpression,
+        String geeProject,
+        int tileSizePixels,
+        String crs
+    ) {
         this.eeExpression = eeExpression;
         this.geeProject = geeProject;
         this.tileSizePixels = tileSizePixels;
+        this.crs = crs;
     }
 
     @Setup
@@ -169,7 +176,7 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
         ObjectNode grid = MAPPER.createObjectNode();
         grid.set("dimensions", dimensions);
         grid.set("affineTransform", affine);
-        grid.put("crsCode", "EPSG:4326");
+        grid.put("crsCode", crs);
 
         ObjectNode request = MAPPER.createObjectNode();
         request.set("expression", expressionNode);

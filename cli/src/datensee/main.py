@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 from rich.console import Console
+
+import pyproj
 
 from datensee import __version__
 from datensee.assemble import write_vrt
@@ -117,6 +120,77 @@ _DEMO_REGION = {
         ]
     ],
 }
+
+
+# ---------------------------------------------------------------------------
+# Input validation
+# ---------------------------------------------------------------------------
+
+_VALID_GEOJSON_TYPES = {"Polygon", "MultiPolygon"}
+_GCS_URI_PATTERN = "gs://"
+
+
+def _validate_inputs(
+    ee_expression: str,
+    geojson_geometry: dict[str, Any],
+    crs: str,
+    output: str,
+    runner: str,
+) -> list[str]:
+    """Validate export inputs before job submission. Returns list of errors."""
+    errors: list[str] = []
+
+    # 1. ee_expression must be valid JSON
+    try:
+        json.loads(ee_expression)
+    except (json.JSONDecodeError, TypeError) as exc:
+        errors.append(
+            f"Expression file is not valid JSON: {exc}. "
+            "Provide a file containing a serialized EE computation "
+            "(output of ee.serializer.encode())."
+        )
+
+    # 2. Region must be a Polygon or MultiPolygon (or Feature wrapping one)
+    geom_type = geojson_geometry.get("type")
+    if geom_type == "Feature":
+        geom_type = (geojson_geometry.get("geometry") or {}).get("type")
+    if geom_type == "FeatureCollection":
+        errors.append(
+            f"Region GeoJSON type is 'FeatureCollection', but a single "
+            f"Polygon or MultiPolygon is required. Extract one feature first."
+        )
+    elif geom_type not in _VALID_GEOJSON_TYPES:
+        errors.append(
+            f"Region GeoJSON type is '{geom_type}', but must be one of "
+            f"{sorted(_VALID_GEOJSON_TYPES)}. Points and lines cannot define "
+            f"an export region."
+        )
+
+    # 3. CRS must be parseable by pyproj
+    try:
+        pyproj.CRS.from_user_input(crs)
+    except pyproj.exceptions.CRSError as exc:
+        errors.append(
+            f"CRS '{crs}' is not recognized: {exc}. "
+            "Use an EPSG code (e.g. 'EPSG:4326') or a valid proj string."
+        )
+
+    # 4. Output path validation
+    if runner == "local" and not output.startswith(_GCS_URI_PATTERN):
+        output_path = Path(output)
+        parent = output_path if output_path.is_dir() else output_path.parent
+        if parent.exists() and not os.access(parent, os.W_OK):
+            errors.append(
+                f"Output directory '{parent}' is not writable. "
+                "Check permissions or choose a different path."
+            )
+    elif runner == "dataflow" and not output.startswith(_GCS_URI_PATTERN):
+        errors.append(
+            f"Dataflow mode requires a GCS output path (gs://…), "
+            f"but got '{output}'. Provide a GCS URI."
+        )
+
+    return errors
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +367,18 @@ def export(
     """Submit an Earth Engine export job to Cloud Dataflow (or local runner)."""
     ee_expression = expression_file.read_text().strip()
     geojson_geometry = json.loads(region_file.read_text())
+
+    validation_errors = _validate_inputs(
+        ee_expression, geojson_geometry, crs, output, runner
+    )
+    if validation_errors:
+        for err in validation_errors:
+            console.print(f"[red]Error:[/red] {err}")
+        raise typer.Exit(code=1)
+
+    # Unwrap Feature → geometry for tiling
+    if geojson_geometry.get("type") == "Feature":
+        geojson_geometry = geojson_geometry["geometry"]
 
     console.print(f"[bold]Tiling region[/bold] at scale={scale}m, crs={crs}")
     tile_grid = decompose_region(

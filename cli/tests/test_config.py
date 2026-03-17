@@ -97,3 +97,56 @@ def test_local_output_path_accepted() -> None:
         update={"output": OutputConfig(output_path="/tmp/datensee-output")}
     )
     assert config.output.output_path == "/tmp/datensee-output"
+
+
+def test_invalid_ee_expression_raises() -> None:
+    with pytest.raises(ValidationError, match="valid JSON"):
+        PipelineConfig(
+            ee_expression="not valid json {{{",
+            gee_project="my-project",
+            tile_grid=TileGrid(
+                crs="EPSG:4326",
+                scale_meters=30.0,
+                tiles=[
+                    TileCoordinate(x_min=0, y_min=0, x_max=1, y_max=1, row=0, col=0)
+                ],
+            ),
+            output=OutputConfig(output_path="/tmp/out"),
+        )
+
+
+def test_valid_ee_expression_accepted() -> None:
+    config = _minimal_config()
+    assert config.ee_expression == '{"result":"0","values":{}}'
+
+
+def test_band_count_default() -> None:
+    config = _minimal_config()
+    assert config.output.band_count == 1
+
+
+def test_data_type_default() -> None:
+    config = _minimal_config()
+    assert config.output.data_type == "float32"
+
+
+def test_multiband_config() -> None:
+    config = _minimal_config().model_copy(
+        update={
+            "output": OutputConfig(
+                output_path="/tmp/out", band_count=3, data_type="uint8"
+            )
+        }
+    )
+    assert config.output.band_count == 3
+    assert config.output.data_type == "uint8"
+
+
+def test_invalid_band_count_raises() -> None:
+    with pytest.raises(ValidationError):
+        OutputConfig(output_path="/tmp/out", band_count=0)
+
+
+def test_invalid_data_type_raises() -> None:
+    with pytest.raises(ValidationError):
+        OutputConfig(output_path="/tmp/out", data_type="complex128")

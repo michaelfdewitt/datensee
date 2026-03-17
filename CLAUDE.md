@@ -167,10 +167,11 @@ These are the areas where the real complexity lives:
 3. **Fail fast, fail loud.** Validate everything in Python before submitting the Dataflow job.
 4. **EE users aren't infra engineers.** Abstract away Dataflow concepts behind opinionated defaults with escape hatches.
 5. **COG to GCS is the primitive.** All other formats are GDAL post-processing.
+6. **Precision is everything.** You'll need to make sure that everything aligns exactly. Don't accept pixel misaligment or projection mismatches.
 
 ## Current Status
 
-🟡 **Project bootstrap** — Setting up toolchain and initial scaffolding.
+🟢 **M2: Real Config** — Arbitrary EE expressions, regions, scales, and CRS supported. Input validation, multi-band VRT, CRS propagation to Java pipeline.
 
 ## Milestones
 
