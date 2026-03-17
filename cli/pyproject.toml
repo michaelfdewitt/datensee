@@ -39,6 +39,9 @@ Issues = "https://github.com/datensee/datensee/issues"
 [project.scripts]
 datensee = "datensee.main:app"
 
+[project.optional-dependencies]
+eval = ["rasterio>=1.3"]
+
 [build-system]
 requires = ["uv_build>=0.10.10,<0.11.0"]
 build-backend = "uv_build"

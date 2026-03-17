@@ -299,8 +299,7 @@ def demo(
         tiles_ok = len(list(output.glob("tile_*.tif")))
         console.print(render_post_run_summary(duration, tiles_ok, 0, str(vrt)))
         console.print(
-            "\nConvert to COG with:\n"
-            f"  gdal_translate -of COG -co COMPRESS=LZW {vrt} ndvi.tif"
+            f"\nConvert to COG with:\n  gdal_translate -of COG -co COMPRESS=LZW {vrt} ndvi.tif"
         )
 
 
@@ -398,6 +397,13 @@ def export(
             min=0.01,
         ),
     ] = 1.0,
+    run_eval: Annotated[
+        bool,
+        typer.Option(
+            "--eval/--no-eval",
+            help="Run zero-cost evals after pipeline completes (local mode only).",
+        ),
+    ] = False,
 ) -> None:
     """Submit an Earth Engine export job to Cloud Dataflow (or local runner)."""
     import time as _time
@@ -407,9 +413,7 @@ def export(
     ee_expression = expression_file.read_text().strip()
     geojson_geometry = json.loads(region_file.read_text())
 
-    validation_errors = _validate_inputs(
-        ee_expression, geojson_geometry, crs, output, runner
-    )
+    validation_errors = _validate_inputs(ee_expression, geojson_geometry, crs, output, runner)
     if validation_errors:
         for err in validation_errors:
             console.print(f"[red]Error:[/red] {err}")
@@ -479,6 +483,15 @@ def export(
         tiles_ok = len(list(Path(output).glob("tile_*.tif")))
         tiles_failed = max(0, estimate.tile_count - tiles_ok)
         console.print(render_post_run_summary(duration, tiles_ok, tiles_failed, str(vrt)))
+
+    if not dry_run and run_eval and runner == "local" and not output.startswith("gs://"):
+        from datensee.eval import validate_output
+
+        console.print("\n[bold]Running evals[/bold]")
+        report = validate_output(Path(output), pipeline_config)
+        console.print(report.render())
+        if not report.all_passed:
+            raise typer.Exit(code=1)
 
 
 # ---------------------------------------------------------------------------
@@ -557,3 +570,94 @@ def jar_build_cmd() -> None:
     except (FileNotFoundError, subprocess.CalledProcessError) as exc:
         console.print(f"[red]Build failed:[/red] {exc}")
         raise typer.Exit(code=1) from exc
+
+
+# ---------------------------------------------------------------------------
+# eval command
+# ---------------------------------------------------------------------------
+
+
+@app.command("eval")
+def eval_cmd(
+    output_path: Annotated[
+        str,
+        typer.Argument(help="Output directory (local) or GCS prefix to validate."),
+    ],
+    config_file: Annotated[
+        Path,
+        typer.Option(
+            "--config",
+            "-c",
+            help="Pipeline config JSON file that produced the output.",
+            exists=True,
+            readable=True,
+        ),
+    ],
+    evals: Annotated[
+        str | None,
+        typer.Option(
+            "--evals",
+            "-e",
+            help="Comma-separated eval IDs to run (e.g. E01,E03,E07). Default: all zero-cost.",
+        ),
+    ] = None,
+    sample: Annotated[
+        int,
+        typer.Option("--sample", help="Tile sample size for sampling-based evals."),
+    ] = 20,
+    reference: Annotated[
+        bool,
+        typer.Option(
+            "--reference",
+            help="Enable E07 pixel accuracy eval (costs EECUs).",
+        ),
+    ] = False,
+    gee_project: Annotated[
+        str | None,
+        typer.Option("--gee-project", help="GCP project for E07 reference fetches."),
+    ] = None,
+    json_output: Annotated[
+        Path | None,
+        typer.Option("--json", help="Write machine-readable JSON report to this file."),
+    ] = None,
+) -> None:
+    """Validate pipeline output with the DatensEE eval suite.
+
+    Runs structural, spatial, and pixel-level checks against exported tiles.
+    By default runs all zero-cost evals (E01-E06, E08-E10). Use --reference
+    to also run E07 (pixel value comparison against EE HV API).
+    """
+    from datensee.eval import EvalID, validate_output, zero_cost_evals
+
+    config = PipelineConfig.read_json(config_file)
+
+    # Parse eval IDs
+    eval_ids: list[EvalID] | None = None
+    if evals:
+        eval_ids = [EvalID(e.strip().upper()) for e in evals.split(",")]
+    elif reference:
+        eval_ids = zero_cost_evals() + [EvalID.E07]
+
+    # E07 requires a project
+    if eval_ids and EvalID.E07 in eval_ids and not gee_project:
+        project = config.gee_project
+        console.print(f"[dim]Using gee_project from config: {project}[/dim]")
+    else:
+        project = gee_project
+
+    report = validate_output(
+        output_path,
+        config,
+        evals=eval_ids,
+        sample_size=sample,
+        gee_project=project,
+    )
+
+    console.print(report.render())
+
+    if json_output:
+        json_output.write_text(json.dumps(report.to_dict(), indent=2))
+        console.print(f"[dim]Report written to {json_output}[/dim]")
+
+    if not report.all_passed:
+        raise typer.Exit(code=1)

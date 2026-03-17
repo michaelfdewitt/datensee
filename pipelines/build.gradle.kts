@@ -15,6 +15,13 @@ java {
     }
 }
 
+tasks.withType<JavaCompile>().configureEach {
+    // Dataflow workers run Java 21 — emit Java 21 bytecode even though we
+    // compile with Java 25.  The --release flag also restricts the API surface
+    // to JDK 21, catching accidental use of newer APIs at compile time.
+    options.release.set(21)
+}
+
 repositories {
     mavenCentral()
 }

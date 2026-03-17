@@ -184,6 +184,7 @@ These are the areas where the real complexity lives:
 3. **M3: Scale** ✅ — Partial failure tolerance, per-worker rate limiting, smart retry classification, file-based tile input, VRT assembly.
 4. **M4: UX Polish** ✅ — Rich progress bar (local mode), cost estimation (EECU range, Dataflow USD, storage), summary panels, confirmation for large jobs, enhanced Dataflow status polling with metrics.
 5. **M5: Distribution** ✅ — `pip install datensee`, smart JAR discovery, `datensee jar` subcommands (download/build/path), Apache 2.0 license, full PyPI metadata.
+6. **M6: Two-Tier Tiling** — Separate compute tiles (small, for EE HV API) from output tiles (large, for practical file counts). Compute tiles are fetched in parallel, then grouped by output tile via a Beam GroupByKey + shuffle, assembled into larger rasters, and written as COGs. This decouples fetch parallelism from output file granularity.
 
 ## Testing
 

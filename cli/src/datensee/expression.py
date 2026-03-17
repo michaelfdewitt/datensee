@@ -28,19 +28,64 @@ def clip_expression(ee_expression: str, geojson_geometry: dict[str, Any]) -> str
     """
     original = json.loads(ee_expression)
 
+    # EE Cloud API serialization uses a flat {result, values} structure where
+    # "result" names the root node and "values" is a map of node-id → node.
+    # To compose expressions we merge value maps and use valueReference to
+    # point from the clip's "input" argument to the original expression's root.
+    original_result = original["result"]
+    original_values = original.get("values", {})
+
+    # Pick keys for new nodes that don't collide with the original.
+    used_keys = set(original_values.keys())
+
+    def _next_key(prefix: str) -> str:
+        candidate = f"{prefix}_0"
+        i = 0
+        while candidate in used_keys:
+            i += 1
+            candidate = f"{prefix}_{i}"
+        used_keys.add(candidate)
+        return candidate
+
+    geom_key = _next_key("_geom")
+    clip_key = _next_key("_clip")
+
+    merged_values = {**original_values}
+
+    # Image.clip expects an EE Geometry, not raw GeoJSON. Use
+    # GeometryConstructors.Polygon (or .MultiPolygon) to construct a
+    # proper EE geometry from the coordinate array.
+    geom_type = geojson_geometry.get("type", "Polygon")
+    if geom_type == "Polygon":
+        constructor = "GeometryConstructors.Polygon"
+    elif geom_type == "MultiPolygon":
+        constructor = "GeometryConstructors.MultiPolygon"
+    else:
+        msg = f"Unsupported geometry type for clip: {geom_type}"
+        raise ValueError(msg)
+
+    merged_values[geom_key] = {
+        "functionInvocationValue": {
+            "functionName": constructor,
+            "arguments": {
+                "coordinates": {"constantValue": geojson_geometry["coordinates"]},
+            },
+        }
+    }
+
+    merged_values[clip_key] = {
+        "functionInvocationValue": {
+            "functionName": "Image.clip",
+            "arguments": {
+                "input": {"valueReference": original_result},
+                "geometry": {"valueReference": geom_key},
+            },
+        }
+    }
+
     clipped = {
-        "result": "0",
-        "values": {
-            "0": {
-                "functionInvocationValue": {
-                    "functionName": "Image.clip",
-                    "arguments": {
-                        "input": original,
-                        "geometry": {"constantValue": geojson_geometry},
-                    },
-                }
-            }
-        },
+        "result": clip_key,
+        "values": merged_values,
     }
 
     return json.dumps(clipped)

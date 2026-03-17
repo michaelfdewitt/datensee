@@ -1,10 +1,3 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://em-content.zobj.net/source/apple/391/satellite_1f6f0.png" width="80">
-    <img src="https://em-content.zobj.net/source/apple/391/satellite_1f6f0.png" width="80" alt="satellite">
-  </picture>
-</p>
-
 <h1 align="center">DatensEE</h1>
 
 <p align="center">
@@ -32,16 +25,14 @@ datensee export expression.json region.geojson \
 
 ## Why
 
-Earth Engine is great at computing things. It is not great at getting large
-results *out*. The built-in `Export.image.toDrive()` is single-threaded,
-capped at ~1 billion pixels, and silently fails on anything ambitious.
+Earth Engine is great at computing things, but the built-in `Export.image.*` functions were designed in an era that predates the Cambrian explosion of easy and affordable cloud processing tools.
 
 DatensEE doesn't recompile or interpret your computation — EE does that.
 We just call the [High Volume API](https://developers.google.com/earth-engine/reference/rest/v1/projects.image/computePixels)
 thousands of times in parallel, with proper tiling, retries, and rate limiting,
 and stitch the results together.
 
-**EE is the computation engine. We are the parallelism engine.**
+**EE is the computation engine. DatensEE is the parallelism engine.**
 
 ## How it works
 
@@ -54,10 +45,10 @@ and stitch the results together.
                                      │ High Volume API
                                      │ (thousands of concurrent tile fetches)
                                      │
-┌──────────────┐          ┌──────────┴───────────────────┐          ┌────────────┐
-│  datensee    │─────────▶│     Cloud Dataflow            │─────────▶│    GCS     │
-│  CLI         │ submits   │                               │ writes   │   (COG)    │
-│              │ job       │  Tile coords → ParDo: fetch  │ output   │            │
+┌──────────────┐          ┌──────────┴────────────────────┐          ┌────────────┐
+│  DatensEE    │─────────▶│     Cloud Dataflow            │─────────▶│    GCS     │
+│  CLI         │ submits  │                               │ writes   │   (COG)    │
+│              │ job      │  Tile coords → ParDo: fetch   │ output   │            │
 │  • Validate  │          │  → Assemble raster            │          │            │
 │  • Tile      │          │  → Write COG                  │          │            │
 │  • Submit    │          │                               │          │            │
@@ -207,8 +198,9 @@ datensee/
 │   │   ├── config.py    Pipeline config models
 │   │   ├── tiling.py    Region → globally-aligned tile grid
 │   │   ├── assemble.py  VRT mosaic assembly (multi-band, any data type)
-│   │   └── submit.py    Dataflow job submission
-│   └── tests/           78 tests (unit + EE HV API integration)
+│   │   ├── submit.py    Dataflow job submission
+│   │   └── eval/        Output validation: 10 evals (structural, spatial, pixel-level)
+│   └── tests/           Unit + EE HV API integration + eval tests
 ├── pipelines/           Java Beam pipeline (Gradle)
 │   └── src/main/java/com/datensee/
 │       ├── DatensEEPipeline.java
@@ -249,13 +241,9 @@ The integration suite includes:
 | M3: Scale | Done | Rate limiting, retry, adaptive tiling, COG output |
 | M4: UX Polish | Done | Rich progress, cost estimation, summary panels |
 | M5: Distribution | Done | `pip install datensee`, prebuilt JARs, JAR management |
+| Evals | Done | 10 output validation evals — structural, spatial, pixel-level ([details](EVALS.md)) |
+| M6: Two-Tier Tiling | Next | Separate compute tiles from output tiles for practical file counts |
 
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
-
-<!--
-  If you're reading the source of this README, hi Steve!
-  Yes, we are hitting your HV endpoint very hard and we are not sorry.
-  (But we are being polite about rate limiting. Mostly.)
--->

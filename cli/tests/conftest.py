@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import httpx
 
@@ -17,10 +16,28 @@ def pytest_addoption(parser: object) -> None:
         help="Run integration tests that hit the EE High Volume API.",
     )
     parser.addoption(
+        "--scale",
+        action="store_true",
+        default=False,
+        help="Run large-scale Dataflow tests (costs real money).",
+    )
+    parser.addoption(
         "--gee-project",
         action="store",
         default=None,
         help="GCP project ID for EE integration tests.",
+    )
+    parser.addoption(
+        "--gcs-bucket",
+        action="store",
+        default=None,
+        help="GCS bucket name for scale test output (e.g. 'datensee-testing').",
+    )
+    parser.addoption(
+        "--keep-output",
+        action="store_true",
+        default=False,
+        help="Keep GCS output from scale tests instead of cleaning up.",
     )
 
 
@@ -29,16 +46,29 @@ def pytest_configure(config: object) -> None:
         "markers",
         "integration: marks tests that call the real EE High Volume API",
     )
+    config.addinivalue_line(
+        "markers",
+        "scale: marks large-scale Dataflow tests that cost real money",
+    )
 
 
 def pytest_collection_modifyitems(config: object, items: list) -> None:
-    if not config.getoption("--integration"):
-        skip = __import__("pytest").mark.skip(
-            reason="Integration tests require --integration flag"
-        )
-        for item in items:
-            if "integration" in item.keywords:
-                item.add_marker(skip)
+    skip_integration = not config.getoption("--integration")
+    skip_scale = not config.getoption("--scale")
+
+    for item in items:
+        if skip_integration and "integration" in item.keywords:
+            item.add_marker(
+                __import__("pytest").mark.skip(
+                    reason="Integration tests require --integration flag"
+                )
+            )
+        if skip_scale and "scale" in item.keywords:
+            item.add_marker(
+                __import__("pytest").mark.skip(
+                    reason="Scale tests require --scale flag (costs real money)"
+                )
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +104,7 @@ def _get_eecu_total(project: str, token: str, since: str, until: str) -> float:
 
 
 def _utc_iso(t: float) -> str:
-    return datetime.fromtimestamp(t, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.fromtimestamp(t, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def pytest_sessionstart(session: object) -> None:
