@@ -1,7 +1,7 @@
-package com.geedf.fetch;
+package com.datensee.fetch;
 
-import com.geedf.FetchedTile;
-import com.geedf.TileCoordinate;
+import com.datensee.FetchedTile;
+import com.datensee.TileCoordinate;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.values.PCollection;

@@ -1,1 +1,1 @@
-rootProject.name = "gee-df-pipeline"
+rootProject.name = "datensee-pipeline"

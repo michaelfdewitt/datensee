@@ -1,7 +1,7 @@
-package com.geedf.io;
+package com.datensee.io;
 
-import com.geedf.FetchedTile;
-import com.geedf.PipelineConfig.OutputConfig;
+import com.datensee.FetchedTile;
+import com.datensee.PipelineConfig.OutputConfig;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.values.PCollection;

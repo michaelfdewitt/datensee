@@ -4,7 +4,7 @@ plugins {
     checkstyle
 }
 
-group = "com.geedf"
+group = "com.datensee"
 version = "0.1.0"
 
 java {
@@ -59,13 +59,13 @@ tasks.test {
 }
 
 tasks.shadowJar {
-    archiveBaseName.set("gee-df-pipeline")
+    archiveBaseName.set("datensee-pipeline")
     archiveClassifier.set("")
     archiveVersion.set(version.toString())
     isZip64 = true
     mergeServiceFiles()
     manifest {
-        attributes["Main-Class"] = "com.geedf.GeeDataflowPipeline"
+        attributes["Main-Class"] = "com.datensee.DatensEEPipeline"
     }
 }
 

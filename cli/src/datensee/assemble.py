@@ -13,7 +13,7 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from gee_df.config import PipelineConfig, TileCoordinate
+from datensee.config import PipelineConfig, TileCoordinate
 
 
 def write_vrt(config: PipelineConfig, output_dir: Path) -> Path:

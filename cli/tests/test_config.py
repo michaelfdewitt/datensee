@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from gee_df.config import (
+from datensee.config import (
     CogParameters,
     DataflowRunnerConfig,
     OutputConfig,
@@ -94,6 +94,6 @@ def test_dataflow_runner_config() -> None:
 
 def test_local_output_path_accepted() -> None:
     config = _minimal_config().model_copy(
-        update={"output": OutputConfig(output_path="/tmp/gee-df-output")}
+        update={"output": OutputConfig(output_path="/tmp/datensee-output")}
     )
-    assert config.output.output_path == "/tmp/gee-df-output"
+    assert config.output.output_path == "/tmp/datensee-output"

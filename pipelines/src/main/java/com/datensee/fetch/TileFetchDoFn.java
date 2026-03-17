@@ -1,10 +1,10 @@
-package com.geedf.fetch;
+package com.datensee.fetch;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.geedf.FetchedTile;
-import com.geedf.TileCoordinate;
+import com.datensee.FetchedTile;
+import com.datensee.TileCoordinate;
 import com.google.auth.oauth2.GoogleCredentials;
 import java.io.IOException;
 import java.net.URI;

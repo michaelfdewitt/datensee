@@ -14,7 +14,7 @@ import pyproj
 from shapely.geometry import Polygon, mapping, shape
 from shapely.ops import transform
 
-from gee_df.config import TileCoordinate, TileGrid
+from datensee.config import TileCoordinate, TileGrid
 
 
 def _reproject_geometry(

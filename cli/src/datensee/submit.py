@@ -12,7 +12,7 @@ from pathlib import Path
 
 from rich.console import Console
 
-from gee_df.config import PipelineConfig
+from datensee.config import PipelineConfig
 
 console = Console()
 

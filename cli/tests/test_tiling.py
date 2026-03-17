@@ -2,7 +2,7 @@
 
 import pytest
 
-from gee_df.tiling import decompose_region
+from datensee.tiling import decompose_region
 
 
 CALIFORNIA_BBOX = {

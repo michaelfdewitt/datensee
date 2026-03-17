@@ -1,10 +1,10 @@
-package com.geedf;
+package com.datensee;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
-import com.geedf.fetch.TileFetchTransform;
-import com.geedf.io.CogWriter;
-import com.geedf.options.GeeDataflowOptions;
+import com.datensee.fetch.TileFetchTransform;
+import com.datensee.io.CogWriter;
+import com.datensee.options.DatensEEOptions;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -16,25 +16,25 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Entry point for the GEE Dataflow pipeline.
+ * Entry point for the DatensEE pipeline.
  *
  * <p>Reads a {@code pipeline-config.json} describing the EE computation,
  * tile grid, and output destination; then orchestrates distributed tile
  * fetching via the Earth Engine High Volume API and COG assembly.
  */
-public final class GeeDataflowPipeline {
+public final class DatensEEPipeline {
 
-    private static final Logger LOG = LoggerFactory.getLogger(GeeDataflowPipeline.class);
+    private static final Logger LOG = LoggerFactory.getLogger(DatensEEPipeline.class);
     private static final ObjectMapper MAPPER = new ObjectMapper()
         .registerModule(new JavaTimeModule());
 
-    private GeeDataflowPipeline() {}
+    private DatensEEPipeline() {}
 
     public static void main(String[] args) throws IOException {
-        GeeDataflowOptions options = PipelineOptionsFactory
+        DatensEEOptions options = PipelineOptionsFactory
             .fromArgs(args)
             .withValidation()
-            .as(GeeDataflowOptions.class);
+            .as(DatensEEOptions.class);
 
         run(options);
     }
@@ -44,7 +44,7 @@ public final class GeeDataflowPipeline {
      *
      * @param options parsed pipeline options (includes path to config JSON)
      */
-    static void run(GeeDataflowOptions options) throws IOException {
+    static void run(DatensEEOptions options) throws IOException {
         PipelineConfig config = loadConfig(options.getConfigFile());
         int tileSize = config.tileGrid().effectiveTileSize();
 

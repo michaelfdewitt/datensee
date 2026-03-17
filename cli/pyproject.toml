@@ -1,7 +1,7 @@
 [project]
-name = "gee-df"
+name = "datensee"
 version = "0.1.0"
-description = "Parallelize Google Earth Engine exports via Cloud Dataflow"
+description = "DatensEE: Parallelize Google Earth Engine exports via Cloud Dataflow"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-gee-df = "gee_df.main:app"
+datensee = "datensee.main:app"
 
 [build-system]
 requires = ["uv_build>=0.10.10,<0.11.0"]

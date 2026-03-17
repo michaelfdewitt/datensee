@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/gee-df/contract/pipeline-config.schema.json",
+  "$id": "https://github.com/datensee/contract/pipeline-config.schema.json",
   "title": "PipelineConfig",
   "description": "Contract between the Python CLI and the Java Beam pipeline.",
   "type": "object",

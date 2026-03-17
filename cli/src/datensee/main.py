@@ -1,4 +1,4 @@
-"""Typer CLI entrypoint for gee-df."""
+"""Typer CLI entrypoint for DatensEE."""
 
 from __future__ import annotations
 
@@ -9,26 +9,26 @@ from typing import Annotated
 import typer
 from rich.console import Console
 
-from gee_df import __version__
-from gee_df.assemble import write_vrt
-from gee_df.config import (
+from datensee import __version__
+from datensee.assemble import write_vrt
+from datensee.config import (
     DataflowRunnerConfig,
     OutputConfig,
     PipelineConfig,
     RunnerConfig,
 )
-from gee_df.submit import submit_job
-from gee_df.tiling import decompose_region
+from datensee.submit import submit_job
+from datensee.tiling import decompose_region
 
 app = typer.Typer(
-    name="gee-df",
-    help="Parallelize Google Earth Engine exports via Cloud Dataflow.",
+    name="datensee",
+    help="DatensEE: Parallelize Google Earth Engine exports via Cloud Dataflow.",
     no_args_is_help=True,
 )
 console = Console()
 
 _DEFAULT_JAR = (
-    Path(__file__).parents[5] / "pipelines" / "build" / "libs" / "gee-df-pipeline.jar"
+    Path(__file__).parents[5] / "pipelines" / "build" / "libs" / "datensee-pipeline.jar"
 )
 
 # ---------------------------------------------------------------------------
@@ -106,7 +106,7 @@ _DEMO_REGION = {
 
 def _version_callback(value: bool) -> None:
     if value:
-        console.print(f"gee-df {__version__}")
+        console.print(f"DatensEE {__version__}")
         raise typer.Exit()
 
 
@@ -142,7 +142,7 @@ def demo(
             "-o",
             help="Local directory for output tiles + VRT. Created if absent.",
         ),
-    ] = Path("./gee-df-output"),
+    ] = Path("./datensee-output"),
     jar: Annotated[
         Path,
         typer.Option("--jar", help="Path to the compiled pipeline JAR."),
@@ -162,7 +162,7 @@ def demo(
     """
     output.mkdir(parents=True, exist_ok=True)
 
-    console.print("[bold]gee-df M1 demo[/bold] — Landsat 9 NDVI, SF Bay Area")
+    console.print("[bold]DatensEE M1 demo[/bold] — Landsat 9 NDVI, SF Bay Area")
     console.print(f"  project : {project}")
     console.print(f"  output  : {output.resolve()}")
 
@@ -332,8 +332,8 @@ def status(
     ] = "us-central1",
 ) -> None:
     """Poll a Dataflow job until it reaches a terminal state."""
-    from gee_df.auth import get_access_token
-    from gee_df.status import poll_job
+    from datensee.auth import get_access_token
+    from datensee.status import poll_job
 
     access_token = get_access_token()
     final_state = poll_job(

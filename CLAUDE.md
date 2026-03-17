@@ -1,4 +1,4 @@
-# CLAUDE.md — GEE Dataflow Orchestrator
+# CLAUDE.md — DatensEE Orchestrator
 
 ## What This Project Is
 
@@ -66,12 +66,12 @@ The pipeline config passed from Python → Java. Defines:
 ## Repository Structure
 
 ```
-gee-dataflow/
+datensee/
 ├── CLAUDE.md
 ├── cli/
 │   ├── pyproject.toml
 │   ├── src/
-│   │   └── gee_df/
+│   │   └── datensee/
 │   │       ├── __init__.py
 │   │       ├── main.py          ← Typer app entrypoint
 │   │       ├── config.py        ← Pydantic models for pipeline config
@@ -82,12 +82,12 @@ gee-dataflow/
 ├── pipelines/
 │   ├── build.gradle.kts
 │   ├── src/main/java/
-│   │   └── com/geedf/
-│   │       ├── GeeDataflowPipeline.java  ← Beam pipeline definition
-│   │       ├── options/                   ← PipelineOptions
-│   │       ├── fetch/                     ← HV API client, rate limiter, retry logic
-│   │       ├── assemble/                  ← Tile → raster assembly
-│   │       └── io/                        ← COG writer, GCS sink
+│   │   └── com/datensee/
+│   │       ├── DatensEEPipeline.java  ← Beam pipeline definition
+│   │       ├── options/               ← PipelineOptions
+│   │       ├── fetch/                 ← HV API client, rate limiter, retry logic
+│   │       ├── assemble/              ← Tile → raster assembly
+│   │       └── io/                    ← COG writer, GCS sink
 │   └── src/test/java/
 ├── contract/
 │   ├── pipeline-config.schema.json
@@ -178,7 +178,7 @@ These are the areas where the real complexity lives:
 2. **M2: Real Config** — Pipeline config schema defined. CLI accepts arbitrary EE expressions, regions, scales. Local runner works for small jobs.
 3. **M3: Scale** — Rate limiting, retry logic, adaptive tiling, COG output, large-region support.
 4. **M4: UX Polish** — Rich progress output, log streaming, `status` / `logs` / `cancel` subcommands, cost estimation.
-5. **M5: Distribution** — `pip install gee-df`, prebuilt pipeline JARs, documentation, quickstart guide.
+5. **M5: Distribution** — `pip install datensee`, prebuilt pipeline JARs, documentation, quickstart guide.
 
 ## Notes for Claude
 
