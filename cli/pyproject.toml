@@ -2,7 +2,7 @@
 name = "datensee"
 version = "0.1.0"
 description = "DatensEE: Parallelize Google Earth Engine exports via Cloud Dataflow"
-readme = "../README.md"
+readme = {text = "DatensEE: Parallelize Google Earth Engine exports via Cloud Dataflow", content-type = "text/plain"}
 requires-python = ">=3.12"
 license = "Apache-2.0"
 authors = [{ name = "DatensEE Contributors" }]

@@ -45,53 +45,50 @@ def is_colab() -> bool:
 def ensure_auth() -> None:
     """Ensure GCP credentials are available, triggering Colab auth if needed.
 
-    In Colab: if Application Default Credentials are not configured, triggers
-    the interactive ``google.colab.auth.authenticate_user()`` flow, then
-    exports credentials to the standard ADC file so that Java subprocesses
-    (the Beam pipeline) can also discover them.
+    In Colab: always calls ``google.colab.auth.authenticate_user()`` (idempotent
+    — won't re-prompt if already authed), then exports user credentials to the
+    standard ADC file so that Java subprocesses can discover them.
 
     Outside Colab: no-ops if ADC is available, raises if not.
     """
-    try:
-        import google.auth
-
-        google.auth.default()
-    except Exception:
-        if is_colab():
-            from google.colab import auth  # type: ignore[import-untyped]
-
-            auth.authenticate_user()
-        else:
-            raise
-
     if is_colab():
+        from google.colab import auth  # type: ignore[import-untyped]
+
+        auth.authenticate_user()
         _export_adc_for_java()
+        return
+
+    import google.auth
+
+    google.auth.default()
 
 
 def _export_adc_for_java() -> None:
     """Write Python credentials to the standard ADC file for Java subprocesses.
 
-    Colab's ``authenticate_user()`` makes credentials available to Python via
-    ``google.auth.default()``, but does not write them to the well-known file
-    that Java's ``GoogleCredentials.getApplicationDefault()`` checks. This
-    bridges the gap by serializing the Python credentials to
+    Colab's ``authenticate_user()`` makes credentials available to Python but
+    not to the well-known file that Java's ``GoogleCredentials.getApplicationDefault()``
+    checks. This bridges the gap by serializing the user credentials to
     ``~/.config/gcloud/application_default_credentials.json``.
+
+    Best-effort — silently skips if credentials lack the required fields
+    (e.g. GCE compute credentials instead of user OAuth credentials).
     """
     import json as _json
 
     import google.auth
-    import google.auth.transport.requests
 
     adc_path = Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
     if adc_path.exists():
         return
 
-    creds, _ = google.auth.default()
+    try:
+        creds, _ = google.auth.default()
+    except Exception:
+        return
 
-    # Refresh to ensure we have a valid token and refresh_token
-    creds.refresh(google.auth.transport.requests.Request())
-
-    # User credentials (from Colab OAuth flow) have client_id/secret/refresh_token
+    # Only user credentials (from the Colab OAuth flow) have these fields.
+    # GCE compute credentials don't — skip without error.
     client_id = getattr(creds, "client_id", None)
     client_secret = getattr(creds, "client_secret", None)
     refresh_token = getattr(creds, "refresh_token", None)
