@@ -46,7 +46,9 @@ def ensure_auth() -> None:
     """Ensure GCP credentials are available, triggering Colab auth if needed.
 
     In Colab: if Application Default Credentials are not configured, triggers
-    the interactive ``google.colab.auth.authenticate_user()`` flow.
+    the interactive ``google.colab.auth.authenticate_user()`` flow, then
+    exports credentials to the standard ADC file so that Java subprocesses
+    (the Beam pipeline) can also discover them.
 
     Outside Colab: no-ops if ADC is available, raises if not.
     """
@@ -61,6 +63,51 @@ def ensure_auth() -> None:
             auth.authenticate_user()
         else:
             raise
+
+    if is_colab():
+        _export_adc_for_java()
+
+
+def _export_adc_for_java() -> None:
+    """Write Python credentials to the standard ADC file for Java subprocesses.
+
+    Colab's ``authenticate_user()`` makes credentials available to Python via
+    ``google.auth.default()``, but does not write them to the well-known file
+    that Java's ``GoogleCredentials.getApplicationDefault()`` checks. This
+    bridges the gap by serializing the Python credentials to
+    ``~/.config/gcloud/application_default_credentials.json``.
+    """
+    import json as _json
+
+    import google.auth
+    import google.auth.transport.requests
+
+    adc_path = Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
+    if adc_path.exists():
+        return
+
+    creds, _ = google.auth.default()
+
+    # Refresh to ensure we have a valid token and refresh_token
+    creds.refresh(google.auth.transport.requests.Request())
+
+    # User credentials (from Colab OAuth flow) have client_id/secret/refresh_token
+    client_id = getattr(creds, "client_id", None)
+    client_secret = getattr(creds, "client_secret", None)
+    refresh_token = getattr(creds, "refresh_token", None)
+
+    if not all([client_id, client_secret, refresh_token]):
+        return
+
+    adc = {
+        "type": "authorized_user",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token,
+    }
+
+    adc_path.parent.mkdir(parents=True, exist_ok=True)
+    adc_path.write_text(_json.dumps(adc))
 
 
 # ---------------------------------------------------------------------------
