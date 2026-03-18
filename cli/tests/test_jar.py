@@ -42,9 +42,7 @@ class TestFindJar:
         monkeypatch.setattr("datensee.jar._CACHE_DIR", cache_dir)
         assert find_jar() == jar
 
-    def test_no_jar_anywhere_raises(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_no_jar_anywhere_raises(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("DATENSEE_JAR", raising=False)
         monkeypatch.setattr("datensee.jar._CACHE_DIR", tmp_path / "empty_cache")
         monkeypatch.setattr("datensee.jar._REPO_JAR", tmp_path / "nonexistent.jar")
@@ -61,9 +59,7 @@ class TestJarPath:
         monkeypatch.setattr("datensee.jar._REPO_JAR", tmp_path / "nope.jar")
         assert jar_path() is None
 
-    def test_returns_path_when_found(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_path_when_found(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         jar = tmp_path / JAR_FILENAME
         jar.write_bytes(b"fake jar")
         monkeypatch.setenv("DATENSEE_JAR", str(jar))

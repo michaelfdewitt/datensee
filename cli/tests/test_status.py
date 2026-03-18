@@ -5,14 +5,13 @@ Uses pytest-httpx to mock the Dataflow REST API.
 
 from __future__ import annotations
 
-import pytest
 from pytest_httpx import HTTPXMock
 from rich.table import Table
 
 from datensee.status import (
+    TERMINAL_STATES,
     JobInfo,
     JobState,
-    TERMINAL_STATES,
     _fetch_job_info,
     _parse_elapsed,
     _parse_metrics,
@@ -20,8 +19,9 @@ from datensee.status import (
     poll_job,
 )
 
-
-_BASE_URL = "https://dataflow.googleapis.com/v1b3/projects/test-project/locations/us-central1/jobs/job-123"
+_BASE_URL = (
+    "https://dataflow.googleapis.com/v1b3/projects/test-project/locations/us-central1/jobs/job-123"
+)
 _HEADERS = {"Authorization": "Bearer fake-token"}
 
 
@@ -171,7 +171,10 @@ class TestPollJob:
             json={"currentState": "JOB_STATE_DONE"},
         )
         state = poll_job(
-            "job-123", "test-project", "us-central1", "fake-token",
+            "job-123",
+            "test-project",
+            "us-central1",
+            "fake-token",
             poll_interval_seconds=0,
         )
         assert state == JobState.DONE
@@ -187,7 +190,10 @@ class TestPollJob:
             json={"currentState": "JOB_STATE_DONE"},
         )
         state = poll_job(
-            "job-123", "test-project", "us-central1", "fake-token",
+            "job-123",
+            "test-project",
+            "us-central1",
+            "fake-token",
             poll_interval_seconds=0,
         )
         assert state == JobState.DONE
@@ -198,7 +204,10 @@ class TestPollJob:
             json={"currentState": "JOB_STATE_FAILED"},
         )
         state = poll_job(
-            "job-123", "test-project", "us-central1", "fake-token",
+            "job-123",
+            "test-project",
+            "us-central1",
+            "fake-token",
             poll_interval_seconds=0,
         )
         assert state == JobState.FAILED

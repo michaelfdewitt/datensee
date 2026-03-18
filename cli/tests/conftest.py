@@ -75,9 +75,7 @@ def pytest_collection_modifyitems(config: object, items: list) -> None:
 # EECU usage tracking
 # ---------------------------------------------------------------------------
 
-_MONITORING_URL = (
-    "https://monitoring.googleapis.com/v3/projects/{project}/timeSeries"
-)
+_MONITORING_URL = "https://monitoring.googleapis.com/v3/projects/{project}/timeSeries"
 
 
 def _get_eecu_total(project: str, token: str, since: str, until: str) -> float:
@@ -131,9 +129,8 @@ def pytest_sessionfinish(session: object, exitstatus: int) -> None:
     # Get a token for the monitoring API.
     try:
         from datensee.auth import get_access_token
-        token = get_access_token(
-            scopes=["https://www.googleapis.com/auth/monitoring.read"]
-        )
+
+        token = get_access_token(scopes=["https://www.googleapis.com/auth/monitoring.read"])
     except Exception:
         return
 

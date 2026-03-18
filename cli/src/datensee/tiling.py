@@ -80,11 +80,9 @@ def decompose_region(
     pixel_native = _pixel_size_native(crs, scale_meters)
     tile_size_native = pixel_native * tile_size_pixels
 
-    # Snap grid origin to global (0, 0) — floor to the nearest tile boundary.
-    grid_x_min = math.floor(minx / tile_size_native) * tile_size_native
-    grid_y_min = math.floor(miny / tile_size_native) * tile_size_native
-
     # Tile indices and counts — ceil ensures we cover the full bbox.
+    # Grid origin is implicitly (0, 0) in the target CRS: tile boundaries
+    # are aligned to col * tile_size_native, row * tile_size_native.
     col_start = math.floor(minx / tile_size_native)
     row_start = math.floor(miny / tile_size_native)
     col_end = math.ceil(maxx / tile_size_native)

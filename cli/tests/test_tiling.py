@@ -1,9 +1,6 @@
 """Tests for region → tile grid decomposition."""
 
-import pytest
-
 from datensee.tiling import decompose_region
-
 
 CALIFORNIA_BBOX = {
     "type": "Polygon",
@@ -85,9 +82,7 @@ SF_BAY = {
 
 def test_decompose_projected_crs_epsg32610() -> None:
     """UTM Zone 10N: tile coordinates should be in meters, not degrees."""
-    grid = decompose_region(
-        SF_BAY, scale_meters=10.0, crs="EPSG:32610", tile_size_pixels=256
-    )
+    grid = decompose_region(SF_BAY, scale_meters=10.0, crs="EPSG:32610", tile_size_pixels=256)
     assert grid.crs == "EPSG:32610"
     assert len(grid.tiles) >= 1
 
@@ -192,12 +187,8 @@ def test_shifted_region_produces_aligned_grid() -> None:
     assert len(overlap) > 0, "Expected overlapping tiles between shifted regions"
 
     # For overlapping tiles, verify exact coordinate match
-    tiles_a_by_origin = {
-        (round(t.x_min, 10), round(t.y_min, 10)): t for t in grid_a.tiles
-    }
-    tiles_b_by_origin = {
-        (round(t.x_min, 10), round(t.y_min, 10)): t for t in grid_b.tiles
-    }
+    tiles_a_by_origin = {(round(t.x_min, 10), round(t.y_min, 10)): t for t in grid_a.tiles}
+    tiles_b_by_origin = {(round(t.x_min, 10), round(t.y_min, 10)): t for t in grid_b.tiles}
     for origin in overlap:
         ta = tiles_a_by_origin[origin]
         tb = tiles_b_by_origin[origin]
@@ -214,12 +205,12 @@ def test_adjacent_tiles_share_boundaries() -> None:
         right = tiles_by_rc.get((row, col + 1))
         if right:
             assert abs(tile.x_max - right.x_min) < 1e-10, (
-                f"Gap/overlap between ({row},{col}) and ({row},{col+1}): "
+                f"Gap/overlap between ({row},{col}) and ({row},{col + 1}): "
                 f"{tile.x_max} vs {right.x_min}"
             )
         above = tiles_by_rc.get((row + 1, col))
         if above:
             assert abs(tile.y_max - above.y_min) < 1e-10, (
-                f"Gap/overlap between ({row},{col}) and ({row+1},{col}): "
+                f"Gap/overlap between ({row},{col}) and ({row + 1},{col}): "
                 f"{tile.y_max} vs {above.y_min}"
             )

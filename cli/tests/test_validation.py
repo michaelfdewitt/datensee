@@ -9,10 +9,7 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from datensee.main import _validate_inputs
-
 
 # ---------------------------------------------------------------------------
 # Realistic EE expression fixtures
@@ -30,11 +27,7 @@ _VALID_NDVI_EXPRESSION = json.dumps(
                         "input": {
                             "functionInvocationValue": {
                                 "functionName": "ImageCollection.load",
-                                "arguments": {
-                                    "id": {
-                                        "constantValue": "LANDSAT/LC09/C02/T1_L2"
-                                    }
-                                },
+                                "arguments": {"id": {"constantValue": "LANDSAT/LC09/C02/T1_L2"}},
                             }
                         },
                     },
@@ -182,9 +175,7 @@ class TestValidInputs:
 
     def test_minimal_valid_expression(self) -> None:
         """Even a trivial JSON object should pass the expression check."""
-        errors = _validate_inputs(
-            "{}", _POLYGON_SF, "EPSG:4326", "/tmp/out", "local"
-        )
+        errors = _validate_inputs("{}", _POLYGON_SF, "EPSG:4326", "/tmp/out", "local")
         assert errors == []
 
 
@@ -195,9 +186,7 @@ class TestValidInputs:
 
 class TestBadExpressions:
     def test_plain_text_rejected(self) -> None:
-        errors = _validate_inputs(
-            "not json at all", _POLYGON_SF, "EPSG:4326", "/tmp/out", "local"
-        )
+        errors = _validate_inputs("not json at all", _POLYGON_SF, "EPSG:4326", "/tmp/out", "local")
         assert len(errors) == 1
         assert "not valid JSON" in errors[0]
 
@@ -226,9 +215,7 @@ class TestBadExpressions:
         assert "not valid JSON" in errors[0]
 
     def test_empty_string_rejected(self) -> None:
-        errors = _validate_inputs(
-            "", _POLYGON_SF, "EPSG:4326", "/tmp/out", "local"
-        )
+        errors = _validate_inputs("", _POLYGON_SF, "EPSG:4326", "/tmp/out", "local")
         assert len(errors) == 1
         assert "not valid JSON" in errors[0]
 

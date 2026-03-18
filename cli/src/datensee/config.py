@@ -44,9 +44,7 @@ class TileGrid(BaseModel):
         has_inline = self.tiles is not None and len(self.tiles) > 0
         has_file = self.tiles_file is not None and self.tiles_file.strip() != ""
         if not has_inline and not has_file:
-            raise ValueError(
-                "TileGrid must have either inline tiles or a tiles_file path"
-            )
+            raise ValueError("TileGrid must have either inline tiles or a tiles_file path")
         if has_inline and has_file:
             raise ValueError(
                 "TileGrid cannot have both inline tiles and tiles_file — use one or the other"
@@ -73,13 +71,11 @@ class OutputConfig(BaseModel):
     directory path for local-runner mode.
     """
 
-    output_path: str = Field(
-        description="Output path: GCS URI (gs://…) or local directory"
-    )
+    output_path: str = Field(description="Output path: GCS URI (gs://…) or local directory")
     band_count: int = Field(default=1, gt=0, description="Number of output bands")
-    data_type: Literal[
-        "float32", "float64", "int16", "int32", "uint8", "uint16"
-    ] = Field(default="float32", description="Pixel data type for output raster")
+    data_type: Literal["float32", "float64", "int16", "int32", "uint8", "uint16"] = Field(
+        default="float32", description="Pixel data type for output raster"
+    )
     cog: CogParameters = Field(default_factory=CogParameters)
 
 
@@ -127,9 +123,7 @@ class PipelineConfig(BaseModel):
     Earth Engine evaluates it per-tile via the High Volume API.
     """
 
-    ee_expression: str = Field(
-        description="Serialized EE computation (opaque JSON string)"
-    )
+    ee_expression: str = Field(description="Serialized EE computation (opaque JSON string)")
     gee_project: str = Field(
         description="GCP project ID with Earth Engine API enabled (used in HV API URL)"
     )
@@ -143,9 +137,7 @@ class PipelineConfig(BaseModel):
         try:
             json.loads(self.ee_expression)
         except (json.JSONDecodeError, TypeError) as exc:
-            raise ValueError(
-                f"ee_expression must be a valid JSON string: {exc}"
-            ) from exc
+            raise ValueError(f"ee_expression must be a valid JSON string: {exc}") from exc
         return self
 
     def write_json(self, path: Path) -> None:

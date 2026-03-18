@@ -22,10 +22,7 @@ from datensee.estimate import CostEstimate
 
 
 def _make_tiles(n: int) -> list[TileCoordinate]:
-    return [
-        TileCoordinate(x_min=i, y_min=0, x_max=i + 1, y_max=1, row=0, col=i)
-        for i in range(n)
-    ]
+    return [TileCoordinate(x_min=i, y_min=0, x_max=i + 1, y_max=1, row=0, col=i) for i in range(n)]
 
 
 def _make_estimate(**overrides: object) -> CostEstimate:

@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import io
 import json
-import struct
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
@@ -28,7 +27,7 @@ import numpy as np
 import pytest
 
 from datensee.auth import get_access_token
-from datensee.tiling import decompose_region, _pixel_size_native
+from datensee.tiling import _pixel_size_native, decompose_region
 
 HV_ENDPOINT = (
     "https://earthengine-highvolume.googleapis.com/v1/projects/{project}/image:computePixels"
@@ -112,9 +111,7 @@ def _srtm_rescaled_expression() -> str:
                                 "functionInvocationValue": {
                                     "functionName": "Image.load",
                                     "arguments": {
-                                        "id": {
-                                            "constantValue": "USGS/SRTMGL1_003"
-                                        },
+                                        "id": {"constantValue": "USGS/SRTMGL1_003"},
                                     },
                                 }
                             },
@@ -197,9 +194,7 @@ def _srtm_multiband_expression() -> str:
                         "functionName": "Image.cat",
                         "arguments": {
                             "images": {
-                                "arrayValue": {
-                                    "values": [srtm_load, srtm_scaled, srtm_squared]
-                                }
+                                "arrayValue": {"values": [srtm_load, srtm_scaled, srtm_squared]}
                             }
                         },
                     }
@@ -230,9 +225,7 @@ def _srtm_slope_expression() -> str:
                                 "functionInvocationValue": {
                                     "functionName": "Image.load",
                                     "arguments": {
-                                        "id": {
-                                            "constantValue": "USGS/SRTMGL1_003"
-                                        },
+                                        "id": {"constantValue": "USGS/SRTMGL1_003"},
                                     },
                                 }
                             }
@@ -415,9 +408,7 @@ class TestSingleTileFetch:
         assert resp.status_code == 200
         _assert_valid_geotiff(resp.content)
 
-    def test_srtm_slope(
-        self, gee_project: str, access_token: str, hv_client: httpx.Client
-    ) -> None:
+    def test_srtm_slope(self, gee_project: str, access_token: str, hv_client: httpx.Client) -> None:
         """Terrain slope — derived from elevation gradient, highly spatial."""
         body = _build_hv_request(
             _srtm_slope_expression(),
@@ -472,9 +463,7 @@ class TestTilingAndFetch:
         self, gee_project: str, access_token: str, hv_client: httpx.Client
     ) -> None:
         """Tile Sierra Nevada in WGS84, fetch elevation for every tile."""
-        grid = decompose_region(
-            _SIERRA_NEVADA, scale_meters=1000.0, crs="EPSG:4326"
-        )
+        grid = decompose_region(_SIERRA_NEVADA, scale_meters=1000.0, crs="EPSG:4326")
         assert len(grid.tiles) >= 1
 
         for tile in grid.tiles:
@@ -572,10 +561,7 @@ class TestHighVolumeBatch:
             resp = _fetch_tile(client, project, token, body)
             detail = ""
             if resp.status_code != 200:
-                detail = (
-                    f"r={tile.row},c={tile.col} HTTP {resp.status_code}: "
-                    f"{resp.text[:100]}"
-                )
+                detail = f"r={tile.row},c={tile.col} HTTP {resp.status_code}: {resp.text[:100]}"
             return resp.status_code, detail
 
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -872,7 +858,7 @@ class TestPixelAlignment:
         """
         pixel_native = _pixel_size_native(crs, scale_meters)
         shift_native = shift_pixels * pixel_native
-        tile_native = pixel_native * tile_size_pixels
+        pixel_native * tile_size_pixels
 
         # Two overlapping WGS84 regions. The shift is applied in native
         # CRS units, but converted back to WGS84 for the GeoJSON input
@@ -927,12 +913,8 @@ class TestPixelAlignment:
         )
 
         # Find tiles present in both grids (same snapped origin).
-        origins_a = {
-            (round(t.x_min, 6), round(t.y_min, 6)): t for t in grid_a.tiles
-        }
-        origins_b = {
-            (round(t.x_min, 6), round(t.y_min, 6)): t for t in grid_b.tiles
-        }
+        origins_a = {(round(t.x_min, 6), round(t.y_min, 6)): t for t in grid_a.tiles}
+        origins_b = {(round(t.x_min, 6), round(t.y_min, 6)): t for t in grid_b.tiles}
         shared_origins = set(origins_a.keys()) & set(origins_b.keys())
         assert len(shared_origins) > 0, (
             f"No shared tiles between original and shifted grids. "
@@ -952,21 +934,30 @@ class TestPixelAlignment:
 
         # Fetch the same tile from both grids — should be pixel-identical.
         pixels_a = _fetch_tile_as_numpy(
-            client, project, token, expression,
+            client,
+            project,
+            token,
+            expression,
             (tile_a.x_min, tile_a.y_min, tile_a.x_max, tile_a.y_max),
-            tile_size_pixels, crs,
+            tile_size_pixels,
+            crs,
         )
         pixels_b = _fetch_tile_as_numpy(
-            client, project, token, expression,
+            client,
+            project,
+            token,
+            expression,
             (tile_b.x_min, tile_b.y_min, tile_b.x_max, tile_b.y_max),
-            tile_size_pixels, crs,
+            tile_size_pixels,
+            crs,
         )
 
         assert pixels_a.shape == pixels_b.shape, (
             f"Shape mismatch: {pixels_a.shape} vs {pixels_b.shape}"
         )
         np.testing.assert_array_equal(
-            pixels_a, pixels_b,
+            pixels_a,
+            pixels_b,
             err_msg=(
                 f"Pixel mismatch in shared tile at origin {origin}. "
                 f"This means the grid is not snapped to a global origin — "
@@ -980,7 +971,9 @@ class TestPixelAlignment:
     ) -> None:
         """Shift region by 5 pixels in WGS84 — shared tiles must be identical."""
         self._compare_shifted_grids(
-            hv_client, gee_project, access_token,
+            hv_client,
+            gee_project,
+            access_token,
             _srtm_elevation_expression(),
             crs="EPSG:4326",
             scale_meters=100.0,
@@ -993,7 +986,9 @@ class TestPixelAlignment:
     ) -> None:
         """Shift by 17 pixels (non-power-of-2) — still must align."""
         self._compare_shifted_grids(
-            hv_client, gee_project, access_token,
+            hv_client,
+            gee_project,
+            access_token,
             _srtm_elevation_expression(),
             crs="EPSG:4326",
             scale_meters=100.0,
@@ -1006,7 +1001,9 @@ class TestPixelAlignment:
     ) -> None:
         """Shift by exactly 1 tile width — trivially aligned if grid is snapped."""
         self._compare_shifted_grids(
-            hv_client, gee_project, access_token,
+            hv_client,
+            gee_project,
+            access_token,
             _srtm_elevation_expression(),
             crs="EPSG:4326",
             scale_meters=100.0,
@@ -1019,7 +1016,9 @@ class TestPixelAlignment:
     ) -> None:
         """Shift region by 5 pixels in UTM Zone 10N."""
         self._compare_shifted_grids(
-            hv_client, gee_project, access_token,
+            hv_client,
+            gee_project,
+            access_token,
             _srtm_elevation_expression(),
             crs="EPSG:32610",
             scale_meters=100.0,
@@ -1032,7 +1031,9 @@ class TestPixelAlignment:
     ) -> None:
         """Shift with slope (derived band) in UTM — hardest combo."""
         self._compare_shifted_grids(
-            hv_client, gee_project, access_token,
+            hv_client,
+            gee_project,
+            access_token,
             _srtm_slope_expression(),
             crs="EPSG:32610",
             scale_meters=100.0,

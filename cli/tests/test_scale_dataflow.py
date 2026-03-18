@@ -52,6 +52,7 @@ from datensee.tiling import decompose_region
 # Sentinel-2 NDVI expression
 # ---------------------------------------------------------------------------
 
+
 def _sentinel2_ndvi_expression() -> str:
     """Sentinel-2 summer 2023 median NDVI — single band, float32.
 
@@ -61,79 +62,81 @@ def _sentinel2_ndvi_expression() -> str:
           .median()
           .normalizedDifference(['B8', 'B4'])
     """
-    return json.dumps({
-        "result": "0",
-        "values": {
-            "0": {
-                "functionInvocationValue": {
-                    "functionName": "Image.normalizedDifference",
-                    "arguments": {
-                        "bandNames": {"constantValue": ["B8", "B4"]},
-                        "input": {
-                            "functionInvocationValue": {
-                                "functionName": "reduce.median",
-                                "arguments": {
-                                    "collection": {
-                                        "functionInvocationValue": {
-                                            "functionName": "Collection.filter",
-                                            "arguments": {
-                                                "collection": {
-                                                    "functionInvocationValue": {
-                                                        "functionName": (
-                                                            "ImageCollection.load"
-                                                        ),
-                                                        "arguments": {
-                                                            "id": {
-                                                                "constantValue": (
-                                                                    "COPERNICUS"
-                                                                    "/S2_SR_HARMONIZED"
-                                                                )
-                                                            }
-                                                        },
-                                                    }
-                                                },
-                                                "filter": {
-                                                    "functionInvocationValue": {
-                                                        "functionName": (
-                                                            "Filter.dateRangeContains"
-                                                        ),
-                                                        "arguments": {
-                                                            "leftValue": {
-                                                                "functionInvocationValue": {
-                                                                    "functionName": "DateRange",
-                                                                    "arguments": {
-                                                                        "start": {
-                                                                            "constantValue": (
-                                                                                "2023-06-01"
-                                                                            )
-                                                                        },
-                                                                        "end": {
-                                                                            "constantValue": (
-                                                                                "2023-09-01"
-                                                                            )
-                                                                        },
-                                                                    },
+    return json.dumps(
+        {
+            "result": "0",
+            "values": {
+                "0": {
+                    "functionInvocationValue": {
+                        "functionName": "Image.normalizedDifference",
+                        "arguments": {
+                            "bandNames": {"constantValue": ["B8", "B4"]},
+                            "input": {
+                                "functionInvocationValue": {
+                                    "functionName": "reduce.median",
+                                    "arguments": {
+                                        "collection": {
+                                            "functionInvocationValue": {
+                                                "functionName": "Collection.filter",
+                                                "arguments": {
+                                                    "collection": {
+                                                        "functionInvocationValue": {
+                                                            "functionName": (
+                                                                "ImageCollection.load"
+                                                            ),
+                                                            "arguments": {
+                                                                "id": {
+                                                                    "constantValue": (
+                                                                        "COPERNICUS"
+                                                                        "/S2_SR_HARMONIZED"
+                                                                    )
                                                                 }
                                                             },
-                                                            "rightField": {
-                                                                "constantValue": (
-                                                                    "system:time_start"
-                                                                )
+                                                        }
+                                                    },
+                                                    "filter": {
+                                                        "functionInvocationValue": {
+                                                            "functionName": (
+                                                                "Filter.dateRangeContains"
+                                                            ),
+                                                            "arguments": {
+                                                                "leftValue": {
+                                                                    "functionInvocationValue": {
+                                                                        "functionName": "DateRange",
+                                                                        "arguments": {
+                                                                            "start": {
+                                                                                "constantValue": (
+                                                                                    "2023-06-01"
+                                                                                )
+                                                                            },
+                                                                            "end": {
+                                                                                "constantValue": (
+                                                                                    "2023-09-01"
+                                                                                )
+                                                                            },
+                                                                        },
+                                                                    }
+                                                                },
+                                                                "rightField": {
+                                                                    "constantValue": (
+                                                                        "system:time_start"
+                                                                    )
+                                                                },
                                                             },
-                                                        },
-                                                    }
+                                                        }
+                                                    },
                                                 },
-                                            },
+                                            }
                                         }
-                                    }
-                                },
-                            }
+                                    },
+                                }
+                            },
                         },
-                    },
+                    }
                 }
-            }
-        },
-    })
+            },
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -144,19 +147,22 @@ def _sentinel2_ndvi_expression() -> str:
 # ~330 km × ~220 km → ~3,000 tiles at 10m / 512px.
 _SWITZERLAND = {
     "type": "Polygon",
-    "coordinates": [[
-        [6.0, 46.0],
-        [10.5, 46.0],
-        [10.5, 48.0],
-        [6.0, 48.0],
-        [6.0, 46.0],
-    ]],
+    "coordinates": [
+        [
+            [6.0, 46.0],
+            [10.5, 46.0],
+            [10.5, 48.0],
+            [6.0, 48.0],
+            [6.0, 46.0],
+        ]
+    ],
 }
 
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(scope="module")
 def gee_project(request: pytest.FixtureRequest) -> str:
@@ -194,6 +200,7 @@ def output_prefix(gcs_bucket: str) -> str:
 # Test
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.scale
 class TestZurichNdviDataflow:
     """End-to-end Dataflow export: Sentinel-2 NDVI over Switzerland at 10m."""
@@ -228,9 +235,7 @@ class TestZurichNdviDataflow:
         print(f"\nTile count: {tile_count}")
 
         # -- Build config --
-        expression = clip_expression(
-            _sentinel2_ndvi_expression(), _SWITZERLAND
-        )
+        expression = clip_expression(_sentinel2_ndvi_expression(), _SWITZERLAND)
 
         temp_location = f"gs://{gcs_bucket}/dataflow-temp"
 

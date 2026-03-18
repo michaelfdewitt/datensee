@@ -158,9 +158,7 @@ def estimate_cost(
         wall_hours = wall_seconds / 3600.0
         dataflow_vcpu_hours = vcpus * df.max_workers * wall_hours
         dataflow_memory_gb_hours = memory_gb * df.max_workers * wall_hours
-        dataflow_cost_usd = (
-            dataflow_vcpu_hours * vcpu_rate + dataflow_memory_gb_hours * gb_rate
-        )
+        dataflow_cost_usd = dataflow_vcpu_hours * vcpu_rate + dataflow_memory_gb_hours * gb_rate
 
     return CostEstimate(
         tile_count=tile_count,

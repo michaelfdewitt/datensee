@@ -23,6 +23,7 @@ from datensee.config import (
     PipelineConfig,
     RateLimitConfig,
     RunnerConfig,
+    TileGrid,
 )
 from datensee.estimate import CostEstimate, estimate_cost
 from datensee.expression import clip_expression
@@ -33,69 +34,75 @@ from datensee.tiling import decompose_region
 # ---------------------------------------------------------------------------
 
 _LANDSAT_ID = "LANDSAT/LC09/C02/T1_L2"
+_DATE_START = "2023-06-01"
+_DATE_END = "2023-09-01"
 
-_DEMO_EXPRESSION = json.dumps(
-    {
-        "result": "0",
-        "values": {
-            "0": {
-                "functionInvocationValue": {
-                    "functionName": "Image.normalizedDifference",
-                    "arguments": {
-                        "bandNames": {
-                            "constantValue": ["SR_B5", "SR_B4"],
-                        },
-                        "input": {
-                            "functionInvocationValue": {
-                                "functionName": "reduce.median",
-                                "arguments": {
-                                    "collection": {
-                                        "functionInvocationValue": {
-                                            "functionName": "Collection.filter",
-                                            "arguments": {
-                                                "collection": {
-                                                    "functionInvocationValue": {
-                                                        "functionName": "ImageCollection.load",
-                                                        "arguments": {
-                                                            "id": {"constantValue": _LANDSAT_ID},
-                                                        },
-                                                    }
-                                                },
-                                                "filter": {
-                                                    "functionInvocationValue": {
-                                                        "functionName": "Filter.dateRangeContains",
-                                                        "arguments": {
-                                                            "leftValue": {
-                                                                "functionInvocationValue": {
-                                                                    "functionName": "DateRange",
-                                                                    "arguments": {
-                                                                        "end": {
-                                                                            "constantValue": "2023-09-01"
-                                                                        },
-                                                                        "start": {
-                                                                            "constantValue": "2023-06-01"
-                                                                        },
-                                                                    },
-                                                                }
-                                                            },
-                                                            "rightField": {
-                                                                "constantValue": "system:time_start",
-                                                            },
-                                                        },
-                                                    }
-                                                },
+# Serialized EE expression: Landsat 9 summer median NDVI.
+# Equivalent to:
+#   ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+#     .filterDate('2023-06-01', '2023-09-01')
+#     .median()
+#     .normalizedDifference(['SR_B5', 'SR_B4'])
+_DEMO_EXPRESSION_OBJ: dict[str, Any] = {
+    "result": "0",
+    "values": {
+        "0": {
+            "functionInvocationValue": {
+                "functionName": "Image.normalizedDifference",
+                "arguments": {
+                    "bandNames": {"constantValue": ["SR_B5", "SR_B4"]},
+                    "input": {
+                        "functionInvocationValue": {
+                            "functionName": "reduce.median",
+                            "arguments": {
+                                "collection": {
+                                    "functionInvocationValue": {
+                                        "functionName": "Collection.filter",
+                                        "arguments": {
+                                            "collection": {
+                                                "functionInvocationValue": {
+                                                    "functionName": "ImageCollection.load",
+                                                    "arguments": {
+                                                        "id": {"constantValue": _LANDSAT_ID},
+                                                    },
+                                                }
                                             },
-                                        }
+                                            "filter": {
+                                                "functionInvocationValue": {
+                                                    "functionName": "Filter.dateRangeContains",
+                                                    "arguments": {
+                                                        "leftValue": {
+                                                            "functionInvocationValue": {
+                                                                "functionName": "DateRange",
+                                                                "arguments": {
+                                                                    "end": {
+                                                                        "constantValue": _DATE_END
+                                                                    },
+                                                                    "start": {
+                                                                        "constantValue": _DATE_START
+                                                                    },
+                                                                },
+                                                            }
+                                                        },
+                                                        "rightField": {
+                                                            "constantValue": "system:time_start",
+                                                        },
+                                                    },
+                                                }
+                                            },
+                                        },
                                     }
-                                },
-                            }
-                        },
+                                }
+                            },
+                        }
                     },
                 },
             },
         },
-    }
-)
+    },
+}
+
+_DEMO_EXPRESSION = json.dumps(_DEMO_EXPRESSION_OBJ)
 
 _DEMO_REGION = {
     "type": "Polygon",
@@ -197,8 +204,6 @@ def _validate_inputs(
 # ---------------------------------------------------------------------------
 # TileGrid helper
 # ---------------------------------------------------------------------------
-
-from datensee.config import TileGrid  # noqa: E402
 
 
 def tile(
@@ -345,13 +350,11 @@ def export(
 
     # Resolve JAR
     if jar is not None:
-        jar_path = Path(jar) if isinstance(jar, str) else jar
+        from datensee.jar import find_jar
+
+        jar_path = find_jar(Path(jar) if isinstance(jar, str) else jar)
     else:
         jar_path = ensure_jar()
-
-    from datensee.jar import find_jar
-
-    jar_path = find_jar(jar_path if jar is not None else None)
 
     # Submit
     from datensee.submit import submit_job

@@ -13,7 +13,7 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from datensee.config import PipelineConfig, TileCoordinate
+from datensee.config import PipelineConfig
 
 # Map config data_type values to GDAL VRT DataType names.
 _DATA_TYPE_MAP: dict[str, str] = {
@@ -70,14 +70,12 @@ def write_vrt(config: PipelineConfig, output_dir: Path) -> Path:
 
     ET.SubElement(root, "SRS").text = grid.crs
 
-    ET.SubElement(root, "GeoTransform").text = (
-        f"{all_x_min}, {pixel_w}, 0, {all_y_max}, 0, -{pixel_h}"
-    )
+    ET.SubElement(
+        root, "GeoTransform"
+    ).text = f"{all_x_min}, {pixel_w}, 0, {all_y_max}, 0, -{pixel_h}"
 
     for band_idx in range(1, band_count + 1):
-        band_el = ET.SubElement(
-            root, "VRTRasterBand", dataType=data_type, band=str(band_idx)
-        )
+        band_el = ET.SubElement(root, "VRTRasterBand", dataType=data_type, band=str(band_idx))
         ET.SubElement(band_el, "NoDataValue").text = "nan"
 
         for tile in tiles:

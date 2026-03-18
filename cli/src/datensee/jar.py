@@ -180,8 +180,7 @@ def build_jar() -> Path:
     gradlew = pipelines_dir / "gradlew"
     if not gradlew.exists():
         raise FileNotFoundError(
-            f"Gradle wrapper not found at {gradlew}.\n"
-            "Ensure the repository is complete."
+            f"Gradle wrapper not found at {gradlew}.\nEnsure the repository is complete."
         )
 
     console.print("[bold]Building pipeline JAR...[/bold]")
@@ -196,8 +195,7 @@ def build_jar() -> Path:
     jar = pipelines_dir / "build" / "libs" / JAR_FILENAME
     if not jar.exists():
         raise FileNotFoundError(
-            f"Build succeeded but JAR not found at {jar}.\n"
-            "Check the Gradle build output."
+            f"Build succeeded but JAR not found at {jar}.\nCheck the Gradle build output."
         )
 
     # Also copy to cache dir for future use

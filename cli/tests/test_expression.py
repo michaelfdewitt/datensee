@@ -8,7 +8,6 @@ import pytest
 
 from datensee.expression import clip_expression
 
-
 _SIMPLE_EXPRESSION = json.dumps({"result": "0", "values": {"0": {"constantValue": 42}}})
 
 _POLYGON = {
@@ -82,14 +81,16 @@ def test_clip_rejects_unsupported_geometry_type() -> None:
 
 
 def test_clip_key_avoids_collision() -> None:
-    expr = json.dumps({
-        "result": "0",
-        "values": {
-            "0": {"constantValue": 42},
-            "_clip_0": {"constantValue": 99},
-            "_geom_0": {"constantValue": 88},
-        },
-    })
+    expr = json.dumps(
+        {
+            "result": "0",
+            "values": {
+                "0": {"constantValue": 42},
+                "_clip_0": {"constantValue": 99},
+                "_geom_0": {"constantValue": 88},
+            },
+        }
+    )
     result = json.loads(clip_expression(expr, _POLYGON))
     clip_key = result["result"]
     assert clip_key not in ("_clip_0", "_geom_0")

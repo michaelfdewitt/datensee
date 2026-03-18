@@ -145,9 +145,7 @@ def test_invalid_ee_expression_raises() -> None:
             tile_grid=TileGrid(
                 crs="EPSG:4326",
                 scale_meters=30.0,
-                tiles=[
-                    TileCoordinate(x_min=0, y_min=0, x_max=1, y_max=1, row=0, col=0)
-                ],
+                tiles=[TileCoordinate(x_min=0, y_min=0, x_max=1, y_max=1, row=0, col=0)],
             ),
             output=OutputConfig(output_path="/tmp/out"),
         )
@@ -170,11 +168,7 @@ def test_data_type_default() -> None:
 
 def test_multiband_config() -> None:
     config = _minimal_config().model_copy(
-        update={
-            "output": OutputConfig(
-                output_path="/tmp/out", band_count=3, data_type="uint8"
-            )
-        }
+        update={"output": OutputConfig(output_path="/tmp/out", band_count=3, data_type="uint8")}
     )
     assert config.output.band_count == 3
     assert config.output.data_type == "uint8"
@@ -196,9 +190,7 @@ def test_rate_limit_defaults() -> None:
 
 
 def test_rate_limit_custom() -> None:
-    config = _minimal_config().model_copy(
-        update={"rate_limit": RateLimitConfig(max_qps=50)}
-    )
+    config = _minimal_config().model_copy(update={"rate_limit": RateLimitConfig(max_qps=50)})
     assert config.rate_limit.max_qps == 50
 
 

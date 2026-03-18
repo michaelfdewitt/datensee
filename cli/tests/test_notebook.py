@@ -53,31 +53,23 @@ class TestEnsureAuth:
         with patch("google.auth.default", return_value=(MagicMock(), "project")):
             ensure_auth()  # Should not raise
 
-    def test_calls_colab_auth_when_adc_fails_in_colab(self) -> None:
+    def test_calls_colab_auth_in_colab(self) -> None:
+        """In Colab, ensure_auth() always calls authenticate_user() first."""
         from datensee.notebook import ensure_auth
 
-        mock_colab_auth = MagicMock()
+        mock_colab = MagicMock()
         mock_modules = {
-            "google.colab": MagicMock(),
-            "google.colab.auth": mock_colab_auth,
+            "google.colab": mock_colab,
+            "google.colab.auth": mock_colab.auth,
         }
 
         with (
-            patch("google.auth.default", side_effect=Exception("no creds")),
             patch.dict("sys.modules", mock_modules),
             patch("datensee.notebook.is_colab", return_value=True),
+            patch("datensee.notebook._export_adc_for_java"),
         ):
-
-            def _fake_import(name: str, *a: object, **kw: object) -> object:
-                if "google.colab" in name:
-                    return mock_colab_auth
-                return __import__(name, *a, **kw)
-
-            with patch("builtins.__import__", side_effect=_fake_import):
-                try:
-                    ensure_auth()
-                except Exception:
-                    pass  # May fail due to import mocking complexity
+            ensure_auth()
+            mock_colab.auth.authenticate_user.assert_called_once()
 
     def test_raises_when_adc_fails_outside_colab(self) -> None:
         from datensee.notebook import ensure_auth
