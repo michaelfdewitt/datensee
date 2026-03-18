@@ -142,6 +142,37 @@ datensee export expr.json region.geojson \
   --temp-location gs://my-bucket/tmp
 ```
 
+## Notebook / Colab
+
+DatensEE works natively in Jupyter notebooks and Google Colab — no shell commands needed.
+
+```python
+import datensee
+from datensee import notebook
+
+notebook.ensure_auth()  # triggers Colab OAuth flow, exports ADC for Java
+
+grid = datensee.tile(region, scale=30.0)
+notebook.display_tile_grid(grid, region)       # matplotlib preview
+
+result = datensee.export(expression, region, project="...", output="gs://...", runner="dataflow", temp_location="gs://...")
+notebook.display_job_progress(result.job_id, project="...")  # HTML status polling
+```
+
+See [`notebooks/datensee_quickstart.ipynb`](notebooks/datensee_quickstart.ipynb) for a full walkthrough.
+
+### Local vs Dataflow: when to use which
+
+| | Local (`runner="local"`) | Dataflow (`runner="dataflow"`) |
+|---|---|---|
+| **Good for** | Small regions, testing, debugging | Large regions, production exports |
+| **Tile count** | Up to ~100 tiles | Thousands to millions |
+| **Startup time** | Seconds (JVM only) | ~2 min (VM provisioning + container boot) |
+| **Parallelism** | Single-threaded | Auto-scales to hundreds of workers |
+| **Cost** | Free (your machine) | Dataflow vCPU/GB-hours |
+
+Dataflow has ~2 minutes of fixed overhead for VM provisioning, container startup, and shuffle infrastructure — regardless of workload size. For 9 tiles this dominates the wall time; for 10,000 tiles it's negligible. **Use local mode for anything under ~100 tiles.**
+
 ## Tiling & pixel alignment
 
 DatensEE snaps tile grids to a global origin at `(0, 0)` in the target CRS.
@@ -192,9 +223,11 @@ Full schema: [`contract/pipeline-config.schema.json`](contract/pipeline-config.s
 
 ```
 datensee/
-├── cli/                 Python CLI (Typer + Pydantic)
+├── cli/                 Python CLI + library (Typer + Pydantic)
 │   ├── src/datensee/
-│   │   ├── main.py      CLI entrypoint
+│   │   ├── api.py       Public Python API (export, demo, poll, tile)
+│   │   ├── notebook.py  Colab/Jupyter detection, auth, HTML displays
+│   │   ├── main.py      CLI entrypoint (thin wrapper around api.py)
 │   │   ├── config.py    Pipeline config models
 │   │   ├── tiling.py    Region → globally-aligned tile grid
 │   │   ├── assemble.py  VRT mosaic assembly (multi-band, any data type)
@@ -206,6 +239,7 @@ datensee/
 │       ├── DatensEEPipeline.java
 │       ├── fetch/       HV API client, retry, rate limiting
 │       └── io/          COG writer
+├── notebooks/           Colab/Jupyter examples
 ├── contract/            JSON schema + examples
 └── CLAUDE.md            Development guide
 ```
@@ -242,6 +276,7 @@ The integration suite includes:
 | M4: UX Polish | Done | Rich progress, cost estimation, summary panels |
 | M5: Distribution | Done | `pip install datensee`, prebuilt JARs, JAR management |
 | Evals | Done | 10 output validation evals — structural, spatial, pixel-level ([details](EVALS.md)) |
+| Notebook Integration | Done | Python API, Colab auto-auth, HTML displays, quickstart notebook |
 | M6: Two-Tier Tiling | Next | Separate compute tiles from output tiles for practical file counts |
 
 ## License
