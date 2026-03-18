@@ -2,7 +2,7 @@
 
 ## What This Project Is
 
-A CLI tool that lets Google Earth Engine users run image exports at massive scale by parallelizing tile fetches across Google Cloud Dataflow workers. Users provide the same computation description they already use in Earth Engine — the tool handles tiling, parallel fetching via the EE High Volume API, assembly into Cloud Optimized GeoTIFFs, and upload to GCS.
+A CLI + Python library that lets Google Earth Engine users run image exports at massive scale by parallelizing tile fetches across Google Cloud Dataflow workers. Users provide the same computation description they already use in Earth Engine — the tool handles tiling, parallel fetching via the EE High Volume API, assembly into Cloud Optimized GeoTIFFs, and upload to GCS. Works from the terminal, Python scripts, or Colab/Jupyter notebooks.
 
 **The key insight:** We don't need to understand or recompile EE computations. Earth Engine evaluates its own expression graph per-tile — we just need to call it a lot, in parallel, and stitch the results together. This is a massively parallel tile fetcher with smart orchestration, not a computation framework.
 
@@ -10,9 +10,9 @@ A CLI tool that lets Google Earth Engine users run image exports at massive scal
 
 ```
                           ┌──────────────────────────────┐
-                          │     Earth Engine Backend      │
-                          │  (evaluates computation       │
-                          │   per-tile via HV endpoint)   │
+                          │     Earth Engine Backend     │
+                          │  (evaluates computation      │
+                          │   per-tile via HV endpoint)  │
                           └──────────▲───────────────────┘
                                      │ High Volume API
                                      │ (thousands of concurrent tile fetches)
@@ -56,6 +56,26 @@ A CLI tool that lets Google Earth Engine users run image exports at massive scal
 - **Key logic:** HV API client (auth, rate limiting, retries, backoff), tile-to-COG assembly
 - **Tests:** JUnit 5 + Beam TestPipeline
 
+### Python API (`api.py` + `notebook.py`)
+
+The public Python API lives in `api.py` — the CLI (`main.py`) is a thin wrapper. Key functions:
+
+- `datensee.export(ee_expression, region, project, output, ...)` → `ExportResult` — full export pipeline
+- `datensee.demo(project, output)` → `ExportResult` — built-in NDVI demo
+- `datensee.tile(region, scale, crs, tile_size)` → `TileGrid` — region decomposition only
+- `datensee.poll(job_id, project, region, callback=...)` → `JobState` — Dataflow job polling
+
+`notebook.py` provides Colab/Jupyter adapters:
+
+- `notebook.ensure_auth()` — triggers `google.colab.auth` when ADC unavailable
+- `notebook.ensure_jar()` — auto-downloads JAR if not found locally
+- `notebook.display_job_progress(job_id, ...)` — HTML polling display
+- `notebook.display_estimate(estimate, config)` — HTML cost table
+- `notebook.display_tile_grid(grid, region)` — matplotlib tile map
+- `notebook.preview_tiles(output, config, n=4)` — matplotlib tile images
+
+`submit.py` and `status.py` accept optional callbacks (`progress_callback`, `status_callback`) so the notebook layer can replace Rich with HTML rendering without touching business logic.
+
 ### The Contract (`/contract`)
 The pipeline config passed from Python → Java. Defines:
 - EE computation description (opaque serialized expression — we don't interpret this)
@@ -73,8 +93,10 @@ datensee/
 │   ├── pyproject.toml
 │   ├── src/
 │   │   └── datensee/
-│   │       ├── __init__.py
-│   │       ├── main.py          ← Typer app entrypoint + jar subcommands
+│   │       ├── __init__.py      ← Re-exports public API (export, demo, poll, tile)
+│   │       ├── api.py           ← Public Python API — orchestration logic
+│   │       ├── notebook.py      ← Colab/Jupyter detection, auth, HTML displays
+│   │       ├── main.py          ← Typer CLI (thin wrapper around api.py)
 │   │       ├── config.py        ← Pydantic models for pipeline config
 │   │       ├── tiling.py        ← Region → tile grid decomposition
 │   │       ├── submit.py        ← Dataflow job submission + local progress
@@ -97,6 +119,8 @@ datensee/
 │   ├── pipeline-config.schema.json
 │   └── examples/
 │       └── ndvi-california.json
+├── notebooks/
+│   └── datensee_quickstart.ipynb  ← End-to-end Colab example
 └── docs/
 ```
 
@@ -167,7 +191,7 @@ These are the areas where the real complexity lives:
 ## Design Principles
 
 1. **EE is the computation engine. We are the parallelism engine.** Never interpret or optimize the EE expression — but do compose with it (e.g. wrapping in `Image.clip(region)` for edge tiles).
-2. **The CLI is the UX.** Every rough edge is a user lost. Invest in error messages, progress feedback, and sensible defaults.
+2. **The API is the product, the CLI is one surface.** `api.py` owns orchestration; `main.py` (CLI) and `notebook.py` (Colab/Jupyter) are thin display layers. Every rough edge is a user lost.
 3. **Fail fast, fail loud.** Validate everything in Python before submitting the Dataflow job.
 4. **EE users aren't infra engineers.** Abstract away Dataflow concepts behind opinionated defaults with escape hatches.
 5. **COG to GCS is the primitive.** All other formats are GDAL post-processing.
@@ -175,7 +199,7 @@ These are the areas where the real complexity lives:
 
 ## Current Status
 
-🟢 **M5: Distribution** — `pip install datensee` works. Smart JAR discovery (env var → cache → repo), `datensee jar` subcommands (download/build/path), Apache 2.0 license, full PyPI metadata. All milestones M1–M5 complete.
+🟢 **Notebook Integration** — Public Python API (`datensee.export()`, `tile()`, `poll()`), Colab auto-auth, HTML display adapters, quickstart notebook. All milestones M1–M5 + notebook integration complete.
 
 ## Milestones
 
@@ -184,7 +208,8 @@ These are the areas where the real complexity lives:
 3. **M3: Scale** ✅ — Partial failure tolerance, per-worker rate limiting, smart retry classification, file-based tile input, VRT assembly.
 4. **M4: UX Polish** ✅ — Rich progress bar (local mode), cost estimation (EECU range, Dataflow USD, storage), summary panels, confirmation for large jobs, enhanced Dataflow status polling with metrics.
 5. **M5: Distribution** ✅ — `pip install datensee`, smart JAR discovery, `datensee jar` subcommands (download/build/path), Apache 2.0 license, full PyPI metadata.
-6. **M6: Two-Tier Tiling** — Separate compute tiles (small, for EE HV API) from output tiles (large, for practical file counts). Compute tiles are fetched in parallel, then grouped by output tile via a Beam GroupByKey + shuffle, assembled into larger rasters, and written as COGs. This decouples fetch parallelism from output file granularity.
+6. **Notebook Integration** ✅ — Public Python API (`api.py`), Colab/Jupyter auto-auth, HTML display adapters (job progress, cost estimate, tile grid, tile preview), quickstart notebook, `notebook`/`all` optional dependency groups.
+7. **M6: Two-Tier Tiling** — Separate compute tiles (small, for EE HV API) from output tiles (large, for practical file counts). Compute tiles are fetched in parallel, then grouped by output tile via a Beam GroupByKey + shuffle, assembled into larger rasters, and written as COGs. This decouples fetch parallelism from output file granularity.
 
 ## Testing
 
