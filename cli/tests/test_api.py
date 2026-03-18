@@ -5,24 +5,25 @@ from __future__ import annotations
 import pytest
 
 from datensee.api import (
-    _DEMO_EXPRESSION,
-    _DEMO_REGION,
     ExportResult,
+    _demo_expression,
+    _demo_region,
     tile,
 )
 
 
 class TestTile:
     def test_returns_tile_grid(self) -> None:
-        grid = tile(_DEMO_REGION, scale=30.0, crs="EPSG:4326", tile_size=512)
+        grid = tile(_demo_region(), scale=30.0, crs="EPSG:4326", tile_size=512)
         assert grid.tiles is not None
         assert len(grid.tiles) > 0
         assert grid.crs == "EPSG:4326"
         assert grid.scale_meters == 30.0
 
     def test_tile_count_varies_with_scale(self) -> None:
-        grid_30 = tile(_DEMO_REGION, scale=30.0)
-        grid_100 = tile(_DEMO_REGION, scale=100.0)
+        region = _demo_region()
+        grid_30 = tile(region, scale=30.0)
+        grid_100 = tile(region, scale=100.0)
         assert len(grid_30.tiles) >= len(grid_100.tiles)
 
 
@@ -33,29 +34,20 @@ class TestExportResult:
             PipelineConfig,
             RunnerConfig,
         )
-        from datensee.estimate import CostEstimate
 
-        grid = tile(_DEMO_REGION, scale=30.0)
+        grid = tile(_demo_region(), scale=30.0)
         config = PipelineConfig(
-            ee_expression=_DEMO_EXPRESSION,
+            ee_expression=_demo_expression(),
             gee_project="test-project",
             tile_grid=grid,
             output=OutputConfig(output_path="/tmp/test"),
             runner=RunnerConfig(mode="local"),
         )
-        estimate = CostEstimate(
-            tile_count=4,
-            estimated_wall_seconds=1.0,
-            eecu_seconds_low=4.0,
-            eecu_seconds_typical=12.0,
-            eecu_seconds_high=40.0,
-            output_size_bytes=1024,
-            storage_cost_usd_per_month=0.0001,
-        )
-        result = ExportResult(config=config, estimate=estimate)
+        result = ExportResult(config=config)
         assert result.job_id is None
         assert result.duration_seconds is None
         assert result.vrt_path is None
+        assert result.output_bytes is None
 
 
 class TestExportValidation:
@@ -65,7 +57,7 @@ class TestExportValidation:
         with pytest.raises(ValueError, match="not valid JSON"):
             export(
                 ee_expression="not json",
-                region=_DEMO_REGION,
+                region=_demo_region(),
                 project="test",
                 output="/tmp/out",
                 runner="local",
@@ -77,8 +69,8 @@ class TestExportValidation:
 
         with pytest.raises(ValueError, match="temp-location"):
             export(
-                ee_expression=_DEMO_EXPRESSION,
-                region=_DEMO_REGION,
+                ee_expression=_demo_expression(),
+                region=_demo_region(),
                 project="test",
                 output="gs://bucket/out",
                 runner="dataflow",
@@ -89,8 +81,8 @@ class TestExportValidation:
         from datensee.api import export
 
         result = export(
-            ee_expression=_DEMO_EXPRESSION,
-            region=_DEMO_REGION,
+            ee_expression=_demo_expression(),
+            region=_demo_region(),
             project="test",
             output="gs://bucket/out",
             runner="dataflow",

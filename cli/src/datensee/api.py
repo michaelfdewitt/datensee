@@ -25,109 +25,44 @@ from datensee.config import (
     RunnerConfig,
     TileGrid,
 )
-from datensee.estimate import CostEstimate, estimate_cost
 from datensee.expression import clip_expression
 from datensee.tiling import decompose_region
 
 # ---------------------------------------------------------------------------
-# Result model
+# Demo data — loaded from JSON files in data/
 # ---------------------------------------------------------------------------
 
-_LANDSAT_ID = "LANDSAT/LC09/C02/T1_L2"
-_DATE_START = "2023-06-01"
-_DATE_END = "2023-09-01"
 
-# Serialized EE expression: Landsat 9 summer median NDVI.
-# Equivalent to:
-#   ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
-#     .filterDate('2023-06-01', '2023-09-01')
-#     .median()
-#     .normalizedDifference(['SR_B5', 'SR_B4'])
-_DEMO_EXPRESSION_OBJ: dict[str, Any] = {
-    "result": "0",
-    "values": {
-        "0": {
-            "functionInvocationValue": {
-                "functionName": "Image.normalizedDifference",
-                "arguments": {
-                    "bandNames": {"constantValue": ["SR_B5", "SR_B4"]},
-                    "input": {
-                        "functionInvocationValue": {
-                            "functionName": "reduce.median",
-                            "arguments": {
-                                "collection": {
-                                    "functionInvocationValue": {
-                                        "functionName": "Collection.filter",
-                                        "arguments": {
-                                            "collection": {
-                                                "functionInvocationValue": {
-                                                    "functionName": "ImageCollection.load",
-                                                    "arguments": {
-                                                        "id": {"constantValue": _LANDSAT_ID},
-                                                    },
-                                                }
-                                            },
-                                            "filter": {
-                                                "functionInvocationValue": {
-                                                    "functionName": "Filter.dateRangeContains",
-                                                    "arguments": {
-                                                        "leftValue": {
-                                                            "functionInvocationValue": {
-                                                                "functionName": "DateRange",
-                                                                "arguments": {
-                                                                    "end": {
-                                                                        "constantValue": _DATE_END
-                                                                    },
-                                                                    "start": {
-                                                                        "constantValue": _DATE_START
-                                                                    },
-                                                                },
-                                                            }
-                                                        },
-                                                        "rightField": {
-                                                            "constantValue": "system:time_start",
-                                                        },
-                                                    },
-                                                }
-                                            },
-                                        },
-                                    }
-                                }
-                            },
-                        }
-                    },
-                },
-            },
-        },
-    },
-}
+def _load_data(name: str) -> str:
+    """Load a bundled data file as a string."""
+    return (Path(__file__).parent / "data" / name).read_text()
 
-_DEMO_EXPRESSION = json.dumps(_DEMO_EXPRESSION_OBJ)
 
-_DEMO_REGION = {
-    "type": "Polygon",
-    "coordinates": [
-        [
-            [-122.5, 37.75],
-            [-122.25, 37.75],
-            [-122.25, 38.0],
-            [-122.5, 38.0],
-            [-122.5, 37.75],
-        ]
-    ],
-}
+def _demo_expression() -> str:
+    """Return the serialized EE expression for the built-in NDVI demo."""
+    return _load_data("demo_expression.json").strip()
+
+
+def _demo_region() -> dict[str, Any]:
+    """Return the GeoJSON region for the built-in NDVI demo."""
+    return json.loads(_load_data("demo_region.json"))
+
+
+# ---------------------------------------------------------------------------
+# Result model
+# ---------------------------------------------------------------------------
 
 
 class ExportResult(BaseModel):
     """Result of an export() or demo() call."""
 
     config: PipelineConfig
-    estimate: CostEstimate
     job_id: str | None = None
     duration_seconds: float | None = None
     tiles_ok: int | None = None
     tiles_failed: int | None = None
     vrt_path: str | None = None
+    output_bytes: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -250,15 +185,13 @@ def export(
     temp_location: str | None = None,
     max_qps: int = 100,
     jar: Path | str | None = None,
-    eecu_per_tile: float = 1.0,
     dry_run: bool = False,
     progress_callback: Callable[[int, int], None] | None = None,
 ) -> ExportResult:
     """Submit an Earth Engine export job.
 
     This is the programmatic equivalent of `datensee export`. It validates
-    inputs, tiles the region, builds the pipeline config, estimates costs,
-    and submits the job.
+    inputs, tiles the region, builds the pipeline config, and submits the job.
 
     For Dataflow mode, returns immediately after submission with the job_id.
     For local mode, blocks until the pipeline completes.
@@ -277,13 +210,12 @@ def export(
         temp_location: GCS URI for Dataflow temp files (required for Dataflow).
         max_qps: Max queries per second to the EE HV API.
         jar: Path to the pipeline JAR (auto-detected if None).
-        eecu_per_tile: EECU-seconds per tile for cost estimation.
-        dry_run: If True, validate and estimate but don't submit.
+        dry_run: If True, validate but don't submit.
         progress_callback: Optional callback(completed, total) for local
             mode progress. Ignored for Dataflow mode.
 
     Returns:
-        ExportResult with config, estimate, and job details.
+        ExportResult with config and job details.
 
     Raises:
         ValueError: If inputs fail validation.
@@ -343,10 +275,8 @@ def export(
         rate_limit=RateLimitConfig(max_qps=max_qps),
     )
 
-    estimate = estimate_cost(pipeline_config, eecu_per_tile=eecu_per_tile)
-
     if dry_run:
-        return ExportResult(config=pipeline_config, estimate=estimate)
+        return ExportResult(config=pipeline_config)
 
     # Resolve JAR
     if jar is not None:
@@ -380,11 +310,10 @@ def export(
         vrt = write_vrt(pipeline_config, output_dir)
         vrt_path = str(vrt)
         tiles_ok = len(list(output_dir.glob("tile_*.tif")))
-        tiles_failed = max(0, estimate.tile_count - tiles_ok)
+        tiles_failed = max(0, pipeline_config.tile_count - tiles_ok)
 
     return ExportResult(
         config=pipeline_config,
-        estimate=estimate,
         job_id=job_id,
         duration_seconds=duration,
         tiles_ok=tiles_ok,
@@ -415,15 +344,15 @@ def demo(
         project: GCP project ID with Earth Engine API enabled.
         output: Local directory for output tiles + VRT.
         jar: Path to the pipeline JAR (auto-detected if None).
-        dry_run: If True, validate and estimate but don't submit.
+        dry_run: If True, validate but don't submit.
         progress_callback: Optional callback(completed, total) for progress.
 
     Returns:
-        ExportResult with config, estimate, and job details.
+        ExportResult with config and job details.
     """
     return export(
-        ee_expression=_DEMO_EXPRESSION,
-        region=_DEMO_REGION,
+        ee_expression=_demo_expression(),
+        region=_demo_region(),
         project=project,
         output=output,
         scale=30.0,

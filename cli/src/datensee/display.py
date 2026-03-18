@@ -9,7 +9,6 @@ from rich.panel import Panel
 from rich.table import Table
 
 from datensee.config import PipelineConfig
-from datensee.estimate import CostEstimate
 
 
 def _format_duration(seconds: float) -> str:
@@ -34,26 +33,11 @@ def _format_bytes(n: int) -> str:
     return f"{n / 1024**3:.2f} GB"
 
 
-def _format_eecu(low: float, typical: float, high: float) -> str:
-    """Format EECU range as low – typical – high."""
-    return f"{low:.0f} – {typical:.0f} – {high:.0f} s  (low/typ/high)"
-
-
-def _format_usd(amount: float) -> str:
-    """Format a USD amount."""
-    if amount < 0.01:
-        return "<$0.01"
-    if amount < 1.0:
-        return f"${amount:.3f}"
-    return f"${amount:.2f}"
-
-
-def render_export_summary(config: PipelineConfig, estimate: CostEstimate) -> Panel:
-    """Render a pre-submission summary panel with cost estimate.
+def render_export_summary(config: PipelineConfig) -> Panel:
+    """Render a pre-submission summary panel with factual config info.
 
     Args:
         config: Pipeline configuration.
-        estimate: Cost estimate from estimate_cost().
 
     Returns:
         Rich Panel ready for console.print().
@@ -64,11 +48,11 @@ def render_export_summary(config: PipelineConfig, estimate: CostEstimate) -> Pan
     table.add_column("label", style="bold", min_width=14)
     table.add_column("value")
 
-    # Export info
     tile_px = grid.tile_size_pixels
-    table.add_row("Tiles", f"{estimate.tile_count:,}  ({tile_px}×{tile_px} px)")
+    table.add_row("Tiles", f"{config.tile_count:,}  ({tile_px}×{tile_px} px)")
     table.add_row("Scale", f"{grid.scale_meters} m/px  ({grid.crs})")
     table.add_row("Output", config.output.output_path)
+    table.add_row("Raw size", _format_bytes(config.raw_output_bytes))
 
     if config.runner.mode == "dataflow" and config.runner.dataflow is not None:
         df = config.runner.dataflow
@@ -80,25 +64,6 @@ def render_export_summary(config: PipelineConfig, estimate: CostEstimate) -> Pan
         table.add_row("Runner", "local  (DirectRunner)")
 
     table.add_row("Rate limit", f"{config.rate_limit.max_qps} QPS")
-    table.add_row("", "")  # spacer
-
-    # Cost estimates
-    table.add_row("Wall time", _format_duration(estimate.estimated_wall_seconds))
-    table.add_row(
-        "EECUs",
-        _format_eecu(
-            estimate.eecu_seconds_low,
-            estimate.eecu_seconds_typical,
-            estimate.eecu_seconds_high,
-        ),
-    )
-
-    if estimate.dataflow_cost_usd is not None:
-        table.add_row("Dataflow", _format_usd(estimate.dataflow_cost_usd))
-
-    size = _format_bytes(estimate.output_size_bytes)
-    cost = _format_usd(estimate.storage_cost_usd_per_month)
-    table.add_row("Storage", f"{size}  ({cost}/mo)")
 
     return Panel(table, title="Export Summary", border_style="cyan")
 
@@ -108,6 +73,8 @@ def render_post_run_summary(
     tiles_ok: int,
     tiles_failed: int,
     output_path: str,
+    *,
+    output_bytes: int | None = None,
 ) -> Panel:
     """Render a post-run summary panel.
 
@@ -116,6 +83,7 @@ def render_post_run_summary(
         tiles_ok: Number of tiles successfully fetched.
         tiles_failed: Number of tiles that failed.
         output_path: Where the output was written.
+        output_bytes: Actual output size in bytes (if measured).
 
     Returns:
         Rich Panel ready for console.print().
@@ -128,6 +96,8 @@ def render_post_run_summary(
     table.add_row("Tiles OK", f"{tiles_ok:,}")
     if tiles_failed > 0:
         table.add_row("Tiles failed", f"[red]{tiles_failed:,}[/red]")
+    if output_bytes is not None:
+        table.add_row("Output size", _format_bytes(output_bytes))
     table.add_row("Output", output_path)
 
     style = "green" if tiles_failed == 0 else "yellow"

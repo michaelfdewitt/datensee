@@ -70,7 +70,7 @@ The public Python API lives in `api.py` — the CLI (`main.py`) is a thin wrappe
 - `notebook.ensure_auth()` — triggers `google.colab.auth` when ADC unavailable
 - `notebook.ensure_jar()` — auto-downloads JAR if not found locally
 - `notebook.display_job_progress(job_id, ...)` — HTML polling display
-- `notebook.display_estimate(estimate, config)` — HTML cost table
+- `notebook.display_export_summary(config)` — HTML config summary
 - `notebook.display_tile_grid(grid, region)` — matplotlib tile map
 - `notebook.preview_tiles(output, config, n=4)` — matplotlib tile images
 
@@ -97,13 +97,13 @@ datensee/
 │   │       ├── api.py           ← Public Python API — orchestration logic
 │   │       ├── notebook.py      ← Colab/Jupyter detection, auth, HTML displays
 │   │       ├── main.py          ← Typer CLI (thin wrapper around api.py)
-│   │       ├── config.py        ← Pydantic models for pipeline config
+│   │       ├── config.py        ← Pydantic models for pipeline config + tile_count/raw_output_bytes
 │   │       ├── tiling.py        ← Region → tile grid decomposition
 │   │       ├── submit.py        ← Dataflow job submission + local progress
 │   │       ├── status.py        ← Job polling with Dataflow metrics
-│   │       ├── estimate.py      ← Cost estimation (EECU, Dataflow, storage)
 │   │       ├── display.py       ← Rich panels (export summary, post-run)
-│   │       └── jar.py           ← Pipeline JAR discovery, download, build
+│   │       ├── jar.py           ← Pipeline JAR discovery, download, build
+│   │       └── data/            ← Bundled JSON (demo expression + region)
 │   └── tests/
 ├── pipelines/
 │   ├── build.gradle.kts

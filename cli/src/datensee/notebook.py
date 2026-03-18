@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from datensee.config import PipelineConfig, TileGrid
-    from datensee.estimate import CostEstimate
     from datensee.status import JobInfo, JobState
 
 
@@ -243,22 +242,24 @@ def display_job_progress(
     )
 
 
-def display_estimate(estimate: CostEstimate, config: PipelineConfig) -> None:
-    """Render a cost estimate as an HTML table in a notebook cell.
+def display_export_summary(config: PipelineConfig) -> None:
+    """Render an export summary as an HTML table in a notebook cell.
 
     Args:
-        estimate: Cost estimate from estimate_cost().
         config: Pipeline configuration.
     """
     from IPython.display import HTML, display
+
+    from datensee.display import _format_bytes
 
     grid = config.tile_grid
     tile_px = grid.tile_size_pixels
 
     rows = [
-        ("Tiles", f"{estimate.tile_count:,} ({tile_px}&times;{tile_px} px)"),
+        ("Tiles", f"{config.tile_count:,} ({tile_px}&times;{tile_px} px)"),
         ("Scale", f"{grid.scale_meters} m/px ({grid.crs})"),
         ("Output", config.output.output_path),
+        ("Raw size", _format_bytes(config.raw_output_bytes)),
     ]
 
     if config.runner.mode == "dataflow" and config.runner.dataflow is not None:
@@ -268,36 +269,6 @@ def display_estimate(estimate: CostEstimate, config: PipelineConfig) -> None:
         rows.append(("Runner", "local (DirectRunner)"))
 
     rows.append(("Rate limit", f"{config.rate_limit.max_qps} QPS"))
-
-    # Cost rows
-    wall_s = estimate.estimated_wall_seconds
-    if wall_s < 60:
-        wall_str = f"~{wall_s:.0f} s"
-    elif wall_s < 3600:
-        wall_str = f"~{wall_s / 60:.1f} min"
-    else:
-        wall_str = f"~{wall_s / 3600:.1f} h"
-    rows.append(("Wall time", wall_str))
-
-    rows.append(
-        (
-            "EECUs",
-            f"{estimate.eecu_seconds_low:.0f} &ndash; {estimate.eecu_seconds_typical:.0f}"
-            f" &ndash; {estimate.eecu_seconds_high:.0f} s (low/typ/high)",
-        )
-    )
-
-    if estimate.dataflow_cost_usd is not None:
-        rows.append(("Dataflow", f"${estimate.dataflow_cost_usd:.2f}"))
-
-    size_gb = estimate.output_size_bytes / (1024**3)
-    if size_gb >= 1:
-        size_str = f"{size_gb:.2f} GB"
-    elif estimate.output_size_bytes >= 1024**2:
-        size_str = f"{estimate.output_size_bytes / 1024**2:.1f} MB"
-    else:
-        size_str = f"{estimate.output_size_bytes / 1024:.1f} KB"
-    rows.append(("Storage", f"{size_str} (${estimate.storage_cost_usd_per_month:.3f}/mo)"))
 
     row_html = "\n".join(
         f'<tr><td style="padding: 4px 12px; font-weight: bold;">{label}</td>'

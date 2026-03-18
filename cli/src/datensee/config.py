@@ -12,6 +12,15 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+_BYTES_PER_PIXEL: dict[str, int] = {
+    "float32": 4,
+    "float64": 8,
+    "int16": 2,
+    "int32": 4,
+    "uint8": 1,
+    "uint16": 2,
+}
+
 
 class TileCoordinate(BaseModel):
     """A single tile's bounding box in the target CRS."""
@@ -131,6 +140,18 @@ class PipelineConfig(BaseModel):
     output: OutputConfig
     runner: RunnerConfig = Field(default_factory=RunnerConfig)
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
+
+    @property
+    def tile_count(self) -> int:
+        """Number of tiles (0 when tiles are externalized to a file)."""
+        return len(self.tile_grid.tiles) if self.tile_grid.tiles is not None else 0
+
+    @property
+    def raw_output_bytes(self) -> int:
+        """Exact uncompressed output size in bytes."""
+        bpp = _BYTES_PER_PIXEL.get(self.output.data_type, 4)
+        px = self.tile_grid.tile_size_pixels
+        return self.tile_count * px * px * bpp * self.output.band_count
 
     @model_validator(mode="after")
     def ee_expression_is_valid_json(self) -> PipelineConfig:

@@ -12,8 +12,8 @@ from rich.console import Console
 
 from datensee import __version__
 from datensee.api import (
-    _DEMO_EXPRESSION,
-    _DEMO_REGION,
+    _demo_expression,
+    _demo_region,
     _validate_inputs,
 )
 from datensee.config import (
@@ -24,7 +24,6 @@ from datensee.config import (
     RunnerConfig,
 )
 from datensee.display import render_export_summary, render_post_run_summary
-from datensee.estimate import estimate_cost
 from datensee.expression import clip_expression
 from datensee.jar import build_jar, download_jar, find_jar
 from datensee.submit import submit_job
@@ -111,16 +110,18 @@ def demo(
     console.print(f"  project : {project}")
     console.print(f"  output  : {output.resolve()}")
 
+    demo_region = _demo_region()
+
     console.print("\n[bold]Tiling region[/bold] (30 m/px, EPSG:4326)")
     grid = decompose_region(
-        geojson_geometry=_DEMO_REGION,
+        geojson_geometry=demo_region,
         scale_meters=30.0,
         crs="EPSG:4326",
         tile_size_pixels=512,
     )
     console.print(f"  → {len(grid.tiles)} tiles")
 
-    clipped_expression = clip_expression(_DEMO_EXPRESSION, _DEMO_REGION)
+    clipped_expression = clip_expression(_demo_expression(), demo_region)
 
     config = PipelineConfig(
         ee_expression=clipped_expression,
@@ -130,8 +131,7 @@ def demo(
         runner=RunnerConfig(mode="local"),
     )
 
-    estimate = estimate_cost(config)
-    console.print(render_export_summary(config, estimate))
+    console.print(render_export_summary(config))
 
     t0 = _time.monotonic()
     submit_job(config, jar_path=jar_path, dry_run=dry_run)
@@ -235,14 +235,6 @@ def export(
         bool,
         typer.Option("--yes", "-y", help="Skip confirmation prompt for large jobs."),
     ] = False,
-    eecu_per_tile: Annotated[
-        float,
-        typer.Option(
-            "--eecu-per-tile",
-            help="Override EECU-seconds per tile for cost estimation (from calibration runs).",
-            min=0.01,
-        ),
-    ] = 1.0,
     run_eval: Annotated[
         bool,
         typer.Option(
@@ -306,14 +298,10 @@ def export(
         rate_limit=RateLimitConfig(max_qps=max_qps),
     )
 
-    estimate = estimate_cost(pipeline_config, eecu_per_tile=eecu_per_tile)
-    console.print(render_export_summary(pipeline_config, estimate))
+    console.print(render_export_summary(pipeline_config))
 
     # Confirm before large jobs unless --yes
-    is_large = estimate.tile_count > 10_000 or (
-        estimate.dataflow_cost_usd is not None and estimate.dataflow_cost_usd > 1.0
-    )
-    if is_large and not yes and not dry_run:
+    if pipeline_config.tile_count > 10_000 and not yes and not dry_run:
         typer.confirm("This is a large job. Proceed?", abort=True)
 
     t0 = _time.monotonic()
@@ -329,7 +317,7 @@ def export(
         console.print("\n[bold]Assembling VRT mosaic[/bold]")
         vrt = write_vrt(pipeline_config, Path(output))
         tiles_ok = len(list(Path(output).glob("tile_*.tif")))
-        tiles_failed = max(0, estimate.tile_count - tiles_ok)
+        tiles_failed = max(0, pipeline_config.tile_count - tiles_ok)
         console.print(render_post_run_summary(duration, tiles_ok, tiles_failed, str(vrt)))
 
     if not dry_run and run_eval and runner == "local" and not output.startswith("gs://"):

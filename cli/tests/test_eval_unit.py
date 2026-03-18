@@ -301,8 +301,8 @@ class TestE10SizePlausibility:
         tiles = _make_tiles(2, 2)
         config = _make_config(tiles, output_path=str(tmp_path))
 
-        # estimate_cost predicts: 4 tiles * 64*64 * 4 bytes * 0.5 = 32,768 bytes
-        # Write tiles at ~8 KB each → 32 KB total → ratio ≈ 1.0
+        # raw_output_bytes: 4 tiles * 64*64 * 4 bytes = 65,536 bytes
+        # Write tiles at ~8 KB each → 32 KB total → ratio ≈ 0.5 (within bounds)
         for t in tiles:
             _write_fake_tiff(tmp_path / tile_filename(t), size_bytes=8192)
 

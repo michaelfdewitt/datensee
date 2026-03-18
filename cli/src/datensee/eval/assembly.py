@@ -2,7 +2,7 @@
 
 E05: VRT references every tile with correct band count/type/dimensions.
 E08: tiles_on_disk + tiles_in_failures == tiles_in_config.
-E10: Total output size within 0.2x–5x of cost estimator prediction.
+E10: Total output size within 0.2x–5x of raw (uncompressed) prediction.
 """
 
 from __future__ import annotations
@@ -12,8 +12,8 @@ import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from datensee.assemble import _vrt_data_type
 from datensee.config import PipelineConfig
-from datensee.estimate import estimate_cost
 from datensee.eval.catalog import EvalID
 from datensee.eval.report import EvalResult, EvalStatus
 from datensee.eval.tile_integrity import tile_filename
@@ -109,16 +109,6 @@ def eval_e08_failure_accounting(
 # E05: VRT Completeness
 # ---------------------------------------------------------------------------
 
-# Map config data_type to VRT DataType names (mirrors assemble._DATA_TYPE_MAP).
-_VRT_DATA_TYPE_MAP: dict[str, str] = {
-    "float32": "Float32",
-    "float64": "Float64",
-    "int16": "Int16",
-    "int32": "Int32",
-    "uint8": "Byte",
-    "uint16": "UInt16",
-}
-
 
 def eval_e05_vrt_completeness(
     output_dir: Path,
@@ -173,7 +163,7 @@ def eval_e05_vrt_completeness(
         issues.append(f"VRT has {len(vrt_bands)} bands, expected {expected_bands}")
 
     # DataType
-    expected_dtype = _VRT_DATA_TYPE_MAP.get(config.output.data_type, "Float32")
+    expected_dtype = _vrt_data_type(config.output.data_type)
     for band_el in vrt_bands:
         dt = band_el.get("dataType", "")
         if dt != expected_dtype:
@@ -226,13 +216,12 @@ def eval_e10_size_plausibility(
     output_dir: Path,
     config: PipelineConfig,
 ) -> EvalResult:
-    """E10: Verify total output size is plausible vs. cost estimator prediction.
+    """E10: Verify total output size is plausible vs. raw (uncompressed) prediction.
 
-    Actual size should be within 0.2x–5x of the estimated size. Wide bounds
+    Actual compressed size should be within 0.2x–5x of the raw size. Wide bounds
     account for compression variability and nodata regions.
     """
-    estimate = estimate_cost(config)
-    predicted_bytes = estimate.output_size_bytes
+    predicted_bytes = config.raw_output_bytes
 
     if predicted_bytes == 0:
         return EvalResult(

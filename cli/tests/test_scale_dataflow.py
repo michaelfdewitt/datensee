@@ -42,7 +42,7 @@ from datensee.config import (
     RateLimitConfig,
     RunnerConfig,
 )
-from datensee.estimate import estimate_cost
+from datensee.display import _format_bytes
 from datensee.expression import clip_expression
 from datensee.jar import find_jar
 from datensee.submit import submit_job
@@ -262,12 +262,9 @@ class TestZurichNdviDataflow:
             rate_limit=RateLimitConfig(max_qps=100),
         )
 
-        # -- Cost estimate --
-        est = estimate_cost(config)
-        print(f"Estimated wall time: {est.estimated_wall_seconds:.0f}s")
-        print(f"Estimated EECUs: {est.eecu_seconds_low:.0f}-{est.eecu_seconds_high:.0f}s")
-        print(f"Estimated Dataflow cost: ${est.dataflow_cost_usd:.2f}")
-        print(f"Estimated output size: {est.output_size_bytes / 1024**3:.1f} GB")
+        # -- Config summary --
+        print(f"Tiles: {config.tile_count}")
+        print(f"Raw output size: {_format_bytes(config.raw_output_bytes)}")
         print(f"Output: {output_prefix}")
 
         # -- Submit and wait --

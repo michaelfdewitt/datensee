@@ -27,6 +27,11 @@ console = Console()
 TILE_FILE_THRESHOLD = 5000
 
 
+def _count_completed_tiles(output_dir: Path) -> int:
+    """Count completed tile GeoTIFFs in the output directory."""
+    return len(list(output_dir.glob("tile_*.tif")))
+
+
 def submit_job(
     config: PipelineConfig,
     jar_path: Path,
@@ -76,11 +81,10 @@ def submit_job(
     console.print(f"Config written to: {tmp_path}")
 
     if config.runner.mode == "local" and not config.output.output_path.startswith("gs://"):
-        total = _tile_count_from_config(config)
         _run_local_with_progress(
             cmd,
             Path(config.output.output_path),
-            total,
+            config.tile_count,
             progress_callback=progress_callback,
         )
         return None
@@ -93,13 +97,6 @@ def submit_job(
 
     # TODO: parse Dataflow job ID from stdout/stderr.
     return None
-
-
-def _tile_count_from_config(config: PipelineConfig) -> int:
-    """Extract tile count from config."""
-    if config.tile_grid.tiles is not None:
-        return len(config.tile_grid.tiles)
-    return 0
 
 
 def _run_local_with_progress(
@@ -136,10 +133,10 @@ def _run_local_with_progress(
 
     if progress_callback is not None:
         while process.poll() is None:
-            completed = len(list(output_dir.glob("tile_*.tif")))
+            completed = _count_completed_tiles(output_dir)
             progress_callback(min(completed, total_tiles or completed), total_tiles)
             time.sleep(0.5)
-        completed = len(list(output_dir.glob("tile_*.tif")))
+        completed = _count_completed_tiles(output_dir)
         progress_callback(min(completed, total_tiles or completed), total_tiles)
     else:
         with Progress(
@@ -154,11 +151,11 @@ def _run_local_with_progress(
             task = progress.add_task("Fetching tiles", total=total_tiles or 1)
 
             while process.poll() is None:
-                completed = len(list(output_dir.glob("tile_*.tif")))
+                completed = _count_completed_tiles(output_dir)
                 progress.update(task, completed=min(completed, total_tiles or completed))
                 time.sleep(0.5)
 
-            completed = len(list(output_dir.glob("tile_*.tif")))
+            completed = _count_completed_tiles(output_dir)
             progress.update(task, completed=min(completed, total_tiles or completed))
 
     if process.returncode != 0:
@@ -174,13 +171,11 @@ def _maybe_externalize_tiles(
     """For large tile counts, write tiles to NDJSON and update config."""
     if config.tile_grid.tiles is None:
         return config
-    if len(config.tile_grid.tiles) < TILE_FILE_THRESHOLD:
+    if config.tile_count < TILE_FILE_THRESHOLD:
         return config
 
     tiles_file_path = _tiles_file_path(config.output.output_path)
-    console.print(
-        f"[bold]Externalizing {len(config.tile_grid.tiles)} tiles[/bold] → {tiles_file_path}"
-    )
+    console.print(f"[bold]Externalizing {config.tile_count} tiles[/bold] → {tiles_file_path}")
 
     if not dry_run:
         _upload_tiles_ndjson(config.tile_grid.tiles, tiles_file_path)
