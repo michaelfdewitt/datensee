@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated
 
-import pyproj
 import typer
 from rich.console import Console
 
 from datensee import __version__
-from datensee.assemble import write_vrt
+from datensee.api import (
+    _DEMO_EXPRESSION,
+    _DEMO_REGION,
+    _validate_inputs,
+)
 from datensee.config import (
     DataflowRunnerConfig,
     OutputConfig,
@@ -36,164 +38,6 @@ app = typer.Typer(
 jar_app = typer.Typer(help="Manage the pipeline JAR (build, download, locate).")
 app.add_typer(jar_app, name="jar")
 console = Console()
-
-# ---------------------------------------------------------------------------
-# Hardcoded M1 demo assets
-# ---------------------------------------------------------------------------
-
-# Landsat 9 summer-2023 NDVI, serialized EE expression.
-# Generated with: ee.serializer.encode(image, for_cloud_api=True) where:
-#   image = (ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
-#            .filterDate('2023-06-01', '2023-09-01')
-#            .median()
-#            .normalizedDifference(['SR_B5', 'SR_B4']))
-_DEMO_EXPRESSION = json.dumps(
-    {
-        "result": "0",
-        "values": {
-            "0": {
-                "functionInvocationValue": {
-                    "functionName": "Image.normalizedDifference",
-                    "arguments": {
-                        "bandNames": {"constantValue": ["SR_B5", "SR_B4"]},
-                        "input": {
-                            "functionInvocationValue": {
-                                "functionName": "reduce.median",
-                                "arguments": {
-                                    "collection": {
-                                        "functionInvocationValue": {
-                                            "functionName": "Collection.filter",
-                                            "arguments": {
-                                                "collection": {
-                                                    "functionInvocationValue": {
-                                                        "functionName": "ImageCollection.load",
-                                                        "arguments": {
-                                                            "id": {
-                                                                "constantValue": "LANDSAT/LC09/C02/T1_L2"
-                                                            }
-                                                        },
-                                                    }
-                                                },
-                                                "filter": {
-                                                    "functionInvocationValue": {
-                                                        "functionName": "Filter.dateRangeContains",
-                                                        "arguments": {
-                                                            "leftValue": {
-                                                                "functionInvocationValue": {
-                                                                    "functionName": "DateRange",
-                                                                    "arguments": {
-                                                                        "end": {
-                                                                            "constantValue": "2023-09-01"
-                                                                        },
-                                                                        "start": {
-                                                                            "constantValue": "2023-06-01"
-                                                                        },
-                                                                    },
-                                                                }
-                                                            },
-                                                            "rightField": {
-                                                                "constantValue": "system:time_start"
-                                                            },
-                                                        },
-                                                    }
-                                                },
-                                            },
-                                        }
-                                    }
-                                },
-                            }
-                        },
-                    },
-                }
-            }
-        },
-    }
-)
-
-# 0.25° × 0.25° SF Bay Area bounding box — produces ~4 tiles at 30 m/px.
-_DEMO_REGION = {
-    "type": "Polygon",
-    "coordinates": [
-        [
-            [-122.5, 37.75],
-            [-122.25, 37.75],
-            [-122.25, 38.0],
-            [-122.5, 38.0],
-            [-122.5, 37.75],
-        ]
-    ],
-}
-
-
-# ---------------------------------------------------------------------------
-# Input validation
-# ---------------------------------------------------------------------------
-
-_VALID_GEOJSON_TYPES = {"Polygon", "MultiPolygon"}
-_GCS_URI_PATTERN = "gs://"
-
-
-def _validate_inputs(
-    ee_expression: str,
-    geojson_geometry: dict[str, Any],
-    crs: str,
-    output: str,
-    runner: str,
-) -> list[str]:
-    """Validate export inputs before job submission. Returns list of errors."""
-    errors: list[str] = []
-
-    # 1. ee_expression must be valid JSON
-    try:
-        json.loads(ee_expression)
-    except (json.JSONDecodeError, TypeError) as exc:
-        errors.append(
-            f"Expression file is not valid JSON: {exc}. "
-            "Provide a file containing a serialized EE computation "
-            "(output of ee.serializer.encode())."
-        )
-
-    # 2. Region must be a Polygon or MultiPolygon (or Feature wrapping one)
-    geom_type = geojson_geometry.get("type")
-    if geom_type == "Feature":
-        geom_type = (geojson_geometry.get("geometry") or {}).get("type")
-    if geom_type == "FeatureCollection":
-        errors.append(
-            "Region GeoJSON type is 'FeatureCollection', but a single "
-            "Polygon or MultiPolygon is required. Extract one feature first."
-        )
-    elif geom_type not in _VALID_GEOJSON_TYPES:
-        errors.append(
-            f"Region GeoJSON type is '{geom_type}', but must be one of "
-            f"{sorted(_VALID_GEOJSON_TYPES)}. Points and lines cannot define "
-            f"an export region."
-        )
-
-    # 3. CRS must be parseable by pyproj
-    try:
-        pyproj.CRS.from_user_input(crs)
-    except pyproj.exceptions.CRSError as exc:
-        errors.append(
-            f"CRS '{crs}' is not recognized: {exc}. "
-            "Use an EPSG code (e.g. 'EPSG:4326') or a valid proj string."
-        )
-
-    # 4. Output path validation
-    if runner == "local" and not output.startswith(_GCS_URI_PATTERN):
-        output_path = Path(output)
-        parent = output_path if output_path.is_dir() else output_path.parent
-        if parent.exists() and not os.access(parent, os.W_OK):
-            errors.append(
-                f"Output directory '{parent}' is not writable. "
-                "Check permissions or choose a different path."
-            )
-    elif runner == "dataflow" and not output.startswith(_GCS_URI_PATTERN):
-        errors.append(
-            f"Dataflow mode requires a GCS output path (gs://…), "
-            f"but got '{output}'. Provide a GCS URI."
-        )
-
-    return errors
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +138,8 @@ def demo(
     duration = _time.monotonic() - t0
 
     if not dry_run:
+        from datensee.assemble import write_vrt
+
         console.print("\n[bold]Assembling VRT mosaic[/bold]")
         vrt = write_vrt(config, output)
         tiles_ok = len(list(output.glob("tile_*.tif")))
@@ -478,6 +324,8 @@ def export(
         console.print(f"[green]Job submitted:[/green] {job_id}")
 
     if not dry_run and assemble and runner == "local" and not output.startswith("gs://"):
+        from datensee.assemble import write_vrt
+
         console.print("\n[bold]Assembling VRT mosaic[/bold]")
         vrt = write_vrt(pipeline_config, Path(output))
         tiles_ok = len(list(Path(output).glob("tile_*.tif")))

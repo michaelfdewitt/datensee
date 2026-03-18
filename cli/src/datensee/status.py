@@ -7,6 +7,7 @@ tile-level progress metrics. Dataflow metrics lag ~30-60s behind reality.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -18,7 +19,9 @@ from rich.table import Table
 
 console = Console()
 
-_DATAFLOW_API = "https://dataflow.googleapis.com/v1b3/projects/{project}/locations/{region}/jobs/{job_id}"
+_DATAFLOW_API = (
+    "https://dataflow.googleapis.com/v1b3/projects/{project}/locations/{region}/jobs/{job_id}"
+)
 
 
 class JobState(StrEnum):
@@ -51,6 +54,7 @@ def poll_job(
     access_token: str,
     *,
     poll_interval_seconds: int = 15,
+    status_callback: Callable[[JobInfo], None] | None = None,
 ) -> JobState:
     """Poll a Dataflow job until it reaches a terminal state.
 
@@ -60,6 +64,8 @@ def poll_job(
         region: Dataflow region (e.g. 'us-central1').
         access_token: OAuth2 bearer token for the Dataflow API.
         poll_interval_seconds: How often to poll.
+        status_callback: Optional callback(JobInfo) called on each poll tick.
+            When provided, Rich Live display is suppressed.
 
     Returns:
         Final JobState.
@@ -67,15 +73,21 @@ def poll_job(
     url = _DATAFLOW_API.format(project=project, region=region, job_id=job_id)
     headers = {"Authorization": f"Bearer {access_token}"}
 
-    with Live(console=console, refresh_per_second=4) as live:
+    if status_callback is not None:
         while True:
             info = _fetch_job_info(url, headers)
-            live.update(_render_status_table(job_id, info))
-
+            status_callback(info)
             if info.state in TERMINAL_STATES:
                 break
-
             time.sleep(poll_interval_seconds)
+    else:
+        with Live(console=console, refresh_per_second=4) as live:
+            while True:
+                info = _fetch_job_info(url, headers)
+                live.update(_render_status_table(job_id, info))
+                if info.state in TERMINAL_STATES:
+                    break
+                time.sleep(poll_interval_seconds)
 
     return info.state
 

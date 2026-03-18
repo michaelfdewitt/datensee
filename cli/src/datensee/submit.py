@@ -14,6 +14,7 @@ import json
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from rich.console import Console
@@ -31,6 +32,7 @@ def submit_job(
     jar_path: Path,
     *,
     dry_run: bool = False,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> str | None:
     """Submit the pipeline to Dataflow (or run locally via Direct runner).
 
@@ -38,6 +40,9 @@ def submit_job(
         config: Validated pipeline configuration.
         jar_path: Path to the compiled Beam fat-JAR.
         dry_run: If True, print the command without executing it.
+        progress_callback: Optional callback(completed, total) for local mode
+            progress updates. When provided, Rich progress bar is suppressed.
+            When None, Rich progress bar is used (backwards-compatible).
 
     Returns:
         Dataflow job ID string, or None for local runs / dry runs.
@@ -54,9 +59,7 @@ def submit_job(
 
     config = _maybe_externalize_tiles(config, dry_run=dry_run)
 
-    with tempfile.NamedTemporaryFile(
-        suffix=".json", delete=False, mode="w"
-    ) as tmp:
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as tmp:
         tmp_path = Path(tmp.name)
         config.write_json(tmp_path)
 
@@ -66,9 +69,7 @@ def submit_job(
         console.print("[bold cyan]Dry run — would execute:[/bold cyan]")
         console.print(" ".join(str(c) for c in cmd))
         if config.tile_grid.tiles_file:
-            console.print(
-                f"[dim]Tiles would be uploaded to: {config.tile_grid.tiles_file}[/dim]"
-            )
+            console.print(f"[dim]Tiles would be uploaded to: {config.tile_grid.tiles_file}[/dim]")
         return None
 
     console.print(f"[bold]Submitting pipeline[/bold] (mode={config.runner.mode})")
@@ -76,7 +77,12 @@ def submit_job(
 
     if config.runner.mode == "local" and not config.output.output_path.startswith("gs://"):
         total = _tile_count_from_config(config)
-        _run_local_with_progress(cmd, Path(config.output.output_path), total)
+        _run_local_with_progress(
+            cmd,
+            Path(config.output.output_path),
+            total,
+            progress_callback=progress_callback,
+        )
         return None
 
     subprocess.run(cmd, check=True, text=True)
@@ -100,17 +106,21 @@ def _run_local_with_progress(
     cmd: list[str],
     output_dir: Path,
     total_tiles: int,
+    *,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> None:
-    """Run the local pipeline with a Rich progress bar driven by file polling.
+    """Run the local pipeline with progress tracking driven by file polling.
 
     Spawns the Java process and polls output_dir for tile_*.tif files every
-    0.5s to update the progress bar. This avoids parsing Beam's unstable
-    Direct runner stdout format.
+    0.5s. When progress_callback is provided, calls it with (completed, total)
+    instead of rendering a Rich progress bar.
 
     Args:
         cmd: Java command to execute.
         output_dir: Directory where tile GeoTIFFs are written.
         total_tiles: Expected number of tiles (for the progress bar total).
+        progress_callback: Optional callback(completed, total). When provided,
+            Rich progress bar is suppressed.
 
     Raises:
         subprocess.CalledProcessError: If the Java process exits non-zero.
@@ -124,31 +134,36 @@ def _run_local_with_progress(
         text=True,
     )
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[bold blue]{task.description}"),
-        BarColumn(),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        TextColumn("{task.completed}/{task.total} tiles"),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task("Fetching tiles", total=total_tiles or 1)
-
+    if progress_callback is not None:
         while process.poll() is None:
             completed = len(list(output_dir.glob("tile_*.tif")))
-            progress.update(task, completed=min(completed, total_tiles or completed))
+            progress_callback(min(completed, total_tiles or completed), total_tiles)
             time.sleep(0.5)
-
-        # Final count after process exits
         completed = len(list(output_dir.glob("tile_*.tif")))
-        progress.update(task, completed=min(completed, total_tiles or completed))
+        progress_callback(min(completed, total_tiles or completed), total_tiles)
+    else:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TextColumn("{task.completed}/{task.total} tiles"),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Fetching tiles", total=total_tiles or 1)
+
+            while process.poll() is None:
+                completed = len(list(output_dir.glob("tile_*.tif")))
+                progress.update(task, completed=min(completed, total_tiles or completed))
+                time.sleep(0.5)
+
+            completed = len(list(output_dir.glob("tile_*.tif")))
+            progress.update(task, completed=min(completed, total_tiles or completed))
 
     if process.returncode != 0:
         stderr = process.stderr.read() if process.stderr else ""
-        raise subprocess.CalledProcessError(
-            process.returncode, cmd, output="", stderr=stderr
-        )
+        raise subprocess.CalledProcessError(process.returncode, cmd, output="", stderr=stderr)
 
 
 def _maybe_externalize_tiles(
@@ -192,10 +207,7 @@ def _upload_tiles_ndjson(
     tiles_file_path: str,
 ) -> None:
     """Write tile coordinates as NDJSON to local path or GCS."""
-    lines = [
-        json.dumps(tile.model_dump(), separators=(",", ":"))
-        for tile in tiles
-    ]
+    lines = [json.dumps(tile.model_dump(), separators=(",", ":")) for tile in tiles]
     content = "\n".join(lines) + "\n"
 
     if tiles_file_path.startswith("gs://"):
