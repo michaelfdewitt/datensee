@@ -266,19 +266,6 @@ The integration suite includes:
 - **Pixel alignment** — shift region by N pixels, fetch overlapping tiles, assert `array_equal`
 - **Config roundtrip** — serialize to JSON, deserialize, fetch from restored config
 
-## Roadmap
-
-| Milestone | Status | Description |
-|-----------|--------|-------------|
-| M1: Proof of Life | Done | End-to-end: CLI → Dataflow → HV API → GeoTIFF |
-| M2: Real Config | Done | Arbitrary expressions, CRS, multi-band, validation |
-| M3: Scale | Done | Rate limiting, retry, adaptive tiling, COG output |
-| M4: UX Polish | Done | Rich progress, cost estimation, summary panels |
-| M5: Distribution | Done | `pip install datensee`, prebuilt JARs, JAR management |
-| Evals | Done | 10 output validation evals — structural, spatial, pixel-level ([details](EVALS.md)) |
-| Notebook Integration | Done | Python API, Colab auto-auth, HTML displays, quickstart notebook |
-| M6: Two-Tier Tiling | Next | Separate compute tiles from output tiles for practical file counts |
-
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).

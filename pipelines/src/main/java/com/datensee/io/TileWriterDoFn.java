@@ -16,24 +16,33 @@ import org.slf4j.LoggerFactory;
 /**
  * Writes a single fetched tile to either GCS or the local filesystem.
  *
- * <p>Routing: if {@code outputPath} starts with {@code gs://}, writes to GCS.
- * Otherwise, treats it as a local directory path (useful for Direct runner
- * local testing without requiring GCS credentials).
+ * <p>Each tile is transcoded from the raw GeoTIFF returned by the EE HV API
+ * into a Cloud Optimized GeoTIFF (internal tiling + compression) before
+ * writing. This makes output tiles compatible with
+ * {@code ee.Image.loadGeoTIFF()} for direct visualization.
  *
- * <p>Each tile is written as an individual GeoTIFF named
- * {@code tile_r{row}_c{col}.tif}. Full COG stitching is handled in a
- * post-processing step (see {@code assemble.py} in the Python CLI).
+ * <p>Routing: if {@code outputPath} starts with {@code gs://}, writes to GCS.
+ * Otherwise, treats it as a local directory path.
  */
 public final class TileWriterDoFn extends DoFn<FetchedTile, Void> {
 
     private static final Logger LOG = LoggerFactory.getLogger(TileWriterDoFn.class);
 
     private final String outputPath;
+    private final int tileSize;
+    private final String compression;
 
     private transient Storage storage;
 
-    public TileWriterDoFn(String outputPath) {
+    /**
+     * @param outputPath  GCS URI or local directory
+     * @param tileSize    tile edge size in pixels (used as COG block size)
+     * @param compression COG compression algorithm ("lzw", "deflate", "none")
+     */
+    public TileWriterDoFn(String outputPath, int tileSize, String compression) {
         this.outputPath = outputPath;
+        this.tileSize = tileSize;
+        this.compression = compression;
     }
 
     @Setup
@@ -51,14 +60,18 @@ public final class TileWriterDoFn extends DoFn<FetchedTile, Void> {
             tile.coordinate().col()
         );
 
+        byte[] cogBytes = CogTranscoder.transcode(
+            tile.imageBytes(), tileSize, compression
+        );
+
         if (outputPath.startsWith("gs://")) {
-            writeToGcs(tile, tifName);
+            writeToGcs(tile, tifName, cogBytes);
         } else {
-            writeToLocal(tile, tifName);
+            writeToLocal(tile, tifName, cogBytes);
         }
     }
 
-    private void writeToGcs(FetchedTile tile, String tifName) {
+    private void writeToGcs(FetchedTile tile, String tifName, byte[] data) {
         URI gcsUri = URI.create(outputPath);
         String bucket = gcsUri.getHost();
         String prefix = gcsUri.getPath().replaceFirst("^/", "");
@@ -69,21 +82,21 @@ public final class TileWriterDoFn extends DoFn<FetchedTile, Void> {
             .setContentType("image/tiff")
             .build();
 
-        storage.create(blobInfo, tile.imageBytes());
+        storage.create(blobInfo, data);
         LOG.info(
-            "Wrote {} ({} bytes) to gs://{}/{}",
-            tile.coordinate().id(), tile.imageBytes().length, bucket, blobName
+            "Wrote {} ({} bytes, COG) to gs://{}/{}",
+            tile.coordinate().id(), data.length, bucket, blobName
         );
     }
 
-    private void writeToLocal(FetchedTile tile, String tifName) throws IOException {
+    private void writeToLocal(FetchedTile tile, String tifName, byte[] data) throws IOException {
         Path outDir = Path.of(outputPath);
         Files.createDirectories(outDir);
         Path dest = outDir.resolve(tifName);
-        Files.write(dest, tile.imageBytes());
+        Files.write(dest, data);
         LOG.info(
-            "Wrote {} ({} bytes) to {}",
-            tile.coordinate().id(), tile.imageBytes().length, dest
+            "Wrote {} ({} bytes, COG) to {}",
+            tile.coordinate().id(), data.length, dest
         );
     }
 }

@@ -38,8 +38,9 @@ A CLI + Python library that lets Google Earth Engine users run image exports at 
 3. **Java Beam pipeline does:**
    - Receives tile coordinates as input PCollection
    - Each worker fetches its tiles via EE High Volume API (parallel, rate-limited, with retries)
-   - Assembles fetched tiles into Cloud Optimized GeoTIFF(s)
-   - Writes to GCS
+   - Transcodes each tile to COG (internal tiling + LZW compression) via pure-Java TIFF rewriter
+   - Writes COG tiles to GCS or local filesystem
+   - Assembles a VRT mosaic manifest referencing all tiles
 4. **Post-processing (optional):** GDAL translate for format conversion (separate step)
 
 ### Python Side (`/cli`)

@@ -103,10 +103,13 @@ public final class DatensEEPipeline {
         PCollection<FetchedTile> fetched = fetchResult.get(TileFetchDoFn.SUCCESS_TAG);
         PCollection<TileCoordinate> failed = fetchResult.get(TileFetchDoFn.FAILED_TAG);
 
-        // --- Write successful tiles ---
+        // --- Write successful tiles as COGs ---
+        String compression = config.output().cog() != null
+            && config.output().cog().compress() != null
+            ? config.output().cog().compress() : "lzw";
         fetched.apply(
             "WriteTiles",
-            new CogWriter(config.output().outputPath())
+            new CogWriter(config.output().outputPath(), tileSize, compression)
         );
 
         // --- Write failure report ---
@@ -118,21 +121,17 @@ public final class DatensEEPipeline {
                 .withoutSharding()
                 .withSuffix(".json"));
 
-        // --- VRT assembly (Dataflow mode) ---
-        boolean isDataflow = config.runner() != null
-            && "dataflow".equals(config.runner().mode());
-        if (isDataflow) {
-            fetched.apply(
-                "AssembleVrt",
-                new VrtAssembler(
-                    config.output().outputPath(),
-                    crs,
-                    config.output().effectiveBandCount(),
-                    config.output().effectiveDataType(),
-                    tileSize
-                )
-            );
-        }
+        // --- VRT assembly ---
+        fetched.apply(
+            "AssembleVrt",
+            new VrtAssembler(
+                config.output().outputPath(),
+                crs,
+                config.output().effectiveBandCount(),
+                config.output().effectiveDataType(),
+                tileSize
+            )
+        );
 
         pipeline.run().waitUntilFinish();
     }

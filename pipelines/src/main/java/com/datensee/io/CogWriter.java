@@ -7,22 +7,34 @@ import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PDone;
 
 /**
- * PTransform that writes fetched tiles to GCS or local filesystem.
+ * PTransform that writes fetched tiles as Cloud Optimized GeoTIFFs.
  *
- * <p>Current implementation writes individual tile GeoTIFFs as a staging
- * step. Full COG assembly (stitching + overview pyramid) is a TODO for M3.
+ * <p>Each tile is transcoded from the raw GeoTIFF returned by the EE HV API
+ * into COG format (internal tiling + compression) before writing to GCS
+ * or local filesystem.
  */
 public final class CogWriter extends PTransform<PCollection<FetchedTile>, PDone> {
 
     private final String outputPath;
+    private final int tileSize;
+    private final String compression;
 
-    public CogWriter(String outputPath) {
+    /**
+     * @param outputPath  GCS URI or local directory
+     * @param tileSize    tile edge size in pixels (used as COG block size)
+     * @param compression COG compression algorithm ("lzw", "deflate", "none")
+     */
+    public CogWriter(String outputPath, int tileSize, String compression) {
         this.outputPath = outputPath;
+        this.tileSize = tileSize;
+        this.compression = compression;
     }
 
     @Override
     public PDone expand(PCollection<FetchedTile> input) {
-        input.apply("WriteTileToOutput", ParDo.of(new TileWriterDoFn(outputPath)));
+        input.apply("WriteCogTile", ParDo.of(
+            new TileWriterDoFn(outputPath, tileSize, compression)
+        ));
         return PDone.in(input.getPipeline());
     }
 }
