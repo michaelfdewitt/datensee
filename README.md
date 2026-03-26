@@ -44,7 +44,7 @@ Your GCP project needs:
 - A GCS bucket to write output to
 - The account you auth with in Colab registered for [non-commercial EE use](https://earthengine.google.com/noncommercial) (or a commercial license)
 
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/michaelfdewitt/datensee/blob/master/notebooks/datensee_demo_gcs.ipynb)
+**To open the notebook:** in Colab, go to **File → Open notebook → GitHub**, connect your GitHub account, search for `michaelfdewitt/datensee`, and select `notebooks/datensee_demo_gcs.ipynb`. The badge-style link doesn't work for private repos.
 
 ---
 
