@@ -36,9 +36,11 @@ _CACHE_DIR = Path.home() / ".datensee" / "jars"
 # Relative to main.py's location inside the installed package
 _REPO_JAR = Path(__file__).parents[3] / "pipelines" / "build" / "libs" / JAR_FILENAME
 
+_GITHUB_REPO = "michaelfdewitt/datensee"
 _GITHUB_RELEASE_URL = (
-    "https://github.com/datensee/datensee/releases/download/v{version}/" + JAR_FILENAME
+    f"https://github.com/{_GITHUB_REPO}/releases/download/v{{version}}/" + JAR_FILENAME
 )
+_GITHUB_API_BASE = f"https://api.github.com/repos/{_GITHUB_REPO}"
 
 console = Console()
 
@@ -100,28 +102,92 @@ def jar_path() -> Path | None:
         return None
 
 
-def download_jar(version: str) -> Path:
-    """Download a prebuilt pipeline JAR from GitHub Releases.
+def _resolve_asset_url(version: str, token: str) -> str:
+    """Resolve a pre-signed download URL for a release asset via the GitHub API.
+
+    The direct ``releases/download/`` URL does not support token auth for private
+    repos. The API returns a temporary pre-signed S3 URL instead.
 
     Args:
-        version: Release version (e.g. "0.1.0").
+        version: Release version string (e.g. "0.1.0-dev").
+        token: GitHub personal access token.
+
+    Returns:
+        Pre-signed S3 URL for the JAR asset.
+
+    Raises:
+        FileNotFoundError: If the release or JAR asset does not exist.
+    """
+    auth = {"Authorization": f"Bearer {token}"}
+
+    release_resp = httpx.get(
+        f"{_GITHUB_API_BASE}/releases/tags/v{version}",
+        headers=auth,
+        timeout=15,
+    )
+    if release_resp.status_code == 404:
+        raise FileNotFoundError(
+            f"No prebuilt JAR found for v{version}.\n"
+            "Check available releases or build from source with `datensee jar build`."
+        )
+    release_resp.raise_for_status()
+
+    asset = next(
+        (a for a in release_resp.json().get("assets", []) if a["name"] == JAR_FILENAME),
+        None,
+    )
+    if asset is None:
+        raise FileNotFoundError(
+            f"Release v{version} exists but contains no {JAR_FILENAME} asset.\n"
+            "The release may be incomplete."
+        )
+
+    # GitHub redirects to a pre-signed S3 URL. Don't follow — S3 rejects the
+    # Authorization header if it also sees the query-string signature.
+    redirect = httpx.get(
+        f"{_GITHUB_API_BASE}/releases/assets/{asset['id']}",
+        headers={**auth, "Accept": "application/octet-stream"},
+        follow_redirects=False,
+        timeout=15,
+    )
+    if redirect.status_code not in (301, 302, 303, 307, 308):
+        redirect.raise_for_status()
+
+    return redirect.headers["location"]
+
+
+def download_jar(version: str, github_token: str | None = None) -> Path:
+    """Download a prebuilt pipeline JAR from GitHub Releases.
+
+    For private repositories, pass a GitHub personal access token via
+    ``github_token``, the ``GITHUB_TOKEN`` env var, or Colab Secrets.
+    The token is used to resolve a pre-signed download URL via the GitHub API;
+    it is never sent to S3.
+
+    Args:
+        version: Release version (e.g. "0.1.0-dev").
+        github_token: GitHub personal access token.
 
     Returns:
         Path to the downloaded JAR.
     """
-    url = _GITHUB_RELEASE_URL.format(version=version)
+    token = github_token or os.environ.get("GITHUB_TOKEN")
+
+    if token:
+        url = _resolve_asset_url(version, token)
+        stream_headers: dict[str, str] = {}  # pre-signed URL; no auth needed
+    else:
+        url = _GITHUB_RELEASE_URL.format(version=version)
+        stream_headers = {}
+
     dest = _CACHE_DIR / JAR_FILENAME
-
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Download to a temp file first, then rename (atomic-ish)
     tmp = dest.with_suffix(".tmp")
 
     console.print(f"Downloading pipeline JAR v{version}...")
-    console.print(f"  {url}")
 
     try:
-        with httpx.stream("GET", url, follow_redirects=True, timeout=300) as response:
+        with httpx.stream("GET", url, headers=stream_headers, follow_redirects=True, timeout=300) as response:
             response.raise_for_status()
             total = int(response.headers.get("content-length", 0))
 

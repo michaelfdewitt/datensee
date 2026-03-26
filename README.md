@@ -23,6 +23,31 @@ datensee export expression.json region.geojson \
   --crs EPSG:32610
 ```
 
+## Collaborator quick start (private beta)
+
+The repo is private, so running the demo notebook requires a GitHub token and a GCP project. Three steps:
+
+**1. Create a GitHub token**
+
+Go to [github.com/settings/tokens](https://github.com/settings/tokens) → *Generate new token (classic)* → tick **`repo`** → set an expiry → copy it.
+
+**2. Add it as a Colab Secret**
+
+Open the notebook in Colab → click the key icon (🔑) in the left sidebar → *Add new secret* → name it **`GITHUB_TOKEN`**, paste the token, enable notebook access.
+
+**3. Set your GCP project and run**
+
+In the notebook's setup cell, change `PROJECT` and `GCS_BUCKET` to your own GCP project and bucket, then run all cells.
+
+Your GCP project needs:
+- [Earth Engine API](https://console.cloud.google.com/apis/library/earthengine.googleapis.com) enabled
+- A GCS bucket to write output to
+- The account you auth with in Colab registered for [non-commercial EE use](https://earthengine.google.com/noncommercial) (or a commercial license)
+
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/michaelfdewitt/datensee/blob/master/notebooks/datensee_demo_gcs.ipynb)
+
+---
+
 ## Why
 
 Earth Engine is great at computing things, but the built-in `Export.image.*` functions were designed in an era that predates the Cambrian explosion of easy and affordable cloud processing tools.
