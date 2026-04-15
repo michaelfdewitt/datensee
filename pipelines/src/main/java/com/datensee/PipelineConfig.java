@@ -96,6 +96,7 @@ public record PipelineConfig(
         @JsonProperty("temp_location") String tempLocation,
         @JsonProperty("staging_location") String stagingLocation,
         @JsonProperty("machine_type") String machineType,
-        @JsonProperty("max_workers") int maxWorkers
+        @JsonProperty("max_workers") int maxWorkers,
+        @JsonProperty("labels") java.util.Map<String, String> labels
     ) { }
 }
