@@ -32,7 +32,7 @@ COPY service/src /app/service/src
 # Install service + datensee into a venv at /app/.venv. `--no-editable` so
 # the installed copies live inside the image and don't require the source
 # trees to stay mounted at runtime.
-RUN cd /app/service && uv sync --frozen=false --no-editable
+RUN cd /app/service && uv sync --no-editable
 
 # Bake the pipeline JAR at a stable path and tell datensee where to find it.
 # The JAR is built outside Docker and passed in via build arg.
