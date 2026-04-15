@@ -199,9 +199,7 @@ public final class DatensEEPipeline {
                 // billing line up.
                 String quotaProject = options.as(GcpOptions.class).getProject();
                 if (quotaProject != null && !quotaProject.isBlank()) {
-                    credentials = credentials.toBuilder()
-                        .setQuotaProjectId(quotaProject)
-                        .build();
+                    credentials = credentials.createWithQuotaProject(quotaProject);
                 }
                 options.as(GcpOptions.class).setGcpCredential(credentials);
                 LOG.info(

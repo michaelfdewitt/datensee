@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable
@@ -107,7 +108,30 @@ def submit_job(
             )
             return None
 
-        subprocess.run(cmd, check=True, text=True, pass_fds=pass_fds)
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                text=True,
+                pass_fds=pass_fds,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            # Tee the child's streams to our own so Cloud Run / CLI logs
+            # still carry the full stack trace, then raise a rich
+            # RuntimeError whose message contains the tail — otherwise the
+            # caller only sees argv + exit code, which is useless.
+            if exc.stdout:
+                sys.stderr.write(exc.stdout)
+            if exc.stderr:
+                sys.stderr.write(exc.stderr)
+            sys.stderr.flush()
+            combined = (exc.stderr or "") + (exc.stdout or "")
+            tail = "\n".join(combined.splitlines()[-40:]).strip()
+            summary = tail or f"exit {exc.returncode} with no output"
+            raise RuntimeError(
+                f"datensee pipeline JVM failed (exit {exc.returncode}):\n{summary}"
+            ) from exc
     finally:
         # Parent-side close of the read end (the child has inherited its
         # own copy). If the child never ran — spawn failure, early raise —
