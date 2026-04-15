@@ -184,6 +184,7 @@ def export(
     region_gcp: str = "us-central1",
     temp_location: str | None = None,
     max_qps: int = 100,
+    labels: dict[str, str] | None = None,
     jar: Path | str | None = None,
     dry_run: bool = False,
     progress_callback: Callable[[int, int], None] | None = None,
@@ -209,6 +210,9 @@ def export(
         region_gcp: Dataflow region (e.g. 'us-central1').
         temp_location: GCS URI for Dataflow temp files (required for Dataflow).
         max_qps: Max queries per second to the EE HV API.
+        labels: Dataflow job labels, forwarded to the runner as --labels=JSON.
+            Only applied in 'dataflow' mode. Useful for filtering jobs.list
+            responses downstream (e.g. {"foundree": "1"}).
         jar: Path to the pipeline JAR (auto-detected if None).
         dry_run: If True, validate but don't submit.
         progress_callback: Optional callback(completed, total) for local
@@ -261,6 +265,7 @@ def export(
                 region=region_gcp,
                 temp_location=temp_location,
                 staging_location=temp_location.rstrip("/") + "/staging",
+                labels=labels,
             ),
         )
     else:

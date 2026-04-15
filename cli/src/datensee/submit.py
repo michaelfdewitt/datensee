@@ -255,5 +255,9 @@ def _build_command(
         ]
         if df.service_account_email:
             cmd.append(f"--serviceAccount={df.service_account_email}")
+        if df.labels:
+            # Beam's PipelineOptionsFactory parses --labels as a JSON map
+            # onto DataflowPipelineWorkerPoolOptions.setLabels(Map<String,String>).
+            cmd.append(f"--labels={json.dumps(df.labels, separators=(',', ':'))}")
 
     return cmd

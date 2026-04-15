@@ -128,6 +128,22 @@ def test_dataflow_runner_config() -> None:
     )
     assert runner.dataflow is not None
     assert runner.dataflow.max_workers == 100
+    assert runner.dataflow.labels is None
+
+
+def test_dataflow_runner_config_with_labels() -> None:
+    runner = RunnerConfig(
+        mode="dataflow",
+        dataflow=DataflowRunnerConfig(
+            project="my-project",
+            region="us-central1",
+            temp_location="gs://my-bucket/tmp",
+            staging_location="gs://my-bucket/staging",
+            labels={"foundree": "1", "team": "geo"},
+        ),
+    )
+    assert runner.dataflow is not None
+    assert runner.dataflow.labels == {"foundree": "1", "team": "geo"}
 
 
 def test_local_output_path_accepted() -> None:

@@ -110,6 +110,13 @@ class DataflowRunnerConfig(BaseModel):
     service_account_email: str | None = None
     network: str | None = None
     subnetwork: str | None = None
+    labels: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "Dataflow job labels, forwarded as --labels=JSON to the pipeline. "
+            "Useful for filtering jobs.list queries by caller / integration."
+        ),
+    )
 
 
 class RunnerConfig(BaseModel):
