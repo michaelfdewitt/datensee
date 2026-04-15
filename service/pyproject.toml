@@ -1,0 +1,30 @@
+[project]
+name = "datensee-service"
+version = "0.0.1"
+description = "HTTP wrapper around datensee.api.export() for Cloud Run"
+requires-python = ">=3.12"
+dependencies = [
+    "datensee",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "google-auth>=2.30",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/datensee_service"]
+
+[tool.uv.sources]
+datensee = { path = "../cli", editable = true }
+
+[dependency-groups]
+dev = [
+    "httpx>=0.27",
+    "pytest>=9.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
