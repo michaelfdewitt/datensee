@@ -188,10 +188,25 @@ public final class DatensEEPipeline {
             try {
                 GoogleCredentials credentials =
                     GoogleCredentials.create(new AccessToken(token, null));
+                // Attach the target GCP project as the quota project. Without
+                // this, google-api-client sends the API call with no
+                // x-goog-user-project header, and Google attributes quota +
+                // API-enablement checks to the OAuth client's implicit project
+                // (the FoundrEE app project), which doesn't have Dataflow
+                // enabled and should never be billed for user jobs. With it
+                // set, quota lands on the user's own project — which is the
+                // same project the Dataflow job runs in, so enablement and
+                // billing line up.
+                String quotaProject = options.as(GcpOptions.class).getProject();
+                if (quotaProject != null && !quotaProject.isBlank()) {
+                    credentials = credentials.toBuilder()
+                        .setQuotaProjectId(quotaProject)
+                        .build();
+                }
                 options.as(GcpOptions.class).setGcpCredential(credentials);
                 LOG.info(
-                    "Installed caller-supplied access token from --userTokenFd={} as pipeline GCP credential.",
-                    fd
+                    "Installed caller-supplied access token from --userTokenFd={} as pipeline GCP credential (quotaProject={}).",
+                    fd, quotaProject
                 );
             } finally {
                 // String contents are immutable in the JVM, so we can't zero
