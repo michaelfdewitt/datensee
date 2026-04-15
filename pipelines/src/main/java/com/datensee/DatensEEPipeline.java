@@ -9,10 +9,15 @@ import com.datensee.io.FailedTileWriter;
 import com.datensee.io.TileCoordinateParser;
 import com.datensee.io.VrtAssembler;
 import com.datensee.options.DatensEEOptions;
+import com.google.auth.oauth2.AccessToken;
+import com.google.auth.oauth2.GoogleCredentials;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 import org.apache.beam.sdk.Pipeline;
+import org.apache.beam.sdk.extensions.gcp.options.GcpOptions;
 import org.apache.beam.sdk.io.TextIO;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.transforms.Create;
@@ -55,6 +60,8 @@ public final class DatensEEPipeline {
      * @param options parsed pipeline options (includes path to config JSON)
      */
     static void run(DatensEEOptions options) throws IOException {
+        applyUserCredentials(options);
+
         PipelineConfig config = loadConfig(options.getConfigFile());
         validateConfig(config);
 
@@ -134,6 +141,68 @@ public final class DatensEEPipeline {
         );
 
         pipeline.run().waitUntilFinish();
+    }
+
+    /**
+     * Install a caller-supplied OAuth access token as the pipeline's GCP
+     * credential, if one was passed via {@code --userTokenFd=<N>}. When
+     * absent, the pipeline falls back to application default credentials,
+     * preserving the standalone-CLI flow.
+     *
+     * <p>Security: the token is a bearer credential. The parent side
+     * (Python {@code datensee.submit}) creates an {@code os.pipe()}, writes
+     * the token onto the write-end, closes the write-end, and marks the
+     * read-end inheritable before spawning this JVM. We read the inherited
+     * FD via {@code /proc/self/fd/<N>}, parse the token, construct the
+     * credential, and zero the intermediate byte buffer. The token never
+     * appears on argv ({@code /proc/<pid>/cmdline}) or the environment
+     * ({@code /proc/<pid>/environ}), so the only on-disk exposure is the
+     * FD symlink itself, and the pipe is at EOF before any other code in
+     * this process runs.
+     *
+     * <p>Linux-only: we rely on {@code /proc/self/fd/<N>} to reopen the
+     * inherited FD as a regular {@code Path}.
+     */
+    private static void applyUserCredentials(DatensEEOptions options) throws IOException {
+        Integer fd = options.getUserTokenFd();
+        if (fd == null || fd < 0) {
+            LOG.info("No --userTokenFd set — falling back to application default credentials.");
+            return;
+        }
+
+        Path fdPath = Path.of("/proc/self/fd/" + fd);
+        byte[] buf = Files.readAllBytes(fdPath);
+        try {
+            // Trim trailing whitespace (parent may or may not newline-terminate)
+            // without materializing a String copy longer than necessary.
+            int end = buf.length;
+            while (end > 0 && Character.isWhitespace((char) (buf[end - 1] & 0xFF))) {
+                end--;
+            }
+            if (end == 0) {
+                throw new IOException(
+                    "Received empty access token on --userTokenFd=" + fd
+                );
+            }
+            String token = new String(buf, 0, end, StandardCharsets.UTF_8);
+            try {
+                GoogleCredentials credentials =
+                    GoogleCredentials.create(new AccessToken(token, null));
+                options.as(GcpOptions.class).setGcpCredential(credentials);
+                LOG.info(
+                    "Installed caller-supplied access token from --userTokenFd={} as pipeline GCP credential.",
+                    fd
+                );
+            } finally {
+                // String contents are immutable in the JVM, so we can't zero
+                // `token`; we just drop the local ref and let GC reclaim it.
+                // The intermediate byte buffer — which we *do* own — is
+                // wiped below.
+                token = null;
+            }
+        } finally {
+            Arrays.fill(buf, (byte) 0);
+        }
     }
 
     private static int resolveMaxWorkers(PipelineConfig config) {

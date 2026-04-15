@@ -12,7 +12,10 @@ import os
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from google.auth.credentials import Credentials
 
 import pyproj
 from pydantic import BaseModel
@@ -188,6 +191,7 @@ def export(
     jar: Path | str | None = None,
     dry_run: bool = False,
     progress_callback: Callable[[int, int], None] | None = None,
+    credentials: Credentials | None = None,
 ) -> ExportResult:
     """Submit an Earth Engine export job.
 
@@ -217,6 +221,13 @@ def export(
         dry_run: If True, validate but don't submit.
         progress_callback: Optional callback(completed, total) for local
             mode progress. Ignored for Dataflow mode.
+        credentials: Optional caller-supplied Google credentials. When set,
+            DatensEE skips its normal ADC bootstrap (`ensure_auth()`) and
+            uses these credentials for every Google API call — GCS uploads
+            on the driver and Dataflow job submission in the Java worker
+            (threaded through a short-lived env var). Use this when the
+            caller is a service that holds an end-user's OAuth token and
+            must not fall back to its own ambient ADC.
 
     Returns:
         ExportResult with config and job details.
@@ -227,7 +238,12 @@ def export(
     """
     from datensee.notebook import ensure_auth, ensure_jar
 
-    ensure_auth()
+    # Caller-supplied credentials bypass the ADC bootstrap entirely so
+    # we never silently fall back to host ADC (see security note in the
+    # FoundrEE bridge — the driver must act as the end user, not as the
+    # host service account).
+    if credentials is None:
+        ensure_auth()
 
     geojson_geometry = region.copy()
 
@@ -300,6 +316,7 @@ def export(
         jar_path=jar_path,
         dry_run=False,
         progress_callback=progress_callback,
+        credentials=credentials,
     )
     duration = time.monotonic() - t0
 

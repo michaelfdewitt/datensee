@@ -34,6 +34,10 @@ dependencies {
     implementation("org.apache.beam:beam-sdks-java-core:$beamVersion")
     implementation("org.apache.beam:beam-runners-direct-java:$beamVersion")
 
+    // GcpOptions lives here — we need it at compile time to install a
+    // caller-supplied GoogleCredentials onto the pipeline options.
+    implementation("org.apache.beam:beam-sdks-java-extensions-google-cloud-platform-core:$beamVersion")
+
     // Dataflow runner — included at runtime; workers resolve this from the JAR
     runtimeOnly("org.apache.beam:beam-runners-google-cloud-dataflow-java:$beamVersion")
 

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+from unittest.mock import MagicMock
 
 from datensee.config import (
     DataflowRunnerConfig,
@@ -13,7 +15,7 @@ from datensee.config import (
     TileCoordinate,
     TileGrid,
 )
-from datensee.submit import _build_command
+from datensee.submit import _build_command, _prepare_user_token_fd
 
 
 def _config(runner: RunnerConfig) -> PipelineConfig:
@@ -104,3 +106,57 @@ def test_dataflow_command_labels_multi_key() -> None:
     assert len(label_flags) == 1
     payload = label_flags[0].removeprefix("--labels=")
     assert json.loads(payload) == {"foundree": "1", "team": "geo"}
+
+
+def test_prepare_user_token_fd_returns_none_without_credentials() -> None:
+    assert _prepare_user_token_fd(None) is None
+
+
+def test_prepare_user_token_fd_round_trip() -> None:
+    """Verify the pipe FD carries exactly the token bytes and then EOFs.
+
+    Simulates what the Java driver does on the other side: read from the
+    inherited FD via `/proc/self/fd/<N>` (here we just read the FD directly
+    since we're the same process) and confirm we see the token followed by
+    EOF. Also verifies the FD is inheritable so subprocess.Popen(pass_fds=...)
+    can actually hand it to the child.
+    """
+    creds = MagicMock()
+    creds.token = "ya29.test-token-value"
+    creds.expired = False
+
+    fd = _prepare_user_token_fd(creds)
+    assert fd is not None
+    try:
+        # subprocess.Popen(pass_fds=...) works because the FD is marked
+        # inheritable. We verify that flag explicitly so a regression in
+        # _prepare_user_token_fd can't silently break the child handoff.
+        assert os.get_inheritable(fd)
+        # Read all bytes — must see the token and then EOF immediately,
+        # because the write end was closed inside the helper.
+        data = os.read(fd, 4096)
+        assert data == b"ya29.test-token-value"
+        assert os.read(fd, 4096) == b""  # EOF
+    finally:
+        os.close(fd)
+
+
+def test_prepare_user_token_fd_refreshes_expired() -> None:
+    """An expired credential is refreshed once before the FD handoff."""
+    creds = MagicMock()
+    creds.token = None
+    creds.expired = True
+
+    def _do_refresh(_request: object) -> None:
+        creds.token = "ya29.refreshed"
+        creds.expired = False
+
+    creds.refresh.side_effect = _do_refresh
+
+    fd = _prepare_user_token_fd(creds)
+    assert fd is not None
+    try:
+        assert os.read(fd, 4096) == b"ya29.refreshed"
+    finally:
+        os.close(fd)
+    creds.refresh.assert_called_once()

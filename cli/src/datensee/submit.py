@@ -11,16 +11,21 @@ output path and references the file in the config instead of inlining.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
 from datensee.config import PipelineConfig, TileGrid
+
+if TYPE_CHECKING:
+    from google.auth.credentials import Credentials
 
 console = Console()
 
@@ -38,6 +43,7 @@ def submit_job(
     *,
     dry_run: bool = False,
     progress_callback: Callable[[int, int], None] | None = None,
+    credentials: Credentials | None = None,
 ) -> str | None:
     """Submit the pipeline to Dataflow (or run locally via Direct runner).
 
@@ -48,6 +54,11 @@ def submit_job(
         progress_callback: Optional callback(completed, total) for local mode
             progress updates. When provided, Rich progress bar is suppressed.
             When None, Rich progress bar is used (backwards-compatible).
+        credentials: Optional caller-supplied Google credentials. When set,
+            the access token is handed to the Java subprocess via an
+            inheritable pipe FD (`--userTokenFd=<N>`) so the token never
+            appears on argv or in the subprocess environment. Also used for
+            driver-side GCS uploads.
 
     Returns:
         Dataflow job ID string, or None for local runs / dry runs.
@@ -62,7 +73,7 @@ def submit_job(
             "Run `./gradlew shadowJar` in the pipelines/ directory first."
         )
 
-    config = _maybe_externalize_tiles(config, dry_run=dry_run)
+    config = _maybe_externalize_tiles(config, dry_run=dry_run, credentials=credentials)
 
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as tmp:
         tmp_path = Path(tmp.name)
@@ -80,16 +91,32 @@ def submit_job(
     console.print(f"[bold]Submitting pipeline[/bold] (mode={config.runner.mode})")
     console.print(f"Config written to: {tmp_path}")
 
-    if config.runner.mode == "local" and not config.output.output_path.startswith("gs://"):
-        _run_local_with_progress(
-            cmd,
-            Path(config.output.output_path),
-            config.tile_count,
-            progress_callback=progress_callback,
-        )
-        return None
+    token_fd = _prepare_user_token_fd(credentials)
+    try:
+        if token_fd is not None:
+            cmd = cmd + [f"--userTokenFd={token_fd}"]
+        pass_fds = (token_fd,) if token_fd is not None else ()
 
-    subprocess.run(cmd, check=True, text=True)
+        if config.runner.mode == "local" and not config.output.output_path.startswith("gs://"):
+            _run_local_with_progress(
+                cmd,
+                Path(config.output.output_path),
+                config.tile_count,
+                progress_callback=progress_callback,
+                pass_fds=pass_fds,
+            )
+            return None
+
+        subprocess.run(cmd, check=True, text=True, pass_fds=pass_fds)
+    finally:
+        # Parent-side close of the read end (the child has inherited its
+        # own copy). If the child never ran — spawn failure, early raise —
+        # this still cleans up the FD.
+        if token_fd is not None:
+            try:
+                os.close(token_fd)
+            except OSError:
+                pass
 
     # For local runs, job ID is not applicable.
     if config.runner.mode == "local":
@@ -99,12 +126,80 @@ def submit_job(
     return None
 
 
+def _prepare_user_token_fd(credentials: Credentials | None) -> int | None:
+    """Write the caller's access token onto a pipe and return the read-end FD.
+
+    Creates an `os.pipe()`, writes the token to the write-end, closes the
+    write-end (so the child hits EOF after reading), and marks the read-end
+    inheritable so `subprocess.Popen(pass_fds=...)` keeps it open across the
+    fork+exec. Returns the read-end FD — the caller is responsible for
+    passing it via `pass_fds` and closing it after the child has exited.
+
+    The whole point of this dance is to avoid putting the bearer token on
+    argv or in the subprocess environment, where it would be visible in
+    `/proc/<pid>/cmdline` and `/proc/<pid>/environ`. The FD number itself
+    is fine to expose on argv — it's a small integer that means nothing
+    outside this process tree.
+    """
+    if credentials is None:
+        return None
+    token = _materialize_access_token(credentials)
+    # bytearray is mutable, so we can zero the buffer after os.write.
+    # The underlying str `token` is still in memory until GC — we can't
+    # fix that without reaching into CPython internals, and that's not
+    # worth the maintenance cost.
+    token_bytes = bytearray(token.encode("utf-8"))
+    read_fd, write_fd = os.pipe()
+    try:
+        os.set_inheritable(read_fd, True)
+        os.write(write_fd, token_bytes)
+    except BaseException:
+        os.close(read_fd)
+        os.close(write_fd)
+        raise
+    finally:
+        for i in range(len(token_bytes)):
+            token_bytes[i] = 0
+    # Close the write end so the child's read hits EOF after the token
+    # bytes are consumed.
+    os.close(write_fd)
+    return read_fd
+
+
+def _materialize_access_token(credentials: Credentials) -> str:
+    """Return a live access token from a Credentials object.
+
+    Refreshes the credential if it is missing a token or has expired.
+    Raises RuntimeError with an actionable message if refresh fails —
+    the caller (FoundrEE bridge) re-emits this as an export-failed event.
+    """
+    token = getattr(credentials, "token", None)
+    expired = getattr(credentials, "expired", False)
+    if token is None or expired:
+        try:
+            from google.auth.transport.requests import Request
+
+            credentials.refresh(Request())
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to refresh caller-supplied credentials: {exc}. "
+                "The access token is missing or expired and could not be renewed."
+            ) from exc
+        token = credentials.token
+    if not token:
+        raise RuntimeError(
+            "Caller-supplied credentials have no access token after refresh."
+        )
+    return token
+
+
 def _run_local_with_progress(
     cmd: list[str],
     output_dir: Path,
     total_tiles: int,
     *,
     progress_callback: Callable[[int, int], None] | None = None,
+    pass_fds: tuple[int, ...] = (),
 ) -> None:
     """Run the local pipeline with progress tracking driven by file polling.
 
@@ -129,6 +224,7 @@ def _run_local_with_progress(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        pass_fds=pass_fds,
     )
 
     if progress_callback is not None:
@@ -167,6 +263,7 @@ def _maybe_externalize_tiles(
     config: PipelineConfig,
     *,
     dry_run: bool,
+    credentials: Credentials | None = None,
 ) -> PipelineConfig:
     """For large tile counts, write tiles to NDJSON and update config."""
     if config.tile_grid.tiles is None:
@@ -178,7 +275,7 @@ def _maybe_externalize_tiles(
     console.print(f"[bold]Externalizing {config.tile_count} tiles[/bold] → {tiles_file_path}")
 
     if not dry_run:
-        _upload_tiles_ndjson(config.tile_grid.tiles, tiles_file_path)
+        _upload_tiles_ndjson(config.tile_grid.tiles, tiles_file_path, credentials=credentials)
 
     new_grid = TileGrid(
         crs=config.tile_grid.crs,
@@ -200,13 +297,15 @@ def _tiles_file_path(output_path: str) -> str:
 def _upload_tiles_ndjson(
     tiles: list,
     tiles_file_path: str,
+    *,
+    credentials: Credentials | None = None,
 ) -> None:
     """Write tile coordinates as NDJSON to local path or GCS."""
     lines = [json.dumps(tile.model_dump(), separators=(",", ":")) for tile in tiles]
     content = "\n".join(lines) + "\n"
 
     if tiles_file_path.startswith("gs://"):
-        _upload_to_gcs(tiles_file_path, content.encode("utf-8"))
+        _upload_to_gcs(tiles_file_path, content.encode("utf-8"), credentials=credentials)
     else:
         path = Path(tiles_file_path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -215,15 +314,20 @@ def _upload_tiles_ndjson(
     console.print(f"  → wrote {len(tiles)} tile coordinates")
 
 
-def _upload_to_gcs(gcs_uri: str, data: bytes) -> None:
-    """Upload bytes to a GCS URI."""
+def _upload_to_gcs(
+    gcs_uri: str,
+    data: bytes,
+    *,
+    credentials: Credentials | None = None,
+) -> None:
+    """Upload bytes to a GCS URI using caller-supplied credentials, if any."""
     from google.cloud import storage
 
     parts = gcs_uri.replace("gs://", "").split("/", 1)
     bucket_name = parts[0]
     blob_name = parts[1] if len(parts) > 1 else ""
 
-    client = storage.Client()
+    client = storage.Client(credentials=credentials) if credentials else storage.Client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
     blob.upload_from_string(data, content_type="application/x-ndjson")
