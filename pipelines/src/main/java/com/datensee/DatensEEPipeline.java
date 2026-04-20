@@ -12,10 +12,16 @@ import com.datensee.options.DatensEEOptions;
 import com.google.auth.oauth2.AccessToken;
 import com.google.auth.oauth2.GoogleCredentials;
 import java.io.IOException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.extensions.gcp.options.GcpOptions;
 import org.apache.beam.sdk.io.TextIO;
@@ -111,9 +117,17 @@ public final class DatensEEPipeline {
         PCollection<TileCoordinate> failed = fetchResult.get(TileFetchDoFn.FAILED_TAG);
 
         // --- Write successful tiles as COGs ---
+        // Default: deflate (zlib). Our hand-rolled LZW encoder in
+        // CogTranscoder produces output that strict TIFF-LZW decoders
+        // (GDAL, imagecodecs, EE's loader) reject with "Corrupted tile:
+        // failed to decompress using scheme LZW". Until the LZW encoder
+        // is rewritten against a canonical test vector, keep the default
+        // at deflate — it's a java.util.zip.Deflater pass-through so
+        // there's nothing to get wrong. Explicit `compress: "lzw"` still
+        // works for callers that want to experiment.
         String compression = config.output().cog() != null
             && config.output().cog().compress() != null
-            ? config.output().cog().compress() : "lzw";
+            ? config.output().cog().compress() : "deflate";
         fetched.apply(
             "WriteTiles",
             new CogWriter(config.output().outputPath(), tileSize, compression)
@@ -140,7 +154,27 @@ public final class DatensEEPipeline {
             )
         );
 
-        pipeline.run().waitUntilFinish();
+        var result = pipeline.run();
+
+        boolean isDataflow = config.runner() != null
+            && "dataflow".equals(config.runner().mode());
+        if (isDataflow) {
+            // DataflowPipelineJob is a runtime-only dep; extract job ID
+            // via reflection to keep the compile-time dep on beam-core only.
+            try {
+                String jobId = result.getClass()
+                    .getMethod("getJobId")
+                    .invoke(result)
+                    .toString();
+                LOG.info("Dataflow job submitted: {}", jobId);
+                System.out.println("DATENSEE_JOB_ID=" + jobId);
+                System.out.flush();
+            } catch (ReflectiveOperationException e) {
+                LOG.warn("Could not extract Dataflow job ID: {}", e.toString());
+            }
+        } else {
+            result.waitUntilFinish();
+        }
     }
 
     /**
@@ -186,8 +220,6 @@ public final class DatensEEPipeline {
             }
             String token = new String(buf, 0, end, StandardCharsets.UTF_8);
             try {
-                GoogleCredentials credentials =
-                    GoogleCredentials.create(new AccessToken(token, null));
                 // Attach the target GCP project as the quota project. Without
                 // this, google-api-client sends the API call with no
                 // x-goog-user-project header, and Google attributes quota +
@@ -197,15 +229,38 @@ public final class DatensEEPipeline {
                 // set, quota lands on the user's own project — which is the
                 // same project the Dataflow job runs in, so enablement and
                 // billing line up.
+                //
+                // We wrap the bare AccessToken credential in a subclass that
+                // forces x-goog-user-project into `getRequestMetadata(URI)`.
+                // `GoogleCredentials.createWithQuotaProject` alone does not
+                // propagate the header through that code path in this version
+                // of google-auth-library — empirically confirmed by dumping
+                // the metadata map from a deployed pipeline. HttpCredentialsAdapter
+                // (Beam's Dataflow client) only calls the URI variant, so we
+                // have to override that method directly.
                 String quotaProject = options.as(GcpOptions.class).getProject();
-                if (quotaProject != null && !quotaProject.isBlank()) {
-                    credentials = credentials.createWithQuotaProject(quotaProject);
-                }
+                GoogleCredentials credentials = new QuotaProjectUserAccessTokenCredentials(
+                    new AccessToken(token, null), quotaProject
+                );
                 options.as(GcpOptions.class).setGcpCredential(credentials);
                 LOG.info(
                     "Installed caller-supplied access token from --userTokenFd={} as pipeline GCP credential (quotaProject={}).",
                     fd, quotaProject
                 );
+                try {
+                    Map<String, List<String>> md =
+                        credentials.getRequestMetadata(URI.create("https://dataflow.googleapis.com/"));
+                    List<String> redacted = new ArrayList<>(md.keySet());
+                    Collections.sort(redacted);
+                    List<String> userProj = md.get("x-goog-user-project");
+                    LOG.info(
+                        "Credential request metadata header keys={}, x-goog-user-project={}",
+                        redacted,
+                        userProj != null ? userProj : "(absent)"
+                    );
+                } catch (IOException mdEx) {
+                    LOG.warn("Failed to dump credential request metadata: {}", mdEx.toString());
+                }
             } finally {
                 // String contents are immutable in the JVM, so we can't zero
                 // `token`; we just drop the local ref and let GC reclaim it.
@@ -270,6 +325,70 @@ public final class DatensEEPipeline {
                 "tile_grid.crs is required. Provide an EPSG code (e.g. 'EPSG:4326') "
                 + "or a proj string."
             );
+        }
+    }
+
+    /**
+     * GoogleCredentials subclass that wraps a bare OAuth access token and
+     * forces {@code x-goog-user-project} into every request metadata map
+     * regardless of which {@code getRequestMetadata} variant the HTTP
+     * initializer calls. The stock
+     * {@link GoogleCredentials#createWithQuotaProject(String)} path only
+     * injects the header in the no-arg {@code getRequestMetadata()} in this
+     * version of google-auth-library, but Beam's Dataflow client goes
+     * through {@link com.google.auth.http.HttpCredentialsAdapter} which
+     * calls the URI-taking variant — so the header never makes it onto the
+     * Dataflow {@code createJob} request, and the API enablement check
+     * lands on the OAuth client's implicit project instead of the user's.
+     *
+     * <p>We can't refresh a bearer-only credential, so we override the
+     * superclass's refresh machinery to a no-op: the caller has already
+     * guaranteed the token is live, and if it expires mid-pipeline the
+     * rest of the stack will surface a 401.
+     */
+    private static final class QuotaProjectUserAccessTokenCredentials extends GoogleCredentials {
+        private static final long serialVersionUID = 1L;
+        private final String quotaProjectId;
+
+        QuotaProjectUserAccessTokenCredentials(AccessToken token, String quotaProjectId) {
+            super(token);
+            this.quotaProjectId = quotaProjectId;
+        }
+
+        @Override
+        public String getQuotaProjectId() {
+            return quotaProjectId;
+        }
+
+        @Override
+        public AccessToken refreshAccessToken() {
+            // Bearer-only; caller guarantees freshness. No refresh path.
+            return getAccessToken();
+        }
+
+        @Override
+        public Map<String, List<String>> getRequestMetadata(URI uri) throws IOException {
+            return injectQuotaProject(super.getRequestMetadata(uri));
+        }
+
+        @Override
+        public Map<String, List<String>> getRequestMetadata() throws IOException {
+            return injectQuotaProject(super.getRequestMetadata());
+        }
+
+        private Map<String, List<String>> injectQuotaProject(Map<String, List<String>> base) {
+            if (quotaProjectId == null || quotaProjectId.isBlank()) {
+                return base;
+            }
+            if (base != null && base.containsKey("x-goog-user-project")) {
+                return base;
+            }
+            Map<String, List<String>> merged = new LinkedHashMap<>();
+            if (base != null) {
+                merged.putAll(base);
+            }
+            merged.put("x-goog-user-project", Collections.singletonList(quotaProjectId));
+            return Collections.unmodifiableMap(merged);
         }
     }
 }

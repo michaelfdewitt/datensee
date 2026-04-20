@@ -96,8 +96,8 @@ public final class CogTranscoder {
             entries.put(entry.tag, entry);
         }
 
-        // Extract pixel data from strips
-        byte[] pixelData = extractStripData(entries, rawGeotiff, order);
+        // Extract pixel data from strips or tiles
+        byte[] pixelData = extractPixelData(entries, rawGeotiff, order);
 
         int width = getIntValue(entries, TAG_IMAGE_WIDTH);
         int height = getIntValue(entries, TAG_IMAGE_LENGTH);
@@ -155,24 +155,39 @@ public final class CogTranscoder {
     }
 
     /**
-     * Extract raw pixel bytes from strip-based layout.
+     * Extract raw pixel bytes from either strip-based or tile-based layout.
+     *
+     * <p>The EE HV API typically returns strip-layout TIFFs, but may also
+     * return tile-layout TIFFs depending on the image type and request
+     * parameters. We handle both transparently.
      */
-    private static byte[] extractStripData(
+    private static byte[] extractPixelData(
         Map<Integer, IfdEntry> entries,
         byte[] raw,
         ByteOrder order
     ) throws IOException {
-        long[] offsets = getLongArray(entries, TAG_STRIP_OFFSETS);
-        long[] counts = getLongArray(entries, TAG_STRIP_BYTE_COUNTS);
+        long[] offsets;
+        long[] counts;
 
-        if (offsets.length != counts.length) {
+        if (entries.containsKey(TAG_STRIP_OFFSETS)) {
+            offsets = getLongArray(entries, TAG_STRIP_OFFSETS);
+            counts = getLongArray(entries, TAG_STRIP_BYTE_COUNTS);
+        } else if (entries.containsKey(TAG_TILE_OFFSETS)) {
+            offsets = getLongArray(entries, TAG_TILE_OFFSETS);
+            counts = getLongArray(entries, TAG_TILE_BYTE_COUNTS);
+        } else {
             throw new IOException(
-                "StripOffsets count (" + offsets.length
-                + ") != StripByteCounts count (" + counts.length + ")"
+                "Input GeoTIFF has neither StripOffsets (273) nor TileOffsets (324)"
             );
         }
 
-        // Check if the input is already uncompressed
+        if (offsets.length != counts.length) {
+            throw new IOException(
+                "Offsets count (" + offsets.length
+                + ") != ByteCounts count (" + counts.length + ")"
+            );
+        }
+
         int inputCompression = entries.containsKey(TAG_COMPRESSION)
             ? getIntValue(entries, TAG_COMPRESSION) : 1;
 
@@ -190,19 +205,57 @@ public final class CogTranscoder {
             pos += len;
         }
 
-        // If the source was compressed, we need to decompress first
-        if (inputCompression != COMPRESS_NONE) {
-            throw new IOException(
-                "Input GeoTIFF is already compressed (compression="
-                + inputCompression + "). Expected uncompressed input from EE HV API."
-            );
+        if (inputCompression == COMPRESS_NONE) {
+            return data;
         }
 
-        return data;
+        // Decompress the pixel data before re-encoding
+        if (inputCompression == COMPRESS_DEFLATE || inputCompression == 32946) {
+            // 32946 = Adobe Deflate (zlib), 8 = standard Deflate — both use zlib
+            int width = getIntValue(entries, TAG_IMAGE_WIDTH);
+            int height = getIntValue(entries, TAG_IMAGE_LENGTH);
+            int bitsPerSample = getIntValue(entries, TAG_BITS_PER_SAMPLE);
+            int samplesPerPixel = entries.containsKey(277) ? getIntValue(entries, 277) : 1;
+            int expectedBytes = width * height * samplesPerPixel * (bitsPerSample / 8);
+            return inflateData(data, expectedBytes);
+        }
+
+        if (inputCompression == COMPRESS_LZW) {
+            int width = getIntValue(entries, TAG_IMAGE_WIDTH);
+            int height = getIntValue(entries, TAG_IMAGE_LENGTH);
+            int bitsPerSample = getIntValue(entries, TAG_BITS_PER_SAMPLE);
+            int samplesPerPixel = entries.containsKey(277) ? getIntValue(entries, 277) : 1;
+            int expectedBytes = width * height * samplesPerPixel * (bitsPerSample / 8);
+            return lzwDecompress(data, expectedBytes);
+        }
+
+        throw new IOException(
+            "Unsupported input compression (compression=" + inputCompression
+            + "). Supported: none (1), LZW (5), Deflate (8, 32946)."
+        );
     }
 
     /**
-     * Build a new TIFF file with tile-based layout.
+     * Build a new TIFF file with COG layout:
+     *
+     * <pre>
+     *   0-7        TIFF header (byte order, magic, IFD offset=8)
+     *   8..        First IFD (count + entries + next-IFD pointer)
+     *   ..         Overflow tag data (GeoKeys, pixel scale, tie points, etc.)
+     *   ..         Pixel data (one tile)
+     * </pre>
+     *
+     * <p>The Cloud Optimized GeoTIFF spec — and EE's validator, which
+     * emits "The first IFD does not immediately follow the TIFF header
+     * or the header ghost area is malformed" — requires the IFD to live
+     * at offset 8, not at the end of the file the way a vanilla
+     * GeoTIFF writer would put it. Putting pixel data first makes this
+     * a perfectly-valid TIFF but not a COG.
+     *
+     * <p>The layout is computed in two passes because the
+     * {@link #TAG_TILE_OFFSETS} value has to point at the pixel data,
+     * which in turn depends on the size of the IFD+overflow preceding
+     * it. We size everything first, then serialize.
      */
     private static byte[] buildCogTiff(
         Map<Integer, IfdEntry> originalEntries,
@@ -214,35 +267,9 @@ public final class CogTranscoder {
         int compression,
         int predictor
     ) throws IOException {
-        var out = new ByteArrayOutputStream();
-
-        // TIFF header (8 bytes)
-        ByteBuffer header = ByteBuffer.allocate(8).order(order);
-        header.putShort(order == ByteOrder.BIG_ENDIAN ? (short) 0x4D4D : (short) 0x4949);
-        header.putShort((short) 42);
-        // IFD offset — we'll put pixel data first, then IFD after
-        // Placeholder — will be filled after we know the data size
-        header.putInt(0);
-        byte[] headerBytes = header.array();
-
-        // Pixel data starts at offset 8
-        int pixelDataOffset = 8;
-        int pixelDataLength = tileData.length;
-
-        // IFD starts after header + pixel data
-        int ifdStart = pixelDataOffset + pixelDataLength;
-        // Align to word boundary
-        if (ifdStart % 2 != 0) {
-            ifdStart++;
-        }
-
-        // Update IFD offset in header
-        ByteBuffer.wrap(headerBytes, 4, 4).order(order).putInt(ifdStart);
-
-        // Build IFD entries — copy originals, replace strip→tile tags
+        // Build IFD entries — copy originals, replace strip→tile tags.
         List<IfdEntry> newEntries = new ArrayList<>();
         for (var entry : originalEntries.values()) {
-            // Skip strip-related and compression/predictor tags
             if (entry.tag == TAG_STRIP_OFFSETS
                 || entry.tag == TAG_STRIP_BYTE_COUNTS
                 || entry.tag == TAG_ROWS_PER_STRIP
@@ -256,8 +283,6 @@ public final class CogTranscoder {
             }
             newEntries.add(entry);
         }
-
-        // Add tile tags
         newEntries.add(IfdEntry.shortValue(TAG_COMPRESSION, compression));
         if (predictor != PREDICTOR_NONE) {
             newEntries.add(IfdEntry.shortValue(TAG_PREDICTOR, predictor));
@@ -265,21 +290,38 @@ public final class CogTranscoder {
         newEntries.add(IfdEntry.shortValue(TAG_TILE_WIDTH, tileSize));
         newEntries.add(IfdEntry.shortValue(TAG_TILE_LENGTH, tileSize));
 
-        // Single tile — one offset, one byte count
-        newEntries.add(IfdEntry.longValue(TAG_TILE_OFFSETS, pixelDataOffset));
-        newEntries.add(IfdEntry.longValue(TAG_TILE_BYTE_COUNTS, pixelDataLength));
+        // TileOffsets starts as a placeholder — gets rewritten once we
+        // know where the pixel data actually lands in the output file.
+        IfdEntry tileOffsets = IfdEntry.longValue(TAG_TILE_OFFSETS, 0);
+        newEntries.add(tileOffsets);
+        newEntries.add(IfdEntry.longValue(TAG_TILE_BYTE_COUNTS, tileData.length));
 
-        // Sort by tag number (TIFF spec requirement)
+        // Sort by tag number (TIFF spec requirement).
         newEntries.sort((a, b) -> Integer.compare(a.tag, b.tag));
 
-        // Serialize IFD
+        // Layout pass 1: figure out IFD + overflow sizes so we know
+        // where the pixel data will land.
+        final int ifdStart = 8; // immediately after the TIFF header
         int entryCount = newEntries.size();
-        // IFD: 2 bytes count + 12 bytes per entry + 4 bytes next-IFD pointer
         int ifdSize = 2 + entryCount * 12 + 4;
         int overflowStart = ifdStart + ifdSize;
 
-        var ifdBuf = new ByteArrayOutputStream();
-        var overflowBuf = new ByteArrayOutputStream();
+        int overflowSize = 0;
+        for (IfdEntry e : newEntries) {
+            int typeSize = (e.type > 0 && e.type < TYPE_SIZES.length) ? TYPE_SIZES[e.type] : 1;
+            int totalBytes = e.count * typeSize;
+            if (totalBytes > 4) overflowSize += totalBytes;
+        }
+        int pixelDataOffset = overflowStart + overflowSize;
+        // Align to word boundary.
+        if ((pixelDataOffset & 1) != 0) pixelDataOffset++;
+
+        // Now plug the real pixel-data offset into the TileOffsets entry.
+        tileOffsets.values[0] = pixelDataOffset;
+
+        // Layout pass 2: serialize IFD + overflow streaming in parallel.
+        var ifdBuf = new ByteArrayOutputStream(ifdSize);
+        var overflowBuf = new ByteArrayOutputStream(overflowSize);
 
         ByteBuffer countBuf = ByteBuffer.allocate(2).order(order);
         countBuf.putShort((short) entryCount);
@@ -289,27 +331,30 @@ public final class CogTranscoder {
             byte[] serialized = entry.serialize(order, overflowStart + overflowBuf.size());
             ifdBuf.write(serialized);
             byte[] overflow = entry.overflowData(order);
-            if (overflow != null) {
-                overflowBuf.write(overflow);
-            }
+            if (overflow != null) overflowBuf.write(overflow);
         }
 
-        // Next IFD pointer = 0 (no more IFDs)
+        // Next-IFD pointer = 0 (no more IFDs in this file).
         ByteBuffer nextIfd = ByteBuffer.allocate(4).order(order);
         nextIfd.putInt(0);
         ifdBuf.write(nextIfd.array());
 
-        // Assemble the file
-        out.write(headerBytes);
-        out.write(tileData);
-        // Pad to align IFD
-        int padNeeded = ifdStart - (pixelDataOffset + pixelDataLength);
-        for (int i = 0; i < padNeeded; i++) {
-            out.write(0);
-        }
+        // Header — now that pixel data offset is known, the IFD offset
+        // is just the constant 8.
+        ByteBuffer header = ByteBuffer.allocate(8).order(order);
+        header.putShort(order == ByteOrder.BIG_ENDIAN ? (short) 0x4D4D : (short) 0x4949);
+        header.putShort((short) 42);
+        header.putInt(ifdStart);
+
+        // Assemble.
+        var out = new ByteArrayOutputStream(8 + ifdSize + overflowSize + tileData.length);
+        out.write(header.array());
         out.write(ifdBuf.toByteArray());
         out.write(overflowBuf.toByteArray());
-
+        // Pad to pixel-data alignment.
+        int pad = pixelDataOffset - (overflowStart + overflowBuf.size());
+        for (int i = 0; i < pad; i++) out.write(0);
+        out.write(tileData);
         return out.toByteArray();
     }
 
@@ -400,6 +445,144 @@ public final class CogTranscoder {
                 out.write((buffer << (8 - bitsInBuffer)) & 0xFF);
                 bitsInBuffer = 0;
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Deflate decompression
+    // -----------------------------------------------------------------------
+
+    private static byte[] inflateData(byte[] compressed, int expectedBytes) throws IOException {
+        var inflater = new java.util.zip.Inflater();
+        inflater.setInput(compressed);
+        var out = new ByteArrayOutputStream(expectedBytes);
+        byte[] tmp = new byte[8192];
+        try {
+            while (!inflater.finished()) {
+                int n = inflater.inflate(tmp);
+                if (n == 0 && inflater.needsInput()) break;
+                out.write(tmp, 0, n);
+            }
+        } catch (java.util.zip.DataFormatException e) {
+            throw new IOException("Failed to inflate pixel data: " + e.getMessage(), e);
+        } finally {
+            inflater.end();
+        }
+        return out.toByteArray();
+    }
+
+    // -----------------------------------------------------------------------
+    // LZW decompression (TIFF-compatible: MSB-first)
+    // -----------------------------------------------------------------------
+
+    private static byte[] lzwDecompress(byte[] compressed, int expectedBytes) throws IOException {
+        var out = new ByteArrayOutputStream(expectedBytes);
+        var bitReader = new BitReader(compressed);
+
+        final int clearCode = 256;
+        final int eoiCode = 257;
+        int codeSize = 9;
+
+        // Initialize table
+        List<byte[]> table = new ArrayList<>();
+        for (int i = 0; i < 258; i++) {
+            if (i < 256) {
+                table.add(new byte[]{(byte) i});
+            } else {
+                table.add(new byte[0]); // clear + EOI placeholders
+            }
+        }
+
+        int code = bitReader.read(codeSize);
+        if (code != clearCode) {
+            throw new IOException("LZW stream does not start with clear code");
+        }
+
+        // Reset table
+        table.subList(258, table.size()).clear();
+        codeSize = 9;
+
+        code = bitReader.read(codeSize);
+        if (code == eoiCode) return out.toByteArray();
+        byte[] prev = table.get(code);
+        out.write(prev);
+
+        while (true) {
+            code = bitReader.read(codeSize);
+            if (code == eoiCode) break;
+            if (code == clearCode) {
+                table.subList(258, table.size()).clear();
+                codeSize = 9;
+                code = bitReader.read(codeSize);
+                if (code == eoiCode) break;
+                prev = table.get(code);
+                out.write(prev);
+                continue;
+            }
+
+            byte[] entry;
+            if (code < table.size()) {
+                entry = table.get(code);
+            } else if (code == table.size()) {
+                entry = new byte[prev.length + 1];
+                System.arraycopy(prev, 0, entry, 0, prev.length);
+                entry[prev.length] = prev[0];
+            } else {
+                throw new IOException("Invalid LZW code: " + code + " (table size: " + table.size() + ")");
+            }
+
+            out.write(entry);
+
+            byte[] newEntry = new byte[prev.length + 1];
+            System.arraycopy(prev, 0, newEntry, 0, prev.length);
+            newEntry[prev.length] = entry[0];
+            table.add(newEntry);
+
+            if (table.size() + 1 > (1 << codeSize) && codeSize < 12) {
+                codeSize++;
+            }
+
+            prev = entry;
+        }
+
+        return out.toByteArray();
+    }
+
+    /**
+     * MSB-first bit reader for TIFF LZW decompression.
+     */
+    private static final class BitReader {
+        private final byte[] data;
+        private int bytePos;
+        private int bitPos; // bits remaining in current byte (MSB-first)
+
+        BitReader(byte[] data) {
+            this.data = data;
+            this.bytePos = 0;
+            this.bitPos = 8;
+        }
+
+        int read(int numBits) throws IOException {
+            int result = 0;
+            int bitsNeeded = numBits;
+            while (bitsNeeded > 0) {
+                if (bytePos >= data.length) {
+                    throw new IOException("Unexpected end of LZW data");
+                }
+                int bitsAvail = bitPos;
+                int bitsToTake = Math.min(bitsAvail, bitsNeeded);
+                int shift = bitsAvail - bitsToTake;
+                int mask = ((1 << bitsToTake) - 1) << shift;
+                int bits = (Byte.toUnsignedInt(data[bytePos]) & mask) >> shift;
+                result = (result << bitsToTake) | bits;
+                bitsNeeded -= bitsToTake;
+                bitPos -= bitsToTake;
+                if (bitPos == 0) {
+                    bytePos++;
+                    bitPos = 8;
+                }
+            }
+            return result;
         }
     }
 

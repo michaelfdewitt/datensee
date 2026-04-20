@@ -9,6 +9,8 @@ import java.io.IOException;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import org.apache.beam.sdk.metrics.Counter;
+import org.apache.beam.sdk.metrics.Metrics;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -33,6 +35,7 @@ public final class TileWriterDoFn extends DoFn<FetchedTile, Void> {
     private final String compression;
 
     private transient Storage storage;
+    private final Counter tilesWritten = Metrics.counter("datensee", "tiles_written");
 
     /**
      * @param outputPath  GCS URI or local directory
@@ -69,12 +72,20 @@ public final class TileWriterDoFn extends DoFn<FetchedTile, Void> {
         } else {
             writeToLocal(tile, tifName, cogBytes);
         }
+        tilesWritten.inc();
     }
 
     private void writeToGcs(FetchedTile tile, String tifName, byte[] data) {
         URI gcsUri = URI.create(outputPath);
         String bucket = gcsUri.getHost();
-        String prefix = gcsUri.getPath().replaceFirst("^/", "");
+        // Strip leading AND trailing slashes from the prefix. The
+        // foundree-side ExportService.outputPath() appends a single
+        // trailing `/` to its prefix (so gcloud-style `gs://b/pfx/`
+        // listings feel natural); concatenating "/" + tifName on top
+        // of that used to produce `pfx//tile.tif` with a double slash.
+        // EE's GCS loader normalizes `//` → `/` before the GET, so the
+        // object couldn't be found and every pixel came back masked.
+        String prefix = gcsUri.getPath().replaceAll("^/+|/+$", "");
         String blobName = prefix.isEmpty() ? tifName : prefix + "/" + tifName;
 
         BlobId blobId = BlobId.of(bucket, blobName);
