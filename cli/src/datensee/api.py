@@ -65,7 +65,6 @@ class ExportResult(BaseModel):
     duration_seconds: float | None = None
     tiles_ok: int | None = None
     tiles_failed: int | None = None
-    vrt_path: str | None = None
     output_bytes: int | None = None
 
 
@@ -314,11 +313,14 @@ def export(
         rate_limit=RateLimitConfig(max_qps=max_qps),
     )
 
-    if dry_run:
-        return ExportResult(config=pipeline_config)
-
+    # The confirm callback fires for both dry-runs and real submissions so
+    # the CLI can render the export summary either way; raising from here
+    # aborts before any cloud action.
     if confirm_callback is not None:
         confirm_callback(pipeline_config)
+
+    if dry_run:
+        return ExportResult(config=pipeline_config)
 
     # Resolve JAR
     if jar is not None:
@@ -341,17 +343,12 @@ def export(
     )
     duration = time.monotonic() - t0
 
-    # Post-processing for local mode
+    # Post-processing for local mode: count what landed on disk.
     tiles_ok: int | None = None
     tiles_failed: int | None = None
-    vrt_path: str | None = None
 
     if runner == "local" and not output.startswith("gs://"):
-        from datensee.assemble import write_vrt
-
         output_dir = Path(output)
-        vrt = write_vrt(pipeline_config, output_dir)
-        vrt_path = str(vrt)
         tiles_ok = len(list(output_dir.glob("tile_*.tif")))
         tiles_failed = max(0, pipeline_config.expected_output_tile_count - tiles_ok)
 
@@ -361,7 +358,6 @@ def export(
         duration_seconds=duration,
         tiles_ok=tiles_ok,
         tiles_failed=tiles_failed,
-        vrt_path=vrt_path,
     )
 
 

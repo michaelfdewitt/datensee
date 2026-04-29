@@ -148,7 +148,7 @@ class TestEvalWithRealOutput:
         report = validate_output(
             output_dir,
             config,
-            checks=[CheckID.E01, CheckID.E05, CheckID.E06, CheckID.E08, CheckID.E10],
+            checks=[CheckID.E01, CheckID.E08, CheckID.E10],
         )
         for r in report.results:
             assert r.status in (CheckStatus.PASSED, CheckStatus.SKIPPED), (

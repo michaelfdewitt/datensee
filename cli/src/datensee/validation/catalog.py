@@ -13,14 +13,18 @@ from pydantic import BaseModel
 
 
 class CheckID(StrEnum):
-    """Stable identifiers for each check."""
+    """Stable identifiers for each check.
+
+    Note: E05 / E06 (VRT-related) were removed when the pipeline stopped
+    producing a VRT manifest; output is now a directory of COGs only,
+    sized via ``output_tile_size_pixels``. The IDs are kept as gaps for
+    stability of any historic JSON reports rather than reused.
+    """
 
     E01 = "E01"
     E02 = "E02"
     E03 = "E03"
     E04 = "E04"
-    E05 = "E05"
-    E06 = "E06"
     E07 = "E07"
     E08 = "E08"
     E09 = "E09"
@@ -78,24 +82,6 @@ _CATALOG: dict[CheckID, CheckDefinition] = {
         name="Boundary Continuity",
         description="Adjacent tiles' shared edge pixels form a smooth continuation.",
         pass_criteria="Mean absolute difference < threshold",
-        cost_tier=CostTier.ZERO_COST,
-    ),
-    CheckID.E05: CheckDefinition(
-        id=CheckID.E05,
-        name="VRT Completeness",
-        description=(
-            "mosaic.vrt references every tile with correct band count/type "
-            "and correct overall dimensions."
-        ),
-        pass_criteria="All tiles referenced in VRT",
-        cost_tier=CostTier.ZERO_COST,
-        runs_on_all_tiles=True,
-    ),
-    CheckID.E06: CheckDefinition(
-        id=CheckID.E06,
-        name="VRT Spatial Correctness",
-        description="VRT bounding box covers the entire export region.",
-        pass_criteria="BBox covers input geometry",
         cost_tier=CostTier.ZERO_COST,
     ),
     CheckID.E07: CheckDefinition(

@@ -112,10 +112,11 @@ def decompose_region(
     # to get its absolute output-grid index. Localizing to the bbox uses
     # the floor of the bbox-start indices so all compute tiles inside one
     # output tile share the same out_row/out_col.
-    if output_tile_size_pixels is None or output_tile_size_pixels == tile_size_pixels:
-        n_per_output = 1
-    else:
-        n_per_output = output_tile_size_pixels // tile_size_pixels
+    n_per_output = (
+        output_tile_size_pixels // tile_size_pixels
+        if output_tile_size_pixels
+        else 1
+    )
     out_row_start = row_start // n_per_output
     out_col_start = col_start // n_per_output
 

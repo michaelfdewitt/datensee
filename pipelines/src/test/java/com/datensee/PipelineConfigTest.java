@@ -74,7 +74,7 @@ class PipelineConfigTest {
                 "cog": {
                   "overview_levels": [2, 4, 8],
                   "blocksize": 256,
-                  "compress": "zstd",
+                  "compress": "deflate",
                   "predictor": 1
                 }
               },
@@ -104,7 +104,7 @@ class PipelineConfigTest {
         assertEquals(3, config.output().effectiveBandCount());
         assertEquals("uint8", config.output().effectiveDataType());
         assertNotNull(config.output().cog());
-        assertEquals("zstd", config.output().cog().compress());
+        assertEquals("deflate", config.output().cog().compress());
         assertEquals("dataflow", config.runner().mode());
         assertNotNull(config.runner().dataflow());
         assertEquals(50, config.runner().dataflow().maxWorkers());

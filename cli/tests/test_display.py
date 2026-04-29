@@ -70,7 +70,7 @@ class TestRenderExportSummary:
 
 class TestRenderPostRunSummary:
     def test_success(self) -> None:
-        panel = render_post_run_summary(12.5, 100, 0, "/tmp/output/mosaic.vrt")
+        panel = render_post_run_summary(12.5, 100, 0, "/tmp/output")
         assert isinstance(panel, Panel)
 
     def test_with_failures(self) -> None:

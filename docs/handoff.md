@@ -24,7 +24,7 @@ When you make changes that affect the install surface, update `cli/pyproject.tom
 ## Repo orientation (one-line per directory)
 
 - `cli/` — Python package `datensee` (Typer CLI + Python API). Owns tiling, submission, polling, output validation.
-- `pipelines/` — Java/Beam pipeline (Gradle Kotlin DSL). Owns the per-tile fetch, COG transcoding, GCS write, VRT manifest.
+- `pipelines/` — Java/Beam pipeline (Gradle Kotlin DSL). Owns the per-tile fetch, COG transcoding, and GCS write.
 - `service/` — FastAPI Cloud Run wrapper around `datensee.api.export`. Used by Foundree.
 - `contract/` — JSON schema for the Python → Java pipeline config.
 - `notebooks/` — Colab quickstart.
@@ -41,27 +41,33 @@ The COG transcoder is the single highest-risk piece of code in the repo. EE's `I
 ### Data flow
 ```
 EE HV API (computePixels)
-   → raw GeoTIFF (uncompressed strip layout, single image == tileSize×tileSize)
+   → raw GeoTIFF — TILE-layout, Adobe Deflate (compression code 32946),
+     internal tiles 256×256 max. For requests up to 256×256 the response
+     contains exactly one inner tile; for larger requests EE chunks into
+     a 256×256 tile grid (e.g. 4 tiles for 512×512, 9 for 768×768).
+     Each tile is its own self-contained zlib stream — extractPixelData
+     must inflate per-chunk, not feed the concatenation into a single
+     Inflater. Verified empirically by cli/scripts/probe_hv_dimensions.py.
 TileFetchDoFn — fetches and dead-letters on retryable failures
    → FetchedTile (raw bytes + coordinate)
-TileWriterDoFn — calls CogTranscoder, then writes to GCS or local disk
-   → COG file per tile, named tile_r{row:04d}_c{col:04d}.tif
-VrtAssembler — emits a `.vrt` manifest stitching tiles into one virtual raster
+TileWriterDoFn (or AssembledCogWriter in M6 mode) — calls CogTranscoder,
+   writes to GCS or local disk
+   → COG file per output tile, named tile_r{row:04d}_c{col:04d}.tif
 ```
 
-The output of the pipeline is N tile COGs + 1 VRT, **not** a single mosaic COG. M6 (two-tier tiling) will change that.
+The output of the pipeline is a directory of COG files, one per output tile. There is no manifest file (no VRT, no JSON sidecar, no XML) — output COGs are self-describing via standard GeoTIFF tags, and any modern GIS tool (QGIS, rasterio, ArcGIS) opens a directory of geotagged TIFFs as a layer set without help. Users who want a single stitched COG control granularity via `output_tile_size_pixels`: set it large enough to cover the export region and the pipeline emits one COG; leave it small (or unset) and the pipeline emits many.
 
 ### Multi-block COGs (M6)
 
-`CogTranscoder` emits multi-block COGs. The image dimensions must be a whole-number multiple of `tileSize` (the COG's internal block size); partial-edge tiles aren't supported. For one-COG-per-fetch (the default mode), `imageWidth == imageHeight == tileSize` and there's a single block. For M6 two-tier tiling, the assembler builds an `output_tile_size × output_tile_size` buffer (always a multiple of `tileSize`) and `CogTranscoder` partitions it into `(output_tile_size / tileSize)²` inner blocks, each compressed independently per the TIFF spec.
+`CogTranscoder` emits multi-block COGs. The image dimensions must be a whole-number multiple of `tileSize` (the COG's internal block size); partial-edge tiles aren't supported. For one-COG-per-fetch (the default mode), `imageWidth == imageHeight == tileSize` and there's a single block. For M6 two-tier tiling, each compute tile becomes one inner COG block: the assembler extracts pixels per compute tile, places them by `(tx, ty)` block index in a row-major `List<byte[]>` (null entries are zero-filled), and `CogTranscoder` compresses each block independently per the TIFF spec — no intermediate `output_tile_size × output_tile_size` buffer.
 
 Two entry points:
 - `transcode(rawGeotiff, tileSize, compression)` — input is an EE-HV-shaped GeoTIFF; used by the one-COG-per-tile path.
-- `transcodeFromAssembledPixels(pixelData, width, height, tileSize, sourceTiffForMetadata, outputTileOriginX, outputTileOriginY, compression)` — input is a pre-assembled pixel buffer plus a representative compute tile for CRS/sample-structure metadata. Used by [`AssembledCogWriter`](../pipelines/src/main/java/com/datensee/io/AssembledCogWriter.java). The source tile's `ModelTiepoint` is overridden with the output tile's origin; everything else (`ModelPixelScale`, `GeoKeyDirectoryTag`, `GeoAsciiParams`, etc.) is inherited.
+- `transcodeFromTileBlocks(tilePixels, width, height, tileSize, sourceTiffForMetadata, outputTileOriginX, outputTileOriginY, compression)` — input is a row-major list of per-block pixel buffers (length `(width/tileSize) * (height/tileSize)`; `null` entries become zero-filled blocks) plus a representative compute tile for CRS/sample-structure metadata. Used by [`AssembledCogWriter`](../pipelines/src/main/java/com/datensee/io/AssembledCogWriter.java). The source tile's `ModelTiepoint` is overridden with the output tile's origin; everything else (`ModelPixelScale`, `GeoKeyDirectoryTag`, `GeoAsciiParams`, etc.) is inherited.
 
-### Why deflate is the default, not LZW
+### Compression: deflate or none
 
-The hand-rolled LZW encoder in `CogTranscoder.lzwCompress` produces output that strict TIFF-LZW decoders (GDAL, imagecodecs, EE's loader) reject as "Corrupted tile: failed to decompress using scheme LZW". The encoder is kept in tree for future replacement against a canonical test vector but **deflate is the default and the only end-to-end-verified compression**. Don't change the default without first fixing or replacing the LZW encoder. The LZW *decoder* is exercised on input but not pinned by tests; assume it's load-bearing only for inputs the EE HV API actually returns.
+`CogTranscoder` accepts two output compressions: `"deflate"` (default — zlib via `java.util.zip`) and `"none"`. Anything else fails fast inside `partitionCompressBuild`. The previous hand-rolled LZW encoder was deleted in favor of deflate-only since the LZW output didn't pass strict TIFF decoders (GDAL / imagecodecs / EE's loader) and deflate is well-supported everywhere downstream. The transcoder still decodes deflate-compressed *inputs* in case the EE HV API ever returns one. No predictor encoding is applied.
 
 ### COG layout (the order matters)
 
@@ -155,13 +161,14 @@ When `output_tile_size_pixels` is unset (the default), routing falls through to 
 
 ## Known limitations / TODOs in priority order
 
-1. **LZW encoder is broken.** Either fix against a TIFF-LZW canonical vector or rip it out. Default is deflate; LZW only routes if user explicitly sets `compress: "lzw"`.
+1. **Geographic-CRS pixel size is approximated as `1/111_320` deg/m at the equator.** [`tiling._pixel_size_native`](../cli/src/datensee/tiling.py) hard-codes a flat degrees-per-meter conversion for `EPSG:4326` (and any other geographic CRS). Tile widths in degrees stay constant across latitude even though the corresponding ground distance does not, so a tile in northern Canada covers a much smaller patch of land than a tile at the equator at the same `scale_meters`. The existing snap/alignment tests assert per-tile uniformity in degrees, which by construction can't both hold and the approximation be correct. Fixing this needs a design call: (a) reject `EPSG:4326` exports above some latitude band and require a projected CRS, (b) compute the conversion at the region centroid, or (c) per-pixel scale via a proj transform. Worth doing before we ship workflows that span large latitude ranges in 4326.
 2. **No automatic retry-loop driver.** `datensee retry` does one round per invocation. A wrapper that loops with backoff until the journal is empty is a small follow-up — not done because it would change the CLI UX surface and we want a clean checkpoint first.
 3. **Dataflow / GCS carryover merge isn't wired yet — planned for the pipeline side.** Local-mode retry is the supported path today; in Dataflow mode the carryover (terminal + depth-capped records) is logged + dropped between rounds rather than appended to `_failures.json`. The fix is to do the merge in the Java pipeline, not in a post-step: the retry CLI will write `{output}/_carryover.json` alongside `_retry_tiles.json`, and the pipeline's failures-journal `TextIO.write` will union that file with this round's new failures before writing `_failures.json`. Same code path local + Dataflow; no orchestration on the Python side. Tracked as the next adaptive-retry milestone in `CLAUDE.md`. See `docs/retry-with-journal.md` for the design rationale.
-3. **`/proc/self/fd/<N>` is Linux-only.** Service-driven auth path won't work on macOS or Windows. Standalone CLI on those OSes uses ADC and is fine.
-4. **Predictor is only applied for LZW.** Deflate would also benefit from horizontal differencing for integer types — pure compression-ratio win, no correctness issue.
-5. **`extractPixelData` for tile-layout inputs concatenates tile bytes in tile order**, not pixel-row order. Safe today because EE HV always returns strip layout; would silently produce wrong pixels for a multi-tile input.
-6. **Partial output tiles are zero-filled.** If some compute tiles in an output group failed and were dead-lettered, the assembler emits a partially-populated COG with zero-filled gaps. Whether to skip the output tile entirely or surface a warning is a design decision left for the next iteration.
+4. **`/proc/self/fd/<N>` is Linux-only.** Service-driven auth path won't work on macOS or Windows. Standalone CLI on those OSes uses ADC and is fine.
+5. **Dataflow job-id extraction uses reflection against a deprecated API.** [`DatensEEPipeline.run`](../pipelines/src/main/java/com/datensee/DatensEEPipeline.java) calls `getJobId` on the result via reflection so we don't pull `beam-runners-google-cloud-dataflow-java` into the compile classpath of every consumer; the current Beam version emits a deprecation warning at compile time. Two ways out: (a) add the runtime dep at compile time and call `((DataflowPipelineJob) result).getJobId()` directly, accepting the dep bloat, or (b) read the job id from the runner's stdout/stderr ahead of `waitUntilFinish` — already partially done via the `DATENSEE_JOB_ID=` echo. Pick one when the Beam minor version next bumps and the deprecation graduates to removal.
+6. ~~`extractPixelData` for tile-layout inputs concatenates tile bytes in tile order, not pixel-row order. Safe today because EE HV always returns strip layout; would silently produce wrong pixels for a multi-tile input.~~ **Both halves of this comment turned out to be wrong.** EE HV does *not* return strip layout — it returns tile layout (256×256 internal tiles, deflate-compressed) for every request. And the failure mode wasn't "silently wrong pixels": each tile is its own zlib stream, so feeding the concatenation into a single `Inflater` stopped at the first end-of-stream marker, dropped every tile after the first, and crashed `extractBlock` downstream with `ArrayIndexOutOfBoundsException`. Fixed: `extractPixelData` now decompresses each chunk independently and assembles tile-layout inputs into row-major order. Pinned by `CogTranscoderTest#multiTileDeflateInputRoundTripsCorrectly` (synthesizes EE's actual response shape: 4-tile 2×2 grid of 256×256 deflate float32) and documented by `cli/scripts/probe_hv_dimensions.py`.
+7. **Partial output tiles are zero-filled.** If some compute tiles in an output group failed and were dead-lettered, the assembler emits a partially-populated COG with zero-filled gaps. Whether to skip the output tile entirely or surface a warning is a design decision left for the next iteration.
+8. **Predictor encoding is not applied for any compression.** Horizontal differencing on integer-typed bands would give a free compression-ratio win for deflate; we don't do it today. Pure ratio question, no correctness issue.
 
 ---
 
@@ -187,7 +194,7 @@ Output validation suite (synthetic GeoTIFFs, requires `[validation]` extra for r
 cd cli && uv run --extra validation pytest tests/test_validation_output_unit.py
 ```
 
-The COG-specific suite is `pipelines/src/test/java/com/datensee/io/CogTranscoderTest.java`. It uses an independent `TestTiffReader` (deliberately decoupled from `CogTranscoder`'s own decoder) so a bug in the writer can't mask itself by being read back through the same broken assumptions. **Do not collapse the test reader into `CogTranscoder`'s helpers**; the independence is the point.
+The COG-specific suites are `pipelines/src/test/java/com/datensee/io/CogTranscoderTest.java` (single-tile transcode round-trips) and `AssembledCogWriterTest.java` (M6 multi-block assembly + the 256-tile pixel-perfect validation case). Both decode COG output via `TestTiffReader` ([source](../pipelines/src/test/java/com/datensee/io/TestTiffReader.java)) — a separate test-only reader deliberately decoupled from `CogTranscoder`'s own decoder paths so a bug in the writer can't mask itself by being read back through the same broken assumptions. **Do not collapse the test reader into `CogTranscoder`'s helpers**; the independence is the point.
 
 ---
 

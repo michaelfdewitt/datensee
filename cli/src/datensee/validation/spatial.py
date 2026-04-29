@@ -1,8 +1,7 @@
-"""Spatial checks — E03, E04, E06.
+"""Spatial checks — E03, E04.
 
 E03: CRS and affine transform match config tile coordinates.
 E04: Adjacent tiles' shared edge pixels form smooth continuation.
-E06: VRT bounding box covers the export region.
 """
 
 from __future__ import annotations
@@ -230,105 +229,3 @@ def _check_edge(
     }
 
 
-# ---------------------------------------------------------------------------
-# E06: VRT Spatial Correctness
-# ---------------------------------------------------------------------------
-
-
-def check_e06_vrt_spatial_correctness(
-    output_dir: Path,
-    config: PipelineConfig,
-) -> CheckResult:
-    """E06: Verify VRT bounding box covers the tile grid extent.
-
-    The VRT's geo-extent (from GeoTransform + raster dimensions) must cover
-    the full extent of the tile grid defined in the config.
-    """
-    import xml.etree.ElementTree as ET
-
-    vrt_path = output_dir / "mosaic.vrt"
-    if not vrt_path.exists():
-        return CheckResult(
-            check_id=CheckID.E06,
-            status=CheckStatus.FAILED,
-            message="mosaic.vrt not found",
-        )
-
-    try:
-        tree = ET.parse(vrt_path)
-    except ET.ParseError as exc:
-        return CheckResult(
-            check_id=CheckID.E06,
-            status=CheckStatus.FAILED,
-            message=f"VRT parse error: {exc}",
-        )
-
-    root = tree.getroot()
-
-    # Parse GeoTransform: "x_origin, pixel_w, 0, y_origin, 0, -pixel_h"
-    gt_el = root.find("GeoTransform")
-    if gt_el is None or gt_el.text is None:
-        return CheckResult(
-            check_id=CheckID.E06,
-            status=CheckStatus.FAILED,
-            message="VRT missing GeoTransform element",
-        )
-
-    gt = [float(v.strip()) for v in gt_el.text.split(",")]
-    x_origin, pixel_w, _, y_origin, _, neg_pixel_h = gt
-
-    raster_x = int(root.get("rasterXSize", "0"))
-    raster_y = int(root.get("rasterYSize", "0"))
-
-    vrt_x_min = x_origin
-    vrt_x_max = x_origin + raster_x * pixel_w
-    vrt_y_max = y_origin
-    vrt_y_min = y_origin + raster_y * neg_pixel_h  # neg_pixel_h is negative
-
-    # Expected extent from config
-    tiles = config.tile_grid.tiles or []
-    if not tiles:
-        return CheckResult(
-            check_id=CheckID.E06,
-            status=CheckStatus.SKIPPED,
-            message="No tiles in config to compare against",
-        )
-
-    grid_x_min = min(t.x_min for t in tiles)
-    grid_x_max = max(t.x_max for t in tiles)
-    grid_y_min = min(t.y_min for t in tiles)
-    grid_y_max = max(t.y_max for t in tiles)
-
-    tol = abs(pixel_w) * 0.5  # half-pixel tolerance
-
-    issues: list[str] = []
-    if vrt_x_min > grid_x_min + tol:
-        issues.append(f"VRT x_min {vrt_x_min} > grid x_min {grid_x_min}")
-    if vrt_x_max < grid_x_max - tol:
-        issues.append(f"VRT x_max {vrt_x_max} < grid x_max {grid_x_max}")
-    if vrt_y_min > grid_y_min + tol:
-        issues.append(f"VRT y_min {vrt_y_min} > grid y_min {grid_y_min}")
-    if vrt_y_max < grid_y_max - tol:
-        issues.append(f"VRT y_max {vrt_y_max} < grid y_max {grid_y_max}")
-
-    if not issues:
-        return CheckResult(
-            check_id=CheckID.E06,
-            status=CheckStatus.PASSED,
-            message="VRT bounding box covers the full tile grid extent",
-            details={
-                "vrt_bbox": [vrt_x_min, vrt_y_min, vrt_x_max, vrt_y_max],
-                "grid_bbox": [grid_x_min, grid_y_min, grid_x_max, grid_y_max],
-            },
-        )
-
-    return CheckResult(
-        check_id=CheckID.E06,
-        status=CheckStatus.FAILED,
-        message=f"VRT bbox does not cover grid: {'; '.join(issues)}",
-        details={
-            "vrt_bbox": [vrt_x_min, vrt_y_min, vrt_x_max, vrt_y_max],
-            "grid_bbox": [grid_x_min, grid_y_min, grid_x_max, grid_y_max],
-            "issues": issues,
-        },
-    )

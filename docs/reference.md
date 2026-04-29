@@ -56,8 +56,11 @@ in-process Beam direct runner. No GCS, no Dataflow.
 datensee demo --project YOUR_GCP_PROJECT
 ```
 
-Outputs land in `./datensee-output/` as individual tile GeoTIFFs plus
-`mosaic.vrt`.
+Outputs land in `./datensee-output/` as a directory of COG files,
+named `tile_r{row:04d}_c{col:04d}.tif`. Open the directory in QGIS,
+rasterio, or any GIS tool — geotagged TIFFs are self-describing.
+Use `--output-tile-size` (M6 two-tier tiling) to control how many
+output COGs you get.
 
 ### CLI — your own export
 
@@ -117,7 +120,7 @@ Run the bundled Landsat 9 NDVI demo locally.
 | Flag             | Type   | Default               | Description                                                              |
 | ---------------- | ------ | --------------------- | ------------------------------------------------------------------------ |
 | `--project`, `-p`| str    | *required*            | GCP project ID with the Earth Engine API enabled                         |
-| `--output`, `-o` | path   | `./datensee-output`   | Local directory for output tiles + `mosaic.vrt`. Created if absent.      |
+| `--output`, `-o` | path   | `./datensee-output`   | Local directory for output COG tiles. Created if absent.                 |
 | `--jar`          | path   | auto-detected         | Path to the pipeline JAR. Override only when running an unreleased build |
 | `--dry-run`      | flag   | off                   | Print the pipeline command without executing                             |
 
@@ -149,7 +152,6 @@ Options:
 | `--jar`                       | path   | auto-detected  | Path to the pipeline JAR                                                             |
 | `--max-qps`                   | int    | `100`          | Max EE HV API queries per second across all workers                                  |
 | `--dry-run`                   | flag   | off            | Print the pipeline command without executing                                         |
-| `--assemble / --no-assemble`  | flag   | `--assemble`   | Write a `mosaic.vrt` after the pipeline completes (local mode only)                  |
 | `--yes`, `-y`                 | flag   | off            | Skip the confirmation prompt for jobs > 10 000 tiles                                 |
 | `--validate / --no-validate`  | flag   | `--no-validate`| Run zero-cost output checks after the pipeline completes (local mode only)          |
 
@@ -258,7 +260,7 @@ The bundled NDVI demo, equivalent to `datensee demo` on the CLI.
 | Param               | Type                                 | Default               | Description                                            |
 | ------------------- | ------------------------------------ | --------------------- | ------------------------------------------------------ |
 | `project`           | `str`                                | *required*            | GCP project with the EE API enabled                    |
-| `output`            | `str`                                | `"./datensee-output"` | Local directory for output tiles + VRT                 |
+| `output`            | `str`                                | `"./datensee-output"` | Local directory for output COG tiles                   |
 | `jar`               | `Path \| str \| None`                | `None`                | Path to the pipeline JAR (auto-detected when `None`)   |
 | `dry_run`           | `bool`                               | `False`               | Validate but don't submit                              |
 | `progress_callback` | `Callable[[int, int], None] \| None` | `None`                | Progress callback `(completed, total)`                 |
@@ -302,7 +304,6 @@ class ExportResult(BaseModel):
     duration_seconds: float | None = None
     tiles_ok: int | None = None
     tiles_failed: int | None = None
-    vrt_path: str | None = None
     output_bytes: int | None = None
 ```
 
@@ -313,7 +314,6 @@ class ExportResult(BaseModel):
 | `duration_seconds` | After submission / completion                                              |
 | `tiles_ok`         | Local mode only, post-completion                                           |
 | `tiles_failed`     | Local mode only, post-completion                                           |
-| `vrt_path`         | Local mode only, post-completion                                           |
 | `output_bytes`     | Reserved for future use                                                    |
 
 ## Pipeline config

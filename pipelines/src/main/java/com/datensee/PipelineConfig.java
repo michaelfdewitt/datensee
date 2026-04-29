@@ -74,6 +74,15 @@ public record PipelineConfig(
                 ? outputTileSizePixels
                 : computeTileSize;
         }
+
+        /**
+         * Returns the configured COG compression name, defaulting to
+         * {@code "deflate"} when no {@code cog} block is present.
+         */
+        public String effectiveCompression() {
+            return cog != null && cog.compress() != null && !cog.compress().isBlank()
+                ? cog.compress() : "deflate";
+        }
     }
 
     /** Cloud Optimized GeoTIFF parameters. */

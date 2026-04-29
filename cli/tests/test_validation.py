@@ -1,6 +1,6 @@
 """Tests for CLI input validation — realistic bad-input scenarios.
 
-These test the _validate_inputs function with inputs that real users are
+These test the validate_inputs function with inputs that real users are
 likely to provide incorrectly: wrong GeoJSON types, malformed expressions,
 unsupported CRS codes, Feature wrappers, etc.
 """
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 
-from datensee.main import _validate_inputs
+from datensee.api import validate_inputs
 
 # ---------------------------------------------------------------------------
 # Realistic EE expression fixtures
@@ -116,13 +116,13 @@ _FEATURE_WRAPPING_POINT = {
 
 class TestValidInputs:
     def test_polygon_epsg4326_local(self) -> None:
-        errors = _validate_inputs(
+        errors = validate_inputs(
             _VALID_NDVI_EXPRESSION, _POLYGON_SF, "EPSG:4326", "/tmp/out", "local"
         )
         assert errors == []
 
     def test_multipolygon_accepted(self) -> None:
-        errors = _validate_inputs(
+        errors = validate_inputs(
             _VALID_NDVI_EXPRESSION,
             _MULTIPOLYGON_HAWAII,
             "EPSG:4326",
@@ -133,7 +133,7 @@ class TestValidInputs:
 
     def test_feature_wrapping_polygon_accepted(self) -> None:
         """GeoJSON Feature with a Polygon geometry should pass validation."""
-        errors = _validate_inputs(
+        errors = validate_inputs(
             _VALID_NDVI_EXPRESSION,
             _FEATURE_WRAPPING_POLYGON,
             "EPSG:4326",
@@ -143,7 +143,7 @@ class TestValidInputs:
         assert errors == []
 
     def test_utm_crs_accepted(self) -> None:
-        errors = _validate_inputs(
+        errors = validate_inputs(
             _VALID_NDVI_EXPRESSION,
             _POLYGON_SF,
             "EPSG:32610",
@@ -154,7 +154,7 @@ class TestValidInputs:
 
     def test_gcs_output_local_runner(self) -> None:
         """GCS paths are fine even in local mode (Beam direct runner can write GCS)."""
-        errors = _validate_inputs(
+        errors = validate_inputs(
             _VALID_NDVI_EXPRESSION,
             _POLYGON_SF,
             "EPSG:4326",
@@ -164,7 +164,7 @@ class TestValidInputs:
         assert errors == []
 
     def test_gcs_output_dataflow_runner(self) -> None:
-        errors = _validate_inputs(
+        errors = validate_inputs(
             _VALID_NDVI_EXPRESSION,
             _POLYGON_SF,
             "EPSG:4326",
@@ -175,7 +175,7 @@ class TestValidInputs:
 
     def test_minimal_valid_expression(self) -> None:
         """Even a trivial JSON object should pass the expression check."""
-        errors = _validate_inputs("{}", _POLYGON_SF, "EPSG:4326", "/tmp/out", "local")
+        errors = validate_inputs("{}", _POLYGON_SF, "EPSG:4326", "/tmp/out", "local")
         assert errors == []
 
 
@@ -186,13 +186,13 @@ class TestValidInputs:
 
 class TestBadExpressions:
     def test_plain_text_rejected(self) -> None:
-        errors = _validate_inputs("not json at all", _POLYGON_SF, "EPSG:4326", "/tmp/out", "local")
+        errors = validate_inputs("not json at all", _POLYGON_SF, "EPSG:4326", "/tmp/out", "local")
         assert len(errors) == 1
         assert "not valid JSON" in errors[0]
 
     def test_truncated_json_rejected(self) -> None:
         """Simulates a truncated file copy."""
-        errors = _validate_inputs(
+        errors = validate_inputs(
             '{"result": "0", "values": {',
             _POLYGON_SF,
             "EPSG:4326",
@@ -204,7 +204,7 @@ class TestBadExpressions:
 
     def test_yaml_rejected(self) -> None:
         """Users might accidentally provide YAML."""
-        errors = _validate_inputs(
+        errors = validate_inputs(
             "result: 0\nvalues:\n  0: test",
             _POLYGON_SF,
             "EPSG:4326",
@@ -215,7 +215,7 @@ class TestBadExpressions:
         assert "not valid JSON" in errors[0]
 
     def test_empty_string_rejected(self) -> None:
-        errors = _validate_inputs("", _POLYGON_SF, "EPSG:4326", "/tmp/out", "local")
+        errors = validate_inputs("", _POLYGON_SF, "EPSG:4326", "/tmp/out", "local")
         assert len(errors) == 1
         assert "not valid JSON" in errors[0]
 
@@ -227,7 +227,7 @@ class TestBadExpressions:
 
 class TestBadRegions:
     def test_point_geometry_rejected(self) -> None:
-        errors = _validate_inputs(
+        errors = validate_inputs(
             _VALID_NDVI_EXPRESSION,
             _POINT_GEOMETRY,
             "EPSG:4326",
@@ -238,7 +238,7 @@ class TestBadRegions:
         assert "Point" in errors[0]
 
     def test_linestring_rejected(self) -> None:
-        errors = _validate_inputs(
+        errors = validate_inputs(
             _VALID_NDVI_EXPRESSION,
             _LINESTRING_GEOMETRY,
             "EPSG:4326",
@@ -249,7 +249,7 @@ class TestBadRegions:
         assert "LineString" in errors[0]
 
     def test_feature_collection_rejected(self) -> None:
-        errors = _validate_inputs(
+        errors = validate_inputs(
             _VALID_NDVI_EXPRESSION,
             _FEATURE_COLLECTION,
             "EPSG:4326",
@@ -261,7 +261,7 @@ class TestBadRegions:
 
     def test_feature_wrapping_point_rejected(self) -> None:
         """A Feature wrapper doesn't help if the inner geometry is a Point."""
-        errors = _validate_inputs(
+        errors = validate_inputs(
             _VALID_NDVI_EXPRESSION,
             _FEATURE_WRAPPING_POINT,
             "EPSG:4326",
@@ -272,7 +272,7 @@ class TestBadRegions:
         assert "Point" in errors[0]
 
     def test_missing_type_field(self) -> None:
-        errors = _validate_inputs(
+        errors = validate_inputs(
             _VALID_NDVI_EXPRESSION,
             {"coordinates": [[0, 0], [1, 1]]},
             "EPSG:4326",
@@ -290,7 +290,7 @@ class TestBadRegions:
 
 class TestBadCrs:
     def test_garbage_crs_rejected(self) -> None:
-        errors = _validate_inputs(
+        errors = validate_inputs(
             _VALID_NDVI_EXPRESSION,
             _POLYGON_SF,
             "not-a-crs",
@@ -302,7 +302,7 @@ class TestBadCrs:
 
     def test_epsg_typo_rejected(self) -> None:
         """EPSG:99999 doesn't exist."""
-        errors = _validate_inputs(
+        errors = validate_inputs(
             _VALID_NDVI_EXPRESSION,
             _POLYGON_SF,
             "EPSG:99999",
@@ -314,7 +314,7 @@ class TestBadCrs:
 
     def test_valid_uncommon_crs_accepted(self) -> None:
         """EPSG:3857 (Web Mercator) is valid even if unusual for EE exports."""
-        errors = _validate_inputs(
+        errors = validate_inputs(
             _VALID_NDVI_EXPRESSION,
             _POLYGON_SF,
             "EPSG:3857",
@@ -331,7 +331,7 @@ class TestBadCrs:
 
 class TestBadOutputPaths:
     def test_dataflow_requires_gcs(self) -> None:
-        errors = _validate_inputs(
+        errors = validate_inputs(
             _VALID_NDVI_EXPRESSION,
             _POLYGON_SF,
             "EPSG:4326",
@@ -342,7 +342,7 @@ class TestBadOutputPaths:
         assert "gs://" in errors[0]
 
     def test_dataflow_accepts_gcs(self) -> None:
-        errors = _validate_inputs(
+        errors = validate_inputs(
             _VALID_NDVI_EXPRESSION,
             _POLYGON_SF,
             "EPSG:4326",
@@ -360,7 +360,7 @@ class TestBadOutputPaths:
 class TestMultipleErrors:
     def test_bad_expression_and_bad_region(self) -> None:
         """All validation errors are collected, not short-circuited."""
-        errors = _validate_inputs(
+        errors = validate_inputs(
             "not json",
             _POINT_GEOMETRY,
             "EPSG:4326",
@@ -372,7 +372,7 @@ class TestMultipleErrors:
         assert any("Point" in e for e in errors)
 
     def test_bad_everything(self) -> None:
-        errors = _validate_inputs(
+        errors = validate_inputs(
             "not json",
             _POINT_GEOMETRY,
             "BOGUS",

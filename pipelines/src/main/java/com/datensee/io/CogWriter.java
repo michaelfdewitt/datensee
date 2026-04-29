@@ -22,7 +22,7 @@ public final class CogWriter extends PTransform<PCollection<FetchedTile>, PDone>
     /**
      * @param outputPath  GCS URI or local directory
      * @param tileSize    tile edge size in pixels (used as COG block size)
-     * @param compression COG compression algorithm ("lzw", "deflate", "none")
+     * @param compression COG compression algorithm ("deflate" or "none")
      */
     public CogWriter(String outputPath, int tileSize, String compression) {
         this.outputPath = outputPath;

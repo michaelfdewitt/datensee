@@ -6,22 +6,22 @@ import pytest
 
 from datensee.api import (
     ExportResult,
-    _demo_expression,
-    _demo_region,
+    demo_expression,
+    demo_region,
     tile,
 )
 
 
 class TestTile:
     def test_returns_tile_grid(self) -> None:
-        grid = tile(_demo_region(), scale=30.0, crs="EPSG:4326", tile_size=512)
+        grid = tile(demo_region(), scale=30.0, crs="EPSG:4326", tile_size=512)
         assert grid.tiles is not None
         assert len(grid.tiles) > 0
         assert grid.crs == "EPSG:4326"
         assert grid.scale_meters == 30.0
 
     def test_tile_count_varies_with_scale(self) -> None:
-        region = _demo_region()
+        region = demo_region()
         grid_30 = tile(region, scale=30.0)
         grid_100 = tile(region, scale=100.0)
         assert len(grid_30.tiles) >= len(grid_100.tiles)
@@ -35,9 +35,9 @@ class TestExportResult:
             RunnerConfig,
         )
 
-        grid = tile(_demo_region(), scale=30.0)
+        grid = tile(demo_region(), scale=30.0)
         config = PipelineConfig(
-            ee_expression=_demo_expression(),
+            ee_expression=demo_expression(),
             gee_project="test-project",
             tile_grid=grid,
             output=OutputConfig(output_path="/tmp/test"),
@@ -46,7 +46,6 @@ class TestExportResult:
         result = ExportResult(config=config)
         assert result.job_id is None
         assert result.duration_seconds is None
-        assert result.vrt_path is None
         assert result.output_bytes is None
 
 
@@ -57,7 +56,7 @@ class TestExportValidation:
         with pytest.raises(ValueError, match="not valid JSON"):
             export(
                 ee_expression="not json",
-                region=_demo_region(),
+                region=demo_region(),
                 project="test",
                 output="/tmp/out",
                 runner="local",
@@ -69,8 +68,8 @@ class TestExportValidation:
 
         with pytest.raises(ValueError, match="temp-location"):
             export(
-                ee_expression=_demo_expression(),
-                region=_demo_region(),
+                ee_expression=demo_expression(),
+                region=demo_region(),
                 project="test",
                 output="gs://bucket/out",
                 runner="dataflow",
@@ -81,8 +80,8 @@ class TestExportValidation:
         from datensee.api import export
 
         result = export(
-            ee_expression=_demo_expression(),
-            region=_demo_region(),
+            ee_expression=demo_expression(),
+            region=demo_region(),
             project="test",
             output="gs://bucket/out",
             runner="dataflow",

@@ -15,16 +15,17 @@ import org.slf4j.LoggerFactory;
  * Transcodes raw GeoTIFF bytes into Cloud Optimized GeoTIFF format.
  *
  * <p>The EE High Volume API returns standard GeoTIFFs with a single-strip
- * layout and no compression. This transcoder rewrites the TIFF structure to
- * use tiled layout and LZW compression, producing a valid COG that
- * {@code ee.Image.loadGeoTIFF()} can read.
+ * layout and no compression. This transcoder rewrites the TIFF structure
+ * to tiled layout with deflate (zlib) compression, producing a valid COG
+ * that {@code ee.Image.loadGeoTIFF()} can read.
  *
  * <p>Approach: operates directly on TIFF bytes — no pixel decoding/encoding
  * via BufferedImage (which would lose float32 precision). Reads the IFD,
- * extracts raw pixel strips, LZW-compresses the pixel data, and writes a
- * new TIFF with tiled layout and all original GeoTIFF metadata tags preserved.
+ * extracts raw pixel strips, deflate-compresses the pixel data, and writes
+ * a new TIFF with tiled layout and all original GeoTIFF metadata tags
+ * preserved.
  *
- * <p>Zero external dependencies — pure Java.
+ * <p>Zero external dependencies — pure Java (zlib via {@code java.util.zip}).
  */
 public final class CogTranscoder {
 
@@ -51,12 +52,7 @@ public final class CogTranscoder {
 
     // Compression values
     private static final int COMPRESS_NONE = 1;
-    private static final int COMPRESS_LZW = 5;
     private static final int COMPRESS_DEFLATE = 8;
-
-    // Predictor values
-    private static final int PREDICTOR_NONE = 1;
-    private static final int PREDICTOR_HORIZONTAL = 2;
 
     private CogTranscoder() { }
 
@@ -65,7 +61,7 @@ public final class CogTranscoder {
      *
      * @param rawGeotiff  bytes from the EE HV API (standard GeoTIFF)
      * @param tileSize    tile edge size in pixels (used as COG block size)
-     * @param compression compression algorithm ("lzw", "deflate", "none")
+     * @param compression compression algorithm ("deflate" or "none")
      * @return COG-encoded bytes
      * @throws IOException if transcoding fails
      */
@@ -136,12 +132,22 @@ public final class CogTranscoder {
         // Extract pixel data from strips or tiles
         byte[] pixelData = extractPixelData(entries, rawGeotiff, order);
 
-        int sampleFormat = entries.containsKey(TAG_SAMPLE_FORMAT)
-            ? getIntValue(entries, TAG_SAMPLE_FORMAT) : 1;
+        // Slice the big buffer into per-block pixel chunks; partitionCompressBuild
+        // does the compression + COG assembly.
+        int bytesPerSample = bitsPerSample / 8;
+        List<byte[]> blocks = new ArrayList<>(tilesAcross * tilesDown);
+        for (int ty = 0; ty < tilesDown; ty++) {
+            for (int tx = 0; tx < tilesAcross; tx++) {
+                blocks.add(extractBlock(
+                    pixelData, width, tileSize, tx, ty,
+                    samplesPerPixel, bytesPerSample
+                ));
+            }
+        }
 
         return partitionCompressBuild(
-            pixelData, width, height, tileSize,
-            bitsPerSample, samplesPerPixel, sampleFormat,
+            blocks, width, height, tileSize,
+            bitsPerSample, samplesPerPixel,
             entries, order, compression
         );
     }
@@ -149,10 +155,11 @@ public final class CogTranscoder {
     /**
      * Multi-tile entry point for the M6 assembler.
      *
-     * <p>Takes a pre-assembled pixel buffer (the union of compute tiles
-     * keyed under one output tile) plus a representative compute tile
-     * whose GeoTIFF metadata describes the sample structure and CRS,
-     * and returns a multi-block COG for the assembled image.
+     * <p>Takes a list of per-tile pixel buffers in row-major order
+     * ({@code [ty * tilesAcross + tx]}), one entry per inner COG block.
+     * {@code null} entries are zero-filled (used when a compute tile in
+     * the group failed upstream — the COG still tiles cleanly with a
+     * blank block where the missing data would have lived).
      *
      * <p>The {@code outputTileOriginX} / {@code outputTileOriginY} pair
      * supplies the output tile's geographic origin in CRS units; this is
@@ -162,12 +169,16 @@ public final class CogTranscoder {
      * are inherited from the supplied source tile — every compute tile
      * shares them.
      *
-     * @param pixelData              row-major assembled pixel bytes
-     *                               (W × H × samples × bytes-per-sample)
-     * @param width                  assembled image width in pixels
-     *                               (output tile size, multiple of tileSize)
-     * @param height                 assembled image height in pixels
-     *                               (output tile size, multiple of tileSize)
+     * @param tilePixels             row-major list of per-block pixel
+     *                               buffers (length = {@code (width/tileSize)
+     *                               * (height/tileSize)}); each non-null
+     *                               entry must be {@code tileSize *
+     *                               tileSize * samples * bytes-per-sample}
+     *                               bytes; null entries are zero-filled
+     * @param width                  output image width in pixels
+     *                               (multiple of tileSize)
+     * @param height                 output image height in pixels
+     *                               (multiple of tileSize)
      * @param tileSize               COG internal block size = compute tile size
      * @param sourceTiffForMetadata  any compute tile from the group; used
      *                               for sample structure and CRS metadata
@@ -175,10 +186,10 @@ public final class CogTranscoder {
      *                               (typically xMin)
      * @param outputTileOriginY      y-coordinate of output tile origin
      *                               (typically yMax)
-     * @param compression            "lzw", "deflate", or "none"
+     * @param compression            compression algorithm ("deflate" or "none")
      */
-    public static byte[] transcodeFromAssembledPixels(
-        byte[] pixelData,
+    public static byte[] transcodeFromTileBlocks(
+        List<byte[]> tilePixels,
         int width, int height,
         int tileSize,
         byte[] sourceTiffForMetadata,
@@ -188,7 +199,7 @@ public final class CogTranscoder {
     ) throws IOException {
         if (width % tileSize != 0 || height % tileSize != 0) {
             throw new IOException(
-                "Assembled image " + width + "x" + height
+                "Output image " + width + "x" + height
                 + " is not a whole-number multiple of tileSize=" + tileSize
             );
         }
@@ -214,18 +225,6 @@ public final class CogTranscoder {
         int bitsPerSample = getIntValue(sourceEntries, TAG_BITS_PER_SAMPLE);
         int samplesPerPixel = sourceEntries.containsKey(277)
             ? getIntValue(sourceEntries, 277) : 1;
-        int sampleFormat = sourceEntries.containsKey(TAG_SAMPLE_FORMAT)
-            ? getIntValue(sourceEntries, TAG_SAMPLE_FORMAT) : 1;
-
-        int expectedBytes = width * height * samplesPerPixel * (bitsPerSample / 8);
-        if (pixelData.length != expectedBytes) {
-            throw new IOException(
-                "Assembled pixel buffer is " + pixelData.length
-                + " bytes; expected " + expectedBytes
-                + " (" + width + "x" + height + " * " + samplesPerPixel
-                + " samples * " + (bitsPerSample / 8) + " bytes/sample)"
-            );
-        }
 
         // Override the source ImageWidth/ImageLength and ModelTiepoint
         // (33922) — everything else (ModelPixelScale, GeoKeyDirectory,
@@ -239,83 +238,78 @@ public final class CogTranscoder {
         }));
 
         return partitionCompressBuild(
-            pixelData, width, height, tileSize,
-            bitsPerSample, samplesPerPixel, sampleFormat,
+            tilePixels, width, height, tileSize,
+            bitsPerSample, samplesPerPixel,
             overridden, order, compression
         );
     }
 
     /**
-     * Shared multi-block emit path: split row-major pixel data into
-     * {@code tilesAcross × tilesDown} blocks, apply predictor + compress
-     * each block independently (TIFF spec requires self-contained tiles),
-     * then assemble into the final COG layout.
+     * Shared multi-block emit path: take a list of per-block uncompressed
+     * pixel buffers (row-major, {@code null} for missing → zero-filled),
+     * compress each block independently (TIFF spec requires self-contained
+     * tiles), then assemble into the final COG layout.
      */
     private static byte[] partitionCompressBuild(
-        byte[] pixelData,
+        List<byte[]> tilePixels,
         int width, int height,
         int tileSize,
-        int bitsPerSample, int samplesPerPixel, int sampleFormat,
+        int bitsPerSample, int samplesPerPixel,
         Map<Integer, IfdEntry> entries,
         ByteOrder order,
         String compression
     ) throws IOException {
         int tilesAcross = width / tileSize;
         int tilesDown = height / tileSize;
-
-        LOG.debug(
-            "Assembling: {}x{}, {}bps, {} samples, {}x{} blocks, {} bytes pixel data",
-            width, height, bitsPerSample, samplesPerPixel,
-            tilesAcross, tilesDown, pixelData.length
-        );
-
-        int compressCode;
-        int predictorCode = PREDICTOR_NONE;
-        switch (compression.toLowerCase()) {
-            case "lzw" -> {
-                compressCode = COMPRESS_LZW;
-                if (sampleFormat != 3) {  // not floating point
-                    predictorCode = PREDICTOR_HORIZONTAL;
-                }
-            }
-            case "deflate" -> compressCode = COMPRESS_DEFLATE;
-            case "none" -> compressCode = COMPRESS_NONE;
-            default -> compressCode = COMPRESS_LZW;
+        int expectedBlocks = tilesAcross * tilesDown;
+        if (tilePixels.size() != expectedBlocks) {
+            throw new IOException(
+                "Expected " + expectedBlocks + " pixel blocks ("
+                + tilesAcross + "x" + tilesDown + " for "
+                + width + "x" + height + " at tileSize=" + tileSize
+                + "), got " + tilePixels.size()
+            );
         }
 
-        int bytesPerSample = bitsPerSample / 8;
+        LOG.debug(
+            "Assembling: {}x{}, {}bps, {} samples, {}x{} blocks",
+            width, height, bitsPerSample, samplesPerPixel,
+            tilesAcross, tilesDown
+        );
 
-        List<byte[]> compressedBlocks = new ArrayList<>(tilesAcross * tilesDown);
-        for (int ty = 0; ty < tilesDown; ty++) {
-            for (int tx = 0; tx < tilesAcross; tx++) {
-                byte[] block = extractBlock(
-                    pixelData, width, tileSize, tx, ty,
-                    samplesPerPixel, bytesPerSample
+        int compressCode = switch (compression.toLowerCase()) {
+            case "deflate" -> COMPRESS_DEFLATE;
+            case "none" -> COMPRESS_NONE;
+            default -> throw new IOException(
+                "Unsupported COG compression '" + compression
+                + "'. Supported: \"deflate\" (default), \"none\"."
+            );
+        };
+
+        int bytesPerSample = bitsPerSample / 8;
+        int blockBytes = tileSize * tileSize * samplesPerPixel * bytesPerSample;
+
+        List<byte[]> compressedBlocks = new ArrayList<>(expectedBlocks);
+        for (byte[] block : tilePixels) {
+            if (block == null) {
+                block = new byte[blockBytes];  // zero-fill missing tile
+            } else if (block.length != blockBytes) {
+                throw new IOException(
+                    "Block pixel buffer is " + block.length
+                    + " bytes; expected " + blockBytes
+                    + " (tileSize=" + tileSize + ", samples=" + samplesPerPixel
+                    + ", bytes/sample=" + bytesPerSample + ")"
                 );
-                byte[] toCompress;
-                if (predictorCode == PREDICTOR_HORIZONTAL) {
-                    toCompress = applyHorizontalPredictor(
-                        block, tileSize, tileSize, samplesPerPixel, bytesPerSample
-                    );
-                } else {
-                    toCompress = block;
-                }
-                byte[] compressedBlock;
-                if (compressCode == COMPRESS_LZW) {
-                    compressedBlock = lzwCompress(toCompress);
-                } else if (compressCode == COMPRESS_DEFLATE) {
-                    compressedBlock = deflateCompress(toCompress);
-                } else {
-                    compressedBlock = toCompress;
-                }
-                compressedBlocks.add(compressedBlock);
             }
+            byte[] compressedBlock = compressCode == COMPRESS_DEFLATE
+                ? deflateCompress(block)
+                : block;
+            compressedBlocks.add(compressedBlock);
         }
 
         return buildCogTiff(
             entries, compressedBlocks, order,
-            width, height, tileSize,
-            compressCode, predictorCode
+            width, height, tileSize, compressCode
         );
     }
 
@@ -378,11 +372,23 @@ public final class CogTranscoder {
     }
 
     /**
-     * Extract raw pixel bytes from either strip-based or tile-based layout.
+     * Extract raw row-major pixel bytes from a TIFF, decompressing per
+     * strip/tile and assembling tile-layout inputs into row order.
      *
-     * <p>The EE HV API typically returns strip-layout TIFFs, but may also
-     * return tile-layout TIFFs depending on the image type and request
-     * parameters. We handle both transparently.
+     * <p>EE's High Volume {@code computePixels} endpoint returns
+     * <em>tile-layout</em> TIFFs for any request larger than 256×256
+     * (with 256×256 internal tile size), and each strip/tile is its
+     * own self-contained zlib stream per the TIFF spec. Two implications:
+     * <ul>
+     *   <li>We must {@link #inflateData} each chunk independently —
+     *       feeding the concatenated compressed bytes into a single
+     *       {@code Inflater} stops at the first end-of-stream marker
+     *       and silently drops everything past the first chunk.
+     *   <li>For tile layout we must place each decompressed tile at its
+     *       row-major position in the output buffer, not concatenate
+     *       in tile order. EE's tile-layout responses use row-major
+     *       tile indexing (TIFF spec).
+     * </ul>
      */
     private static byte[] extractPixelData(
         Map<Integer, IfdEntry> entries,
@@ -391,13 +397,16 @@ public final class CogTranscoder {
     ) throws IOException {
         long[] offsets;
         long[] counts;
+        boolean tileLayout;
 
         if (entries.containsKey(TAG_STRIP_OFFSETS)) {
             offsets = getLongArray(entries, TAG_STRIP_OFFSETS);
             counts = getLongArray(entries, TAG_STRIP_BYTE_COUNTS);
+            tileLayout = false;
         } else if (entries.containsKey(TAG_TILE_OFFSETS)) {
             offsets = getLongArray(entries, TAG_TILE_OFFSETS);
             counts = getLongArray(entries, TAG_TILE_BYTE_COUNTS);
+            tileLayout = true;
         } else {
             throw new IOException(
                 "Input GeoTIFF has neither StripOffsets (273) nor TileOffsets (324)"
@@ -414,47 +423,115 @@ public final class CogTranscoder {
         int inputCompression = entries.containsKey(TAG_COMPRESSION)
             ? getIntValue(entries, TAG_COMPRESSION) : 1;
 
-        int totalBytes = 0;
-        for (long c : counts) {
-            totalBytes += (int) c;
-        }
+        int width = getIntValue(entries, TAG_IMAGE_WIDTH);
+        int height = getIntValue(entries, TAG_IMAGE_LENGTH);
+        int bitsPerSample = getIntValue(entries, TAG_BITS_PER_SAMPLE);
+        int samplesPerPixel = entries.containsKey(277) ? getIntValue(entries, 277) : 1;
+        int bytesPerSample = bitsPerSample / 8;
+        int rowBytes = width * samplesPerPixel * bytesPerSample;
+        byte[] decoded = new byte[height * rowBytes];
 
-        byte[] data = new byte[totalBytes];
-        int pos = 0;
-        for (int i = 0; i < offsets.length; i++) {
-            int off = (int) offsets[i];
-            int len = (int) counts[i];
-            System.arraycopy(raw, off, data, pos, len);
-            pos += len;
-        }
+        if (!tileLayout) {
+            // STRIP LAYOUT: concatenate decompressed strip pixels in
+            // strip order — strip data is row-major within each strip
+            // and strips themselves are top-down, so the concatenation
+            // is already row-major image data.
+            int rowsPerStrip = entries.containsKey(TAG_ROWS_PER_STRIP)
+                ? getIntValue(entries, TAG_ROWS_PER_STRIP) : height;
+            int dstPos = 0;
+            for (int i = 0; i < offsets.length; i++) {
+                int rowsInThisStrip = Math.min(rowsPerStrip, height - i * rowsPerStrip);
+                int stripExpected = rowsInThisStrip * rowBytes;
+                byte[] stripBytes = readChunk(
+                    raw, (int) offsets[i], (int) counts[i],
+                    inputCompression, stripExpected
+                );
+                if (stripBytes.length != stripExpected) {
+                    throw new IOException(
+                        "Strip " + i + " decoded to " + stripBytes.length
+                        + " bytes; expected " + stripExpected
+                        + " (" + rowsInThisStrip + " rows × " + rowBytes + " bytes/row)"
+                    );
+                }
+                System.arraycopy(stripBytes, 0, decoded, dstPos, stripBytes.length);
+                dstPos += stripBytes.length;
+            }
+        } else {
+            // TILE LAYOUT: each tile holds tileWidth × tileLength row-
+            // major pixels, and tiles are arranged in row-major order
+            // across the tile grid. Edge tiles still occupy a full
+            // tileWidth × tileLength block on disk (with possibly-padded
+            // pixels past the visible region) — we copy only the
+            // visible portion into the output buffer.
+            int tileWidth = getIntValue(entries, TAG_TILE_WIDTH);
+            int tileLength = getIntValue(entries, TAG_TILE_LENGTH);
+            int tilesAcross = (width + tileWidth - 1) / tileWidth;
+            int tilesDown = (height + tileLength - 1) / tileLength;
+            int tileExpected = tileWidth * tileLength * samplesPerPixel * bytesPerSample;
+            int tileRowBytes = tileWidth * samplesPerPixel * bytesPerSample;
 
-        if (inputCompression == COMPRESS_NONE) {
-            return data;
-        }
+            if (offsets.length != tilesAcross * tilesDown) {
+                throw new IOException(
+                    "Tile count " + offsets.length + " ≠ " + tilesAcross
+                    + "×" + tilesDown + " = " + (tilesAcross * tilesDown)
+                    + " expected for " + width + "×" + height + " image with "
+                    + tileWidth + "×" + tileLength + " tiles"
+                );
+            }
 
-        // Decompress the pixel data before re-encoding
-        if (inputCompression == COMPRESS_DEFLATE || inputCompression == 32946) {
-            // 32946 = Adobe Deflate (zlib), 8 = standard Deflate — both use zlib
-            int width = getIntValue(entries, TAG_IMAGE_WIDTH);
-            int height = getIntValue(entries, TAG_IMAGE_LENGTH);
-            int bitsPerSample = getIntValue(entries, TAG_BITS_PER_SAMPLE);
-            int samplesPerPixel = entries.containsKey(277) ? getIntValue(entries, 277) : 1;
-            int expectedBytes = width * height * samplesPerPixel * (bitsPerSample / 8);
-            return inflateData(data, expectedBytes);
+            for (int ty = 0; ty < tilesDown; ty++) {
+                for (int tx = 0; tx < tilesAcross; tx++) {
+                    int idx = ty * tilesAcross + tx;
+                    byte[] tileBytes = readChunk(
+                        raw, (int) offsets[idx], (int) counts[idx],
+                        inputCompression, tileExpected
+                    );
+                    if (tileBytes.length != tileExpected) {
+                        throw new IOException(
+                            "Tile (" + tx + "," + ty + ") decoded to "
+                            + tileBytes.length + " bytes; expected " + tileExpected
+                            + " (" + tileWidth + "×" + tileLength + " × "
+                            + samplesPerPixel + " sample(s) × " + bytesPerSample
+                            + " byte(s)/sample)"
+                        );
+                    }
+                    int visibleWidth = Math.min(tileWidth, width - tx * tileWidth);
+                    int visibleHeight = Math.min(tileLength, height - ty * tileLength);
+                    int copyRowBytes = visibleWidth * samplesPerPixel * bytesPerSample;
+                    int dstColBytes = tx * tileWidth * samplesPerPixel * bytesPerSample;
+                    for (int dy = 0; dy < visibleHeight; dy++) {
+                        int srcOff = dy * tileRowBytes;
+                        int dstOff = (ty * tileLength + dy) * rowBytes + dstColBytes;
+                        System.arraycopy(tileBytes, srcOff, decoded, dstOff, copyRowBytes);
+                    }
+                }
+            }
         }
+        return decoded;
+    }
 
-        if (inputCompression == COMPRESS_LZW) {
-            int width = getIntValue(entries, TAG_IMAGE_WIDTH);
-            int height = getIntValue(entries, TAG_IMAGE_LENGTH);
-            int bitsPerSample = getIntValue(entries, TAG_BITS_PER_SAMPLE);
-            int samplesPerPixel = entries.containsKey(277) ? getIntValue(entries, 277) : 1;
-            int expectedBytes = width * height * samplesPerPixel * (bitsPerSample / 8);
-            return lzwDecompress(data, expectedBytes);
+    /**
+     * Read one strip/tile chunk's compressed (or uncompressed) bytes
+     * from the raw TIFF and return decoded bytes. Each chunk in a
+     * compressed TIFF is its own zlib stream, so this must be called
+     * once per chunk — never on a concatenation.
+     */
+    private static byte[] readChunk(
+        byte[] raw, int offset, int length,
+        int compression, int expectedBytes
+    ) throws IOException {
+        byte[] compressed = new byte[length];
+        System.arraycopy(raw, offset, compressed, 0, length);
+        if (compression == COMPRESS_NONE) {
+            return compressed;
         }
-
+        if (compression == COMPRESS_DEFLATE || compression == 32946) {
+            // 32946 = Adobe Deflate (zlib), 8 = standard Deflate — both use zlib.
+            return inflateData(compressed, expectedBytes);
+        }
         throw new IOException(
-            "Unsupported input compression (compression=" + inputCompression
-            + "). Supported: none (1), LZW (5), Deflate (8, 32946)."
+            "Unsupported input compression (compression=" + compression
+            + "). Supported: none (1), Deflate (8, 32946)."
         );
     }
 
@@ -487,8 +564,7 @@ public final class CogTranscoder {
         int width,
         int height,
         int tileSize,
-        int compression,
-        int predictor
+        int compression
     ) throws IOException {
         int numBlocks = compressedBlocks.size();
         int expectedBlocks = (width / tileSize) * (height / tileSize);
@@ -509,6 +585,10 @@ public final class CogTranscoder {
         }
 
         // Build IFD entries — copy originals, replace strip→tile tags.
+        // TAG_PREDICTOR is excluded from the inheritance set even though
+        // we never write one ourselves: the transcoder doesn't apply
+        // predictor encoding, so a stale Predictor tag from the source
+        // would mis-describe our output.
         List<IfdEntry> newEntries = new ArrayList<>();
         for (var entry : originalEntries.values()) {
             if (entry.tag == TAG_STRIP_OFFSETS
@@ -525,9 +605,6 @@ public final class CogTranscoder {
             newEntries.add(entry);
         }
         newEntries.add(IfdEntry.shortValue(TAG_COMPRESSION, compression));
-        if (predictor != PREDICTOR_NONE) {
-            newEntries.add(IfdEntry.shortValue(TAG_PREDICTOR, predictor));
-        }
         newEntries.add(IfdEntry.shortValue(TAG_TILE_WIDTH, tileSize));
         newEntries.add(IfdEntry.shortValue(TAG_TILE_LENGTH, tileSize));
 
@@ -617,98 +694,22 @@ public final class CogTranscoder {
     }
 
     // -----------------------------------------------------------------------
-    // LZW compression (TIFF-compatible: MSB-first, with clear/EOI codes)
+    // Deflate compression / decompression (zlib via java.util.zip)
     // -----------------------------------------------------------------------
 
-    private static byte[] lzwCompress(byte[] input) {
+    private static byte[] deflateCompress(byte[] input) {
+        var deflater = new java.util.zip.Deflater();
+        deflater.setInput(input);
+        deflater.finish();
         var out = new ByteArrayOutputStream();
-        var bitWriter = new BitWriter(out);
-
-        final int clearCode = 256;
-        final int eoiCode = 257;
-        int nextCode = 258;
-        int codeSize = 9;
-
-        // Initialize table with single-byte entries
-        Map<List<Byte>, Integer> table = new LinkedHashMap<>();
-        for (int i = 0; i < 256; i++) {
-            table.put(List.of((byte) i), i);
+        byte[] tmp = new byte[8192];
+        while (!deflater.finished()) {
+            int n = deflater.deflate(tmp);
+            out.write(tmp, 0, n);
         }
-
-        bitWriter.write(clearCode, codeSize);
-
-        List<Byte> w = new ArrayList<>();
-        for (byte b : input) {
-            List<Byte> wc = new ArrayList<>(w);
-            wc.add(b);
-
-            if (table.containsKey(wc)) {
-                w = wc;
-            } else {
-                bitWriter.write(table.get(w), codeSize);
-
-                if (nextCode < 4094) {
-                    table.put(wc, nextCode++);
-                    if (nextCode > (1 << codeSize)) {
-                        codeSize++;
-                    }
-                } else {
-                    // Table full — emit clear code and reset
-                    bitWriter.write(clearCode, codeSize);
-                    table.clear();
-                    for (int i = 0; i < 256; i++) {
-                        table.put(List.of((byte) i), i);
-                    }
-                    nextCode = 258;
-                    codeSize = 9;
-                }
-
-                w = new ArrayList<>();
-                w.add(b);
-            }
-        }
-
-        if (!w.isEmpty()) {
-            bitWriter.write(table.get(w), codeSize);
-        }
-        bitWriter.write(eoiCode, codeSize);
-        bitWriter.flush();
-
+        deflater.end();
         return out.toByteArray();
     }
-
-    /**
-     * MSB-first bit writer for TIFF LZW.
-     */
-    private static final class BitWriter {
-        private final ByteArrayOutputStream out;
-        private int buffer;
-        private int bitsInBuffer;
-
-        BitWriter(ByteArrayOutputStream out) {
-            this.out = out;
-        }
-
-        void write(int code, int numBits) {
-            buffer = (buffer << numBits) | code;
-            bitsInBuffer += numBits;
-            while (bitsInBuffer >= 8) {
-                bitsInBuffer -= 8;
-                out.write((buffer >> bitsInBuffer) & 0xFF);
-            }
-        }
-
-        void flush() {
-            if (bitsInBuffer > 0) {
-                out.write((buffer << (8 - bitsInBuffer)) & 0xFF);
-                bitsInBuffer = 0;
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Deflate decompression
-    // -----------------------------------------------------------------------
 
     private static byte[] inflateData(byte[] compressed, int expectedBytes) throws IOException {
         var inflater = new java.util.zip.Inflater();
@@ -729,175 +730,6 @@ public final class CogTranscoder {
             inflater.end();
         }
         return out.toByteArray();
-    }
-
-    // -----------------------------------------------------------------------
-    // LZW decompression (TIFF-compatible: MSB-first)
-    // -----------------------------------------------------------------------
-
-    private static byte[] lzwDecompress(byte[] compressed, int expectedBytes) throws IOException {
-        var out = new ByteArrayOutputStream(expectedBytes);
-        var bitReader = new BitReader(compressed);
-
-        final int clearCode = 256;
-        final int eoiCode = 257;
-        int codeSize = 9;
-
-        // Initialize table
-        List<byte[]> table = new ArrayList<>();
-        for (int i = 0; i < 258; i++) {
-            if (i < 256) {
-                table.add(new byte[]{(byte) i});
-            } else {
-                table.add(new byte[0]); // clear + EOI placeholders
-            }
-        }
-
-        int code = bitReader.read(codeSize);
-        if (code != clearCode) {
-            throw new IOException("LZW stream does not start with clear code");
-        }
-
-        // Reset table
-        table.subList(258, table.size()).clear();
-        codeSize = 9;
-
-        code = bitReader.read(codeSize);
-        if (code == eoiCode) {
-            return out.toByteArray();
-        }
-        byte[] prev = table.get(code);
-        out.write(prev);
-
-        while (true) {
-            code = bitReader.read(codeSize);
-            if (code == eoiCode) {
-                break;
-            }
-            if (code == clearCode) {
-                table.subList(258, table.size()).clear();
-                codeSize = 9;
-                code = bitReader.read(codeSize);
-                if (code == eoiCode) {
-                    break;
-                }
-                prev = table.get(code);
-                out.write(prev);
-                continue;
-            }
-
-            byte[] entry;
-            if (code < table.size()) {
-                entry = table.get(code);
-            } else if (code == table.size()) {
-                entry = new byte[prev.length + 1];
-                System.arraycopy(prev, 0, entry, 0, prev.length);
-                entry[prev.length] = prev[0];
-            } else {
-                throw new IOException("Invalid LZW code: " + code + " (table size: " + table.size() + ")");
-            }
-
-            out.write(entry);
-
-            byte[] newEntry = new byte[prev.length + 1];
-            System.arraycopy(prev, 0, newEntry, 0, prev.length);
-            newEntry[prev.length] = entry[0];
-            table.add(newEntry);
-
-            if (table.size() + 1 > (1 << codeSize) && codeSize < 12) {
-                codeSize++;
-            }
-
-            prev = entry;
-        }
-
-        return out.toByteArray();
-    }
-
-    /**
-     * MSB-first bit reader for TIFF LZW decompression.
-     */
-    private static final class BitReader {
-        private final byte[] data;
-        private int bytePos;
-        private int bitPos; // bits remaining in current byte (MSB-first)
-
-        BitReader(byte[] data) {
-            this.data = data;
-            this.bytePos = 0;
-            this.bitPos = 8;
-        }
-
-        int read(int numBits) throws IOException {
-            int result = 0;
-            int bitsNeeded = numBits;
-            while (bitsNeeded > 0) {
-                if (bytePos >= data.length) {
-                    throw new IOException("Unexpected end of LZW data");
-                }
-                int bitsAvail = bitPos;
-                int bitsToTake = Math.min(bitsAvail, bitsNeeded);
-                int shift = bitsAvail - bitsToTake;
-                int mask = ((1 << bitsToTake) - 1) << shift;
-                int bits = (Byte.toUnsignedInt(data[bytePos]) & mask) >> shift;
-                result = (result << bitsToTake) | bits;
-                bitsNeeded -= bitsToTake;
-                bitPos -= bitsToTake;
-                if (bitPos == 0) {
-                    bytePos++;
-                    bitPos = 8;
-                }
-            }
-            return result;
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Deflate compression
-    // -----------------------------------------------------------------------
-
-    private static byte[] deflateCompress(byte[] input) {
-        var deflater = new java.util.zip.Deflater();
-        deflater.setInput(input);
-        deflater.finish();
-        var out = new ByteArrayOutputStream();
-        byte[] tmp = new byte[8192];
-        while (!deflater.finished()) {
-            int n = deflater.deflate(tmp);
-            out.write(tmp, 0, n);
-        }
-        deflater.end();
-        return out.toByteArray();
-    }
-
-    // -----------------------------------------------------------------------
-    // Horizontal differencing predictor
-    // -----------------------------------------------------------------------
-
-    private static byte[] applyHorizontalPredictor(
-        byte[] data,
-        int width,
-        int height,
-        int samplesPerPixel,
-        int bytesPerSample
-    ) {
-        byte[] result = data.clone();
-        int rowBytes = width * samplesPerPixel * bytesPerSample;
-
-        for (int row = 0; row < height; row++) {
-            int rowStart = row * rowBytes;
-            // Process right-to-left to avoid overwriting needed values
-            for (int x = width - 1; x >= 1; x--) {
-                for (int s = 0; s < samplesPerPixel; s++) {
-                    int currOff = rowStart + (x * samplesPerPixel + s) * bytesPerSample;
-                    int prevOff = rowStart + ((x - 1) * samplesPerPixel + s) * bytesPerSample;
-                    for (int b = 0; b < bytesPerSample; b++) {
-                        result[currOff + b] = (byte) (data[currOff + b] - data[prevOff + b]);
-                    }
-                }
-            }
-        }
-        return result;
     }
 
     // -----------------------------------------------------------------------
@@ -967,44 +799,52 @@ public final class CogTranscoder {
             int typeSize = (type > 0 && type < TYPE_SIZES.length) ? TYPE_SIZES[type] : 1;
             int totalBytes = count * typeSize;
 
-            long[] values;
-            byte[] overflow = null;
             int dataPos;
-
+            byte[] rawBytes = null;
             if (totalBytes <= 4) {
                 dataPos = valueOffset;
             } else {
                 dataPos = buf.getInt(valueOffset);
-                overflow = new byte[totalBytes];
-                System.arraycopy(raw, dataPos, overflow, 0, totalBytes);
+                rawBytes = new byte[totalBytes];
+                System.arraycopy(raw, dataPos, rawBytes, 0, totalBytes);
             }
 
             // Skip past the 4-byte value/offset field
             buf.position(valueOffset + 4);
 
-            // Parse values
-            ByteBuffer dataBuf = ByteBuffer.wrap(raw).order(order);
-            dataBuf.position(dataPos);
-            values = new long[count];
-
-            for (int i = 0; i < count; i++) {
-                values[i] = switch (type) {
-                    case 1, 7 -> Byte.toUnsignedLong(dataBuf.get());     // BYTE, UNDEFINED
-                    case 2 -> Byte.toUnsignedLong(dataBuf.get());        // ASCII
-                    case 3 -> Short.toUnsignedLong(dataBuf.getShort());  // SHORT
-                    case 4 -> Integer.toUnsignedLong(dataBuf.getInt());  // LONG
-                    case 5 -> {  // RATIONAL
-                        long num = Integer.toUnsignedLong(dataBuf.getInt());
-                        long den = Integer.toUnsignedLong(dataBuf.getInt());
-                        yield (den == 0) ? 0 : num / den;
-                    }
-                    case 11 -> Float.floatToRawIntBits(dataBuf.getFloat()); // FLOAT
-                    case 12 -> Double.doubleToRawLongBits(dataBuf.getDouble()); // DOUBLE
-                    default -> Byte.toUnsignedLong(dataBuf.get());
-                };
+            // Parse numeric values per-type. ASCII (type 2) is byte-oriented
+            // and never inspected numerically; we capture its bytes verbatim
+            // below and leave values[] empty so no part of the round-trip
+            // relies on a pseudo-numerical interpretation of character data.
+            long[] values;
+            if (type == 2) {
+                if (rawBytes == null) {
+                    rawBytes = new byte[totalBytes];
+                    System.arraycopy(raw, dataPos, rawBytes, 0, totalBytes);
+                }
+                values = new long[0];
+            } else {
+                ByteBuffer dataBuf = ByteBuffer.wrap(raw).order(order);
+                dataBuf.position(dataPos);
+                values = new long[count];
+                for (int i = 0; i < count; i++) {
+                    values[i] = switch (type) {
+                        case 1, 7 -> Byte.toUnsignedLong(dataBuf.get());     // BYTE, UNDEFINED
+                        case 3 -> Short.toUnsignedLong(dataBuf.getShort());  // SHORT
+                        case 4 -> Integer.toUnsignedLong(dataBuf.getInt());  // LONG
+                        case 5 -> {  // RATIONAL
+                            long num = Integer.toUnsignedLong(dataBuf.getInt());
+                            long den = Integer.toUnsignedLong(dataBuf.getInt());
+                            yield (den == 0) ? 0 : num / den;
+                        }
+                        case 11 -> Float.floatToRawIntBits(dataBuf.getFloat()); // FLOAT
+                        case 12 -> Double.doubleToRawLongBits(dataBuf.getDouble()); // DOUBLE
+                        default -> Byte.toUnsignedLong(dataBuf.get());
+                    };
+                }
             }
 
-            return new IfdEntry(tag, type, count, values, overflow);
+            return new IfdEntry(tag, type, count, values, rawBytes);
         }
 
         byte[] serialize(ByteOrder order, int overflowOffset) {
@@ -1017,10 +857,16 @@ public final class CogTranscoder {
             int totalBytes = count * typeSize;
 
             if (totalBytes <= 4) {
-                // Inline value
+                // Inline value. ASCII tags are byte-oriented and were read
+                // verbatim into rawOverflow; for those, write the raw bytes
+                // directly (rather than going through the numeric writeValues
+                // path) and pad to the 4-byte field width.
                 int pos = buf.position();
-                writeValues(buf, order);
-                // Pad to 4 bytes
+                if (type == 2 && rawOverflow != null) {
+                    buf.put(rawOverflow);
+                } else {
+                    writeValues(buf, order);
+                }
                 while (buf.position() < pos + 4) {
                     buf.put((byte) 0);
                 }
@@ -1048,6 +894,11 @@ public final class CogTranscoder {
             return buf.array();
         }
 
+        /**
+         * Serialize numeric values per TIFF type. Never called for ASCII
+         * (type 2) — those are byte-oriented and pass through {@code
+         * rawOverflow} on both read and write.
+         */
         private void writeValues(ByteBuffer buf, ByteOrder order) {
             for (long val : values) {
                 switch (type) {
@@ -1060,7 +911,9 @@ public final class CogTranscoder {
                     }
                     case 11 -> buf.putFloat(Float.intBitsToFloat((int) val));
                     case 12 -> buf.putDouble(Double.longBitsToDouble(val));
-                    default -> buf.put((byte) val);
+                    default -> throw new IllegalStateException(
+                        "Cannot serialize TIFF tag " + tag + " of unknown type " + type
+                    );
                 }
             }
         }

@@ -40,7 +40,7 @@ public final class TileWriterDoFn extends DoFn<FetchedTile, Void> {
     /**
      * @param outputPath  GCS URI or local directory
      * @param tileSize    tile edge size in pixels (used as COG block size)
-     * @param compression COG compression algorithm ("lzw", "deflate", "none")
+     * @param compression COG compression algorithm ("deflate" or "none")
      */
     public TileWriterDoFn(String outputPath, int tileSize, String compression) {
         this.outputPath = outputPath;

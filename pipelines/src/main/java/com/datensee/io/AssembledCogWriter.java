@@ -2,7 +2,6 @@ package com.datensee.io;
 
 import com.datensee.FetchedTile;
 import com.datensee.OutputTileKey;
-import com.datensee.TileCoordinate;
 import com.google.cloud.storage.BlobId;
 import com.google.cloud.storage.BlobInfo;
 import com.google.cloud.storage.Storage;
@@ -73,16 +72,14 @@ public final class AssembledCogWriter
         int outputTileSize,
         String compression
     ) {
+        // The (outputTileSize % computeTileSize == 0) invariant is enforced
+        // at the wire boundary by PipelineConfig's pydantic validator and
+        // again at COG-emit time by transcodeFromTileBlocks; no need for a
+        // third check here.
         this.outputPath = outputPath;
         this.computeTileSize = computeTileSize;
         this.outputTileSize = outputTileSize;
         this.compression = compression;
-        if (outputTileSize % computeTileSize != 0) {
-            throw new IllegalArgumentException(
-                "outputTileSize=" + outputTileSize
-                + " must be a multiple of computeTileSize=" + computeTileSize
-            );
-        }
     }
 
     @Override
@@ -137,6 +134,15 @@ public final class AssembledCogWriter
         public void processElement(
             @Element KV<OutputTileKey, Iterable<FetchedTile>> element
         ) throws IOException {
+            process(element);
+        }
+
+        /**
+         * The actual @ProcessElement body — exposed package-private so
+         * tests can drive the DoFn with a synthetic {@code KV} input
+         * without going through Beam's harness or reflection.
+         */
+        void process(KV<OutputTileKey, Iterable<FetchedTile>> element) throws IOException {
             OutputTileKey key = element.getKey();
             List<FetchedTile> computeTiles = new ArrayList<>();
             for (FetchedTile t : element.getValue()) {
@@ -168,68 +174,52 @@ public final class AssembledCogWriter
             ) * outputTileSizeNative;
             double outputYMax = outputYMin + outputTileSizeNative;
 
-            // Determine sample structure from the first tile's pixel
-            // buffer. We get the pixel byte count, infer everything else
-            // from compute tile dimensions + samplesPerPixel from a quick
-            // re-parse via CogTranscoder.
-            byte[] firstPixels = CogTranscoder.extractPixelsFromTiff(sourceTiff);
-            int firstPixelBytes = firstPixels.length;
-            // bytesPerPixelTotal = samplesPerPixel * bytesPerSample
-            int bytesPerPixelTotal = firstPixelBytes / (computeTileSize * computeTileSize);
-            if (bytesPerPixelTotal * computeTileSize * computeTileSize != firstPixelBytes) {
-                throw new IOException(
-                    "Compute tile pixel count " + firstPixelBytes
-                    + " is not consistent with " + computeTileSize + "x" + computeTileSize
-                );
+            // Each compute tile becomes one inner COG block at index
+            // (ty * tilesAcross + tx). Build a row-major list of pixel
+            // buffers; null entries (missing compute tiles, e.g. dead-
+            // lettered upstream) get zero-filled by the transcoder.
+            int tilesAcross = outputTileSize / computeTileSize;
+            int tilesDown = outputTileSize / computeTileSize;
+            List<byte[]> tilePixels = new ArrayList<>(tilesAcross * tilesDown);
+            for (int i = 0; i < tilesAcross * tilesDown; i++) {
+                tilePixels.add(null);
             }
 
-            int outputRowBytes = outputTileSize * bytesPerPixelTotal;
-            byte[] assembled = new byte[outputTileSize * outputRowBytes];
-
             for (FetchedTile t : computeTiles) {
-                byte[] pixels;
-                if (t == first) {
-                    pixels = firstPixels;  // already extracted
-                } else {
-                    pixels = CogTranscoder.extractPixelsFromTiff(t.imageBytes());
-                }
-                if (pixels.length != firstPixelBytes) {
-                    throw new IOException(
-                        "Compute tile " + t.coordinate().id()
-                        + " pixel size " + pixels.length
-                        + " differs from first tile " + firstPixelBytes
-                    );
-                }
-
                 int localXPx = (int) Math.round(
                     (t.coordinate().xMin() - outputXMin) / pixelNative
                 );
                 int localYPx = (int) Math.round(
                     (outputYMax - t.coordinate().yMax()) / pixelNative
                 );
-                if (localXPx < 0 || localYPx < 0
-                    || localXPx + computeTileSize > outputTileSize
-                    || localYPx + computeTileSize > outputTileSize) {
+                if (localXPx % computeTileSize != 0
+                    || localYPx % computeTileSize != 0) {
                     throw new IOException(
                         "Compute tile " + t.coordinate().id()
                         + " (origin " + localXPx + "," + localYPx
-                        + ") falls outside output tile " + key
-                        + " (size " + outputTileSize + "px)"
+                        + " px within output tile " + key + ") is not"
+                        + " block-aligned to computeTileSize=" + computeTileSize
                     );
                 }
-
-                int tileRowBytes = computeTileSize * bytesPerPixelTotal;
-                for (int dy = 0; dy < computeTileSize; dy++) {
-                    int srcOff = dy * tileRowBytes;
-                    int dstOff = (localYPx + dy) * outputRowBytes
-                        + localXPx * bytesPerPixelTotal;
-                    System.arraycopy(pixels, srcOff, assembled, dstOff, tileRowBytes);
+                int tx = localXPx / computeTileSize;
+                int ty = localYPx / computeTileSize;
+                if (tx < 0 || ty < 0 || tx >= tilesAcross || ty >= tilesDown) {
+                    throw new IOException(
+                        "Compute tile " + t.coordinate().id()
+                        + " (block " + tx + "," + ty + ") falls outside"
+                        + " output tile " + key
+                        + " (" + tilesAcross + "x" + tilesDown + " blocks)"
+                    );
                 }
+                tilePixels.set(
+                    ty * tilesAcross + tx,
+                    CogTranscoder.extractPixelsFromTiff(t.imageBytes())
+                );
                 computeTilesAssembled.inc();
             }
 
-            byte[] cog = CogTranscoder.transcodeFromAssembledPixels(
-                assembled,
+            byte[] cog = CogTranscoder.transcodeFromTileBlocks(
+                tilePixels,
                 outputTileSize, outputTileSize,
                 computeTileSize,
                 sourceTiff,
@@ -238,23 +228,20 @@ public final class AssembledCogWriter
             );
 
             String filename = key.filename();
+            String destination;
             if (outputPath.startsWith("gs://")) {
-                writeToGcs(filename, cog);
-                LOG.info(
-                    "Wrote output tile {} ({} compute tiles, {} bytes) to gs://{}",
-                    key, computeTiles.size(), cog.length, filename
-                );
+                destination = writeToGcs(filename, cog);
             } else {
-                writeToLocal(filename, cog);
-                LOG.info(
-                    "Wrote output tile {} ({} compute tiles, {} bytes) to {}",
-                    key, computeTiles.size(), cog.length, filename
-                );
+                destination = writeToLocal(filename, cog);
             }
+            LOG.info(
+                "Wrote output tile {} ({} compute tiles, {} bytes) to {}",
+                key, computeTiles.size(), cog.length, destination
+            );
             outputTilesWritten.inc();
         }
 
-        private void writeToGcs(String filename, byte[] data) {
+        private String writeToGcs(String filename, byte[] data) {
             URI gcsUri = URI.create(outputPath);
             String bucket = gcsUri.getHost();
             String prefix = gcsUri.getPath().replaceAll("^/+|/+$", "");
@@ -264,18 +251,15 @@ public final class AssembledCogWriter
                 .setContentType("image/tiff")
                 .build();
             storage.create(blobInfo, data);
+            return "gs://" + bucket + "/" + blobName;
         }
 
-        private void writeToLocal(String filename, byte[] data) throws IOException {
+        private String writeToLocal(String filename, byte[] data) throws IOException {
             Path outDir = Path.of(outputPath);
             Files.createDirectories(outDir);
             Path dest = outDir.resolve(filename);
             Files.write(dest, data);
+            return dest.toString();
         }
-    }
-
-    /** Helper for extracting pixel size + bbox from a single FetchedTile. */
-    static double inferPixelSize(TileCoordinate coord, int tileSize) {
-        return (coord.xMax() - coord.xMin()) / tileSize;
     }
 }

@@ -75,7 +75,7 @@ def test_dataflow_mode_requires_dataflow_config() -> None:
 def test_cog_defaults_are_sensible() -> None:
     cog = CogParameters()
     assert cog.blocksize == 512
-    assert cog.compress == "lzw"
+    assert cog.compress == "deflate"
     assert 2 in cog.overview_levels
 
 
@@ -213,3 +213,78 @@ def test_rate_limit_custom() -> None:
 def test_rate_limit_invalid_zero() -> None:
     with pytest.raises(ValidationError):
         RateLimitConfig(max_qps=0)
+
+
+# ---------------------------------------------------------------------------
+# expected_output_tile_count: M6 two-tier accounting
+# ---------------------------------------------------------------------------
+
+
+def _config_with_tiles(
+    tiles: list[TileCoordinate], output_tile_size: int | None = None
+) -> PipelineConfig:
+    return PipelineConfig(
+        ee_expression='{"result":"0","values":{}}',
+        gee_project="my-gcp-project",
+        tile_grid=TileGrid(
+            crs="EPSG:4326",
+            scale_meters=30.0,
+            tile_size_pixels=64,
+            tiles=tiles,
+        ),
+        output=OutputConfig(
+            output_path="gs://b/p", output_tile_size_pixels=output_tile_size
+        ),
+    )
+
+
+def test_expected_output_tile_count_defaults_to_compute_tile_count() -> None:
+    tiles = [
+        TileCoordinate(x_min=i, y_min=0, x_max=i + 1, y_max=1, row=0, col=i)
+        for i in range(5)
+    ]
+    config = _config_with_tiles(tiles)
+    assert config.expected_output_tile_count == 5
+    assert config.expected_output_tile_count == config.tile_count
+
+
+def test_expected_output_tile_count_groups_by_out_row_out_col() -> None:
+    # 4 compute tiles, all sharing (out_row=0, out_col=0): one output tile.
+    tiles = [
+        TileCoordinate(
+            x_min=i, y_min=0, x_max=i + 1, y_max=1,
+            row=0, col=i, out_row=0, out_col=0,
+        )
+        for i in range(4)
+    ]
+    config = _config_with_tiles(tiles, output_tile_size=128)  # 2x compute tile
+    assert config.tile_count == 4
+    assert config.expected_output_tile_count == 1
+
+
+def test_expected_output_tile_count_distinct_groups() -> None:
+    # 8 compute tiles split across two (out_row, out_col) groups.
+    tiles = []
+    for out_col in range(2):
+        for i in range(4):
+            tiles.append(TileCoordinate(
+                x_min=out_col * 4 + i, y_min=0,
+                x_max=out_col * 4 + i + 1, y_max=1,
+                row=0, col=out_col * 4 + i, out_row=0, out_col=out_col,
+            ))
+    config = _config_with_tiles(tiles, output_tile_size=128)
+    assert config.tile_count == 8
+    assert config.expected_output_tile_count == 2
+
+
+def test_expected_output_tile_count_external_tiles_file() -> None:
+    config = PipelineConfig(
+        ee_expression='{"result":"0","values":{}}',
+        gee_project="p",
+        tile_grid=TileGrid(
+            crs="EPSG:4326", scale_meters=30.0,
+            tiles_file="gs://b/tiles.ndjson",
+        ),
+        output=OutputConfig(output_path="gs://b/p"),
+    )
+    assert config.expected_output_tile_count == 0

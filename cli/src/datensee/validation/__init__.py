@@ -48,7 +48,6 @@ def validate_output(
         ValidationReport with per-check results.
     """
     from datensee.validation.assembly import (
-        check_e05_vrt_completeness,
         check_e08_failure_accounting,
         check_e10_size_plausibility,
     )
@@ -56,7 +55,6 @@ def validate_output(
     from datensee.validation.spatial import (
         check_e03_tile_geospatial_metadata,
         check_e04_boundary_continuity,
-        check_e06_vrt_spatial_correctness,
     )
     from datensee.validation.tile_integrity import (
         check_e01_tile_file_integrity,
@@ -88,8 +86,6 @@ def validate_output(
         CheckID.E02: lambda: check_e02_tile_dimensions(output, config, sampled),
         CheckID.E03: lambda: check_e03_tile_geospatial_metadata(output, config, sampled),
         CheckID.E04: lambda: check_e04_boundary_continuity(output, config, sampled),
-        CheckID.E05: lambda: check_e05_vrt_completeness(output, config),
-        CheckID.E06: lambda: check_e06_vrt_spatial_correctness(output, config),
         CheckID.E07: _run_e07,
         CheckID.E08: lambda: check_e08_failure_accounting(output, config),
         CheckID.E09: lambda: check_e09_pixel_range_sanity(output, config, sampled),

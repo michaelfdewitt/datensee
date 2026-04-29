@@ -8,7 +8,6 @@ import com.datensee.io.AssembledCogWriter;
 import com.datensee.io.CogWriter;
 import com.datensee.io.FailedTileWriter;
 import com.datensee.io.TileCoordinateParser;
-import com.datensee.io.VrtAssembler;
 import com.datensee.options.DatensEEOptions;
 import com.google.auth.oauth2.AccessToken;
 import com.google.auth.oauth2.GoogleCredentials;
@@ -17,7 +16,6 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -118,17 +116,9 @@ public final class DatensEEPipeline {
         PCollection<FailedTileRecord> failed = fetchResult.get(TileFetchDoFn.FAILED_TAG);
 
         // --- Write successful tiles as COGs ---
-        // Default: deflate (zlib). Our hand-rolled LZW encoder in
-        // CogTranscoder produces output that strict TIFF-LZW decoders
-        // (GDAL, imagecodecs, EE's loader) reject with "Corrupted tile:
-        // failed to decompress using scheme LZW". Until the LZW encoder
-        // is rewritten against a canonical test vector, keep the default
-        // at deflate — it's a java.util.zip.Deflater pass-through so
-        // there's nothing to get wrong. Explicit `compress: "lzw"` still
-        // works for callers that want to experiment.
-        String compression = config.output().cog() != null
-            && config.output().cog().compress() != null
-            ? config.output().cog().compress() : "deflate";
+        // Compression is deflate (zlib via java.util.zip) by default; "none"
+        // is also accepted. Anything else fails inside the transcoder.
+        String compression = config.output().effectiveCompression();
 
         // M6 routing: when output_tile_size_pixels is set and larger
         // than the compute tile size, group compute tiles by output tile
@@ -161,22 +151,6 @@ public final class DatensEEPipeline {
                 .to(failuresPath)
                 .withoutSharding()
                 .withSuffix(".json"));
-
-        // --- VRT assembly ---
-        // VRT references the actual on-disk files. In two-tier mode,
-        // those are output tiles (tile size = outputTileSize); otherwise
-        // they're compute tiles (tile size = tileSize).
-        fetched.apply(
-            "AssembleVrt",
-            new VrtAssembler(
-                config.output().outputPath(),
-                crs,
-                config.output().effectiveBandCount(),
-                config.output().effectiveDataType(),
-                outputTileSize,
-                twoTier
-            )
-        );
 
         var result = pipeline.run();
 
@@ -271,20 +245,6 @@ public final class DatensEEPipeline {
                     "Installed caller-supplied access token from --userTokenFd={} as pipeline GCP credential (quotaProject={}).",
                     fd, quotaProject
                 );
-                try {
-                    Map<String, List<String>> md =
-                        credentials.getRequestMetadata(URI.create("https://dataflow.googleapis.com/"));
-                    List<String> redacted = new ArrayList<>(md.keySet());
-                    Collections.sort(redacted);
-                    List<String> userProj = md.get("x-goog-user-project");
-                    LOG.info(
-                        "Credential request metadata header keys={}, x-goog-user-project={}",
-                        redacted,
-                        userProj != null ? userProj : "(absent)"
-                    );
-                } catch (IOException mdEx) {
-                    LOG.warn("Failed to dump credential request metadata: {}", mdEx.toString());
-                }
             } finally {
                 // String contents are immutable in the JVM, so we can't zero
                 // `token`; we just drop the local ref and let GC reclaim it.

@@ -88,7 +88,7 @@ class CogParameters(BaseModel):
 
     overview_levels: list[int] = Field(default=[2, 4, 8, 16, 32])
     blocksize: int = Field(default=512, gt=0)
-    compress: Literal["lzw", "deflate", "zstd", "none"] = "lzw"
+    compress: Literal["deflate", "none"] = "deflate"
     predictor: Literal[1, 2, 3] = Field(
         default=2,
         description="1=none, 2=horizontal (int), 3=floating-point",
@@ -230,6 +230,20 @@ class PipelineConfig(BaseModel):
     def effective_output_tile_size_pixels(self) -> int:
         """Output COG edge length: either the configured value or the compute tile size."""
         return self.output.output_tile_size_pixels or self.tile_grid.tile_size_pixels
+
+    @property
+    def expected_output_tile_count(self) -> int:
+        """Number of output COG files the pipeline will produce.
+
+        Equal to the compute tile count except in M6 two-tier mode, where
+        compute tiles are grouped by ``(out_row, out_col)`` and one COG is
+        written per group. Zero when tiles are externalized to a file.
+        """
+        if self.tile_grid.tiles is None:
+            return 0
+        if self.output.output_tile_size_pixels is None:
+            return self.tile_count
+        return len({(t.out_row, t.out_col) for t in self.tile_grid.tiles})
 
     def write_json(self, path: Path) -> None:
         """Serialize config to JSON file for handoff to the Java pipeline."""

@@ -33,7 +33,7 @@ assert report.all_passed
 
 ## Sampling
 
-Most checks don't need every tile. The default strategy is **stratified** (4 corners + random edges + random interior, N=20, seed=42 for reproducibility). Checks E01, E05, E08 always run on ALL tiles since they're just file existence / XML inspection.
+Most checks don't need every tile. The default strategy is **stratified** (4 corners + random edges + random interior, N=20, seed=42 for reproducibility). Checks E01 and E08 always run on ALL tiles since they're file-existence inspections.
 
 Strategies: `all`, `stratified` (default), `random`.
 
@@ -84,25 +84,13 @@ Adjacent tiles' shared edge pixels form a smooth continuation. Reads the last co
 | **Catches** | Tile misalignment, off-by-one pixel shifts, grid origin bugs |
 | **Requires** | `rasterio` |
 
-### E05 — VRT Completeness
-
-`mosaic.vrt` exists, parses as valid XML, references every tile in the config, has the correct band count, data type, and raster dimensions.
-
-| | |
-|---|---|
-| **Runs on** | All tiles (VRT XML parsing only) |
-| **Pass criteria** | All tiles referenced, metadata matches config |
-| **Catches** | VRT generation bugs, missing tiles in mosaic |
-
-### E06 — VRT Spatial Correctness
-
-VRT bounding box (from GeoTransform + raster dimensions) covers the full extent of the tile grid.
-
-| | |
-|---|---|
-| **Runs on** | VRT + config |
-| **Pass criteria** | VRT bbox covers grid extent (half-pixel tolerance) |
-| **Catches** | GeoTransform errors, wrong raster dimensions |
+<!--
+  E05 (VRT Completeness) and E06 (VRT Spatial Correctness) were removed
+  when the pipeline stopped producing a VRT manifest. The check IDs are
+  retired — output COGs are self-describing via standard GeoTIFF tags,
+  so the per-tile checks (E01–E04) are now the spatial-correctness
+  surface.
+-->
 
 ### E08 — Failure Accounting
 

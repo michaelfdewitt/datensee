@@ -101,13 +101,15 @@ instead of waiting on a VM provisioner.
 
 ## The output: Cloud Optimized GeoTIFF
 
-For each tile, the pipeline writes a Cloud Optimized GeoTIFF directly to
-GCS, plus a `.vrt` mosaic manifest stitching the tiles into a single
-virtual raster. COG was the right choice because it's the format Earth
-Engine itself can read back via `ee.Image.loadGeoTIFF()` — closing the
-loop. You can export, post-process locally, and feed the result back
-into Earth Engine for a follow-up analysis without ever materializing
-the data into a different format.
+For each output tile, the pipeline writes a Cloud Optimized GeoTIFF
+directly to GCS. COG was the right choice because it's the format
+Earth Engine itself can read back via `ee.Image.loadGeoTIFF()` —
+closing the loop. You can export, post-process locally, and feed the
+result back into Earth Engine for a follow-up analysis without ever
+materializing the data into a different format. There's no manifest
+file: COGs are self-describing GeoTIFFs that any modern GIS reads
+directly. Want one giant COG instead of many? Set
+`output_tile_size_pixels` large enough to cover your region.
 
 ## Costs and quotas
 

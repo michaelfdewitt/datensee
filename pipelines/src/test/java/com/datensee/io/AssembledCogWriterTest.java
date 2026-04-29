@@ -7,14 +7,13 @@ import com.datensee.FetchedTile;
 import com.datensee.OutputTileKey;
 import com.datensee.TileCoordinate;
 import java.io.ByteArrayOutputStream;
-import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.values.KV;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -28,11 +27,12 @@ import org.junit.jupiter.api.io.TempDir;
  * mis-keying or off-by-one in the assembly path surfaces as a wrong
  * pixel at a deterministic location, not just a numerical mismatch.
  *
- * <p>The assembler is exercised by invoking the inner DoFn directly via
- * reflection rather than running a Beam pipeline; tests stay fast and
- * self-contained, and the assembled COG bytes are decoded with the
- * same independent {@code TestTiffReader}-style logic used by
- * {@link CogTranscoderTest} so writer bugs cannot self-mask.
+ * <p>The assembler is exercised by invoking the inner DoFn's
+ * package-private {@code process(KV)} method directly rather than
+ * running a Beam pipeline; tests stay fast and self-contained, and the
+ * assembled COG bytes are decoded with the same independent
+ * {@code TestTiffReader}-style logic used by {@link CogTranscoderTest}
+ * so writer bugs cannot self-mask.
  */
 class AssembledCogWriterTest {
 
@@ -105,19 +105,21 @@ class AssembledCogWriterTest {
         }
         assertEquals(totalTiles, computeTiles.size());
 
-        // Run the assembler DoFn directly.
+        // Run the assembler DoFn directly via its package-private process()
+        // method, skipping the Beam harness.
         AssembledCogWriter.AssembleAndWriteDoFn doFn =
             new AssembledCogWriter.AssembleAndWriteDoFn(
                 tempDir.toString(), innerSize, outerSize, "deflate"
             );
-        invokeProcessElement(doFn, new OutputTileKey(0, 0), computeTiles);
+        doFn.setup();
+        doFn.process(KV.of(new OutputTileKey(0, 0), computeTiles));
 
         // The assembled COG should be at tempDir/tile_r0000_c0000.tif.
         Path cogPath = tempDir.resolve("tile_r0000_c0000.tif");
         byte[] cogBytes = Files.readAllBytes(cogPath);
 
         // Decode and assert pixel-perfect reconstruction.
-        byte[] decoded = decodeAssembledCog(cogBytes, outerSize, outerSize, innerSize);
+        byte[] decoded = TestTiffReader.decodeCogPixels(cogBytes);
         assertArrayEquals(
             expectedPixels, decoded,
             "Assembled 256x256 COG must round-trip every pixel "
@@ -167,48 +169,17 @@ class AssembledCogWriterTest {
             new AssembledCogWriter.AssembleAndWriteDoFn(
                 tempDir.toString(), innerSize, outerSize, "deflate"
             );
-        invokeProcessElement(doFn, new OutputTileKey(0, 0), tiles);
+        doFn.setup();
+        doFn.process(KV.of(new OutputTileKey(0, 0), tiles));
 
         byte[] cogBytes = Files.readAllBytes(tempDir.resolve("tile_r0000_c0000.tif"));
-        byte[] decoded = decodeAssembledCog(cogBytes, outerSize, outerSize, innerSize);
+        byte[] decoded = TestTiffReader.decodeCogPixels(cogBytes);
         assertArrayEquals(expectedPixels, decoded);
     }
 
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
-
-    /**
-     * Invoke a DoFn's @ProcessElement method directly, bypassing Beam's
-     * harness. Since this DoFn doesn't use OutputReceiver / windowing /
-     * timers / state, a reflective call with a synthetic KV input is
-     * sufficient for a unit test.
-     */
-    @SuppressWarnings("unchecked")
-    private static void invokeProcessElement(
-        DoFn<?, ?> doFn,
-        OutputTileKey key,
-        Iterable<FetchedTile> tiles
-    ) throws Exception {
-        // Trigger @Setup so transient fields are initialized.
-        for (Method m : doFn.getClass().getDeclaredMethods()) {
-            if (m.isAnnotationPresent(DoFn.Setup.class)) {
-                m.setAccessible(true);
-                m.invoke(doFn);
-                break;
-            }
-        }
-        org.apache.beam.sdk.values.KV<OutputTileKey, Iterable<FetchedTile>> kv =
-            org.apache.beam.sdk.values.KV.of(key, tiles);
-        for (Method m : doFn.getClass().getDeclaredMethods()) {
-            if (m.isAnnotationPresent(DoFn.ProcessElement.class)) {
-                m.setAccessible(true);
-                m.invoke(doFn, kv);
-                return;
-            }
-        }
-        throw new IllegalStateException("No @ProcessElement method on " + doFn.getClass());
-    }
 
     /**
      * Build a minimal strip-layout uint8 single-band GeoTIFF with
@@ -303,105 +274,5 @@ class AssembledCogWriterTest {
         buf.putShort((short) 12);  // DOUBLE
         buf.putInt(count);
         buf.putInt(offset);
-    }
-
-    /**
-     * Decode a multi-block COG of known dimensions back into row-major
-     * pixel bytes, independent of CogTranscoder's own decoder. Mirrors
-     * the test reader in {@link CogTranscoderTest}.
-     */
-    private static byte[] decodeAssembledCog(
-        byte[] cog, int width, int height, int innerSize
-    ) throws Exception {
-        ByteBuffer buf = ByteBuffer.wrap(cog).order(ByteOrder.LITTLE_ENDIAN);
-        int ifdOffset = buf.getInt(4);
-        buf.position(ifdOffset);
-        int entryCount = Short.toUnsignedInt(buf.getShort());
-
-        long[] tileOffsets = null;
-        long[] tileByteCounts = null;
-        int compression = 1;
-        int predictor = 1;
-
-        for (int i = 0; i < entryCount; i++) {
-            int tag = Short.toUnsignedInt(buf.getShort());
-            int type = Short.toUnsignedInt(buf.getShort());
-            int count = buf.getInt();
-            int valuePos = buf.position();
-            if (tag == 324 || tag == 325) {
-                int total = count * 4;  // LONG
-                int dataStart = total <= 4 ? valuePos
-                    : ByteBuffer.wrap(cog).order(ByteOrder.LITTLE_ENDIAN).getInt(valuePos);
-                ByteBuffer db = ByteBuffer.wrap(cog).order(ByteOrder.LITTLE_ENDIAN);
-                db.position(dataStart);
-                long[] arr = new long[count];
-                for (int j = 0; j < count; j++) {
-                    arr[j] = Integer.toUnsignedLong(db.getInt());
-                }
-                if (tag == 324) {
-                    tileOffsets = arr;
-                } else {
-                    tileByteCounts = arr;
-                }
-            } else if (tag == 259) {
-                compression = Short.toUnsignedInt(ByteBuffer.wrap(cog)
-                    .order(ByteOrder.LITTLE_ENDIAN).getShort(valuePos));
-            } else if (tag == 317) {
-                predictor = Short.toUnsignedInt(ByteBuffer.wrap(cog)
-                    .order(ByteOrder.LITTLE_ENDIAN).getShort(valuePos));
-            }
-            buf.position(valuePos + 4);
-        }
-
-        int tilesAcross = width / innerSize;
-        int tilesDown = height / innerSize;
-        int tileBytes = innerSize * innerSize;  // uint8 single band
-        byte[] full = new byte[width * height];
-
-        for (int ty = 0; ty < tilesDown; ty++) {
-            for (int tx = 0; tx < tilesAcross; tx++) {
-                int idx = ty * tilesAcross + tx;
-                int off = (int) tileOffsets[idx];
-                int len = (int) tileByteCounts[idx];
-                byte[] compressed = new byte[len];
-                System.arraycopy(cog, off, compressed, 0, len);
-
-                byte[] block;
-                if (compression == 1) {
-                    block = compressed;
-                } else if (compression == 8 || compression == 32946) {
-                    java.util.zip.Inflater inflater = new java.util.zip.Inflater();
-                    inflater.setInput(compressed);
-                    ByteArrayOutputStream o = new ByteArrayOutputStream(tileBytes);
-                    byte[] tmp = new byte[8192];
-                    while (!inflater.finished()) {
-                        int n = inflater.inflate(tmp);
-                        if (n == 0 && inflater.needsInput()) {
-                            break;
-                        }
-                        o.write(tmp, 0, n);
-                    }
-                    inflater.end();
-                    block = o.toByteArray();
-                } else {
-                    throw new RuntimeException("unsupported compression " + compression);
-                }
-                if (predictor == 2) {
-                    for (int y = 0; y < innerSize; y++) {
-                        int rowStart = y * innerSize;
-                        for (int x = 1; x < innerSize; x++) {
-                            block[rowStart + x] = (byte) (block[rowStart + x] + block[rowStart + x - 1]);
-                        }
-                    }
-                }
-
-                for (int dy = 0; dy < innerSize; dy++) {
-                    int dstOff = (ty * innerSize + dy) * width + tx * innerSize;
-                    int srcOff = dy * innerSize;
-                    System.arraycopy(block, srcOff, full, dstOff, innerSize);
-                }
-            }
-        }
-        return full;
     }
 }

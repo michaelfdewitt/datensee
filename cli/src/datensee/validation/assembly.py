@@ -1,6 +1,5 @@
-"""Assembly and accounting checks — E05, E08, E10.
+"""Assembly and accounting checks — E08, E10.
 
-E05: VRT references every tile with correct band count/type/dimensions.
 E08: tiles_on_disk + tiles_in_failures == tiles_in_config.
 E10: Total output size within 0.2x–5x of raw (uncompressed) prediction.
 """
@@ -9,14 +8,11 @@ from __future__ import annotations
 
 import json
 import re
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from datensee.assemble import _vrt_data_type
 from datensee.config import PipelineConfig
 from datensee.validation.catalog import CheckID
 from datensee.validation.report import CheckResult, CheckStatus
-from datensee.validation.tile_integrity import tile_filename
 
 # Regex to extract (row, col) from tile filenames like tile_r0003_c0012.tif
 _TILE_FILENAME_RE = re.compile(r"^tile_r(\d{4})_c(\d{4})\.tif$")
@@ -101,105 +97,6 @@ def check_e08_failure_accounting(
             "on_disk": len(on_disk),
             "in_failures": len(in_failures),
             "in_config": len(expected),
-        },
-    )
-
-
-# ---------------------------------------------------------------------------
-# E05: VRT Completeness
-# ---------------------------------------------------------------------------
-
-
-def check_e05_vrt_completeness(
-    output_dir: Path,
-    config: PipelineConfig,
-) -> CheckResult:
-    """E05: Verify mosaic.vrt references every tile with correct metadata.
-
-    Checks:
-    - VRT file exists and parses as XML.
-    - Every tile in config is referenced as a SimpleSource.
-    - Band count matches config.
-    - DataType matches config.
-    - Raster dimensions match (n_cols * tile_px, n_rows * tile_px).
-    """
-    vrt_path = output_dir / "mosaic.vrt"
-    if not vrt_path.exists():
-        return CheckResult(
-            check_id=CheckID.E05,
-            status=CheckStatus.FAILED,
-            message="mosaic.vrt not found in output directory",
-        )
-
-    try:
-        tree = ET.parse(vrt_path)
-    except ET.ParseError as exc:
-        return CheckResult(
-            check_id=CheckID.E05,
-            status=CheckStatus.FAILED,
-            message=f"mosaic.vrt is not valid XML: {exc}",
-        )
-
-    root = tree.getroot()
-    issues: list[str] = []
-
-    # Collect all referenced tile filenames from SimpleSource elements
-    referenced: set[str] = set()
-    for src_filename in root.iter("SourceFilename"):
-        if src_filename.text:
-            referenced.add(src_filename.text.strip())
-
-    # Check every config tile is referenced
-    tiles = config.tile_grid.tiles or []
-    expected_names = {tile_filename(t) for t in tiles}
-    missing = expected_names - referenced
-    if missing:
-        issues.append(f"{len(missing)} tiles not referenced in VRT")
-
-    # Band count: count VRTRasterBand elements
-    vrt_bands = root.findall("VRTRasterBand")
-    expected_bands = config.output.band_count
-    if len(vrt_bands) != expected_bands:
-        issues.append(f"VRT has {len(vrt_bands)} bands, expected {expected_bands}")
-
-    # DataType
-    expected_dtype = _vrt_data_type(config.output.data_type)
-    for band_el in vrt_bands:
-        dt = band_el.get("dataType", "")
-        if dt != expected_dtype:
-            issues.append(f"VRT band dataType '{dt}' != expected '{expected_dtype}'")
-            break
-
-    # Raster dimensions
-    tile_px = config.tile_grid.tile_size_pixels
-    if tiles:
-        max_row = max(t.row for t in tiles)
-        max_col = max(t.col for t in tiles)
-        expected_x = (max_col + 1) * tile_px
-        expected_y = (max_row + 1) * tile_px
-
-        vrt_x = int(root.get("rasterXSize", "0"))
-        vrt_y = int(root.get("rasterYSize", "0"))
-        if vrt_x != expected_x or vrt_y != expected_y:
-            issues.append(f"VRT dimensions {vrt_x}x{vrt_y} != expected {expected_x}x{expected_y}")
-
-    if not issues:
-        return CheckResult(
-            check_id=CheckID.E05,
-            status=CheckStatus.PASSED,
-            message=(
-                f"VRT references all {len(expected_names)} tiles, "
-                f"{expected_bands} band(s), {expected_dtype}"
-            ),
-        )
-
-    return CheckResult(
-        check_id=CheckID.E05,
-        status=CheckStatus.FAILED,
-        message="; ".join(issues),
-        details={
-            "missing_tiles": sorted(missing)[:10] if missing else [],
-            "issues": issues,
         },
     )
 

@@ -40,10 +40,9 @@ A CLI + Python library that lets Google Earth Engine users run image exports at 
 3. **Java Beam pipeline does:**
    - Receives tile coordinates as input PCollection
    - Each worker fetches its tiles via EE High Volume API (parallel, rate-limited, with retries)
-   - Transcodes each tile to COG (internal tiling + LZW compression) via pure-Java TIFF rewriter
-   - Writes COG tiles to GCS or local filesystem
-   - Assembles a VRT mosaic manifest referencing all tiles
-4. **Post-processing (optional):** GDAL translate for format conversion (separate step)
+   - Transcodes each tile to COG (internal tiling + deflate compression) via pure-Java TIFF rewriter
+   - Writes COG tiles to GCS or local filesystem (one COG per output tile; M6 two-tier mode controls granularity via `output_tile_size_pixels`)
+4. **Post-processing (optional):** none required — output COGs are self-describing GeoTIFFs that any modern GIS tool reads directly. No VRT, no XML manifest.
 
 ### Python Side (`/cli`)
 - **Framework:** Typer (CLI) + Pydantic (config validation)
@@ -185,7 +184,7 @@ These are the areas where the real complexity lives:
 
 2. **Tiling strategy.** Naive regular grids waste requests in sparse regions and can hit memory limits in dense ones. Adaptive tiling (quadtree decomposition based on data density or complexity) is a future optimization but adds significant complexity. Start with regular grids.
 
-3. **Raster assembly at scale.** Stitching thousands of tiles into a single COG that's terabytes in size is non-trivial. May need to output tile-pyramid COGs or multiple files with a VRT manifest. GDAL's COG driver handles this but needs memory management.
+3. **Raster assembly at scale.** Stitching thousands of tiles into a single COG that's terabytes in size is non-trivial. The current shape: M6 two-tier tiling (`output_tile_size_pixels`) lets users dial output granularity from "one COG per fetch" up to "one COG per region" without ever generating a manifest file. No VRT, no XML — output COGs are self-describing.
 
 4. **Auth propagation.** EE auth tokens need to reach every Dataflow worker. Beam's credential propagation works for GCP services but EE auth is separate. May need to pass refresh tokens via pipeline options or use workload identity federation.
 
@@ -208,7 +207,7 @@ These are the areas where the real complexity lives:
 
 1. **M1: Proof of Life** ✅ — CLI takes a hardcoded NDVI expression + small region, tiles it, submits to Dataflow, fetches tiles via HV API, writes a single GeoTIFF to GCS.
 2. **M2: Real Config** ✅ — Pipeline config schema defined. CLI accepts arbitrary EE expressions, regions, scales. Local runner works for small jobs.
-3. **M3: Scale** ✅ — Partial failure tolerance, per-worker rate limiting, smart retry classification, file-based tile input, VRT assembly.
+3. **M3: Scale** ✅ — Partial failure tolerance, per-worker rate limiting, smart retry classification, file-based tile input.
 4. **M4: UX Polish** ✅ — Rich progress bar (local mode), cost estimation (EECU range, Dataflow USD, storage), summary panels, confirmation for large jobs, enhanced Dataflow status polling with metrics.
 5. **M5: Distribution** ✅ — `pip install datensee`, smart JAR discovery, `datensee jar` subcommands (download/build/path), Apache 2.0 license, full PyPI metadata.
 6. **Notebook Integration** ✅ — Public Python API (`api.py`), Colab/Jupyter auto-auth, HTML display adapters (job progress, cost estimate, tile grid, tile preview), quickstart notebook, `notebook`/`all` optional dependency groups.

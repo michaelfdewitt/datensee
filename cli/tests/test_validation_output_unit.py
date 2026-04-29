@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,7 +16,6 @@ from datensee.config import (
     TileGrid,
 )
 from datensee.validation.assembly import (
-    check_e05_vrt_completeness,
     check_e08_failure_accounting,
     check_e10_size_plausibility,
 )
@@ -89,8 +87,10 @@ def _write_fake_tiff(path: Path, size_bytes: int = 2048) -> None:
 
 
 class TestCatalog:
-    def test_list_evals_returns_all_ten(self) -> None:
-        assert len(list_checks()) == 10
+    def test_list_evals_returns_all_eight(self) -> None:
+        # E05 / E06 (VRT-related) were removed when the pipeline stopped
+        # producing a VRT manifest.
+        assert len(list_checks()) == 8
 
     def test_zero_cost_excludes_e07(self) -> None:
         zero = zero_cost_checks()
@@ -616,149 +616,6 @@ class TestE04BoundaryContinuity:
 
         result = check_e04_boundary_continuity(tmp_path, config, tiles)
         assert result.status == CheckStatus.SKIPPED
-
-
-# ---------------------------------------------------------------------------
-# E05: VRT Completeness
-# ---------------------------------------------------------------------------
-
-
-def _write_vrt(
-    output_dir: Path,
-    tiles: list[TileCoordinate],
-    *,
-    tile_px: int = 64,
-    band_count: int = 1,
-    data_type: str = "Float32",
-    extra_tiles: list[str] | None = None,
-    omit_tiles: set[str] | None = None,
-) -> Path:
-    """Write a synthetic mosaic.vrt for testing."""
-    max_row = max(t.row for t in tiles) if tiles else 0
-    max_col = max(t.col for t in tiles) if tiles else 0
-    raster_x = (max_col + 1) * tile_px
-    raster_y = (max_row + 1) * tile_px
-
-    root = ET.Element("VRTDataset", rasterXSize=str(raster_x), rasterYSize=str(raster_y))
-
-    all_x_min = min(t.x_min for t in tiles) if tiles else 0
-    all_y_max = max(t.y_max for t in tiles) if tiles else 1
-    all_x_max = max(t.x_max for t in tiles) if tiles else 1
-    all_y_min = min(t.y_min for t in tiles) if tiles else 0
-    pixel_w = (all_x_max - all_x_min) / raster_x if raster_x else 1
-    pixel_h = (all_y_max - all_y_min) / raster_y if raster_y else 1
-
-    ET.SubElement(root, "SRS").text = "EPSG:4326"
-    ET.SubElement(
-        root, "GeoTransform"
-    ).text = f"{all_x_min}, {pixel_w}, 0, {all_y_max}, 0, -{pixel_h}"
-
-    omit = omit_tiles or set()
-
-    for band_idx in range(1, band_count + 1):
-        band_el = ET.SubElement(root, "VRTRasterBand", dataType=data_type, band=str(band_idx))
-        for tile in tiles:
-            name = tile_filename(tile)
-            if name in omit:
-                continue
-            src = ET.SubElement(band_el, "SimpleSource")
-            ET.SubElement(src, "SourceFilename", relativeToVRT="1").text = name
-
-    tree = ET.ElementTree(root)
-    ET.indent(tree, space="  ")
-    vrt_path = output_dir / "mosaic.vrt"
-    tree.write(vrt_path, xml_declaration=True, encoding="UTF-8")
-    return vrt_path
-
-
-class TestE05VrtCompleteness:
-    def test_complete_vrt(self, tmp_path: Path) -> None:
-        tiles = _make_tiles(2, 2)
-        config = _make_config(tiles)
-        _write_vrt(tmp_path, tiles)
-
-        result = check_e05_vrt_completeness(tmp_path, config)
-        assert result.status == CheckStatus.PASSED
-
-    def test_missing_tile_in_vrt(self, tmp_path: Path) -> None:
-        tiles = _make_tiles(2, 2)
-        config = _make_config(tiles)
-        _write_vrt(tmp_path, tiles, omit_tiles={tile_filename(tiles[0])})
-
-        result = check_e05_vrt_completeness(tmp_path, config)
-        assert result.status == CheckStatus.FAILED
-        assert "not referenced" in result.message
-
-    def test_wrong_band_count(self, tmp_path: Path) -> None:
-        tiles = _make_tiles(1, 1)
-        config = _make_config(tiles, band_count=3)
-        _write_vrt(tmp_path, tiles, band_count=1)  # VRT has 1 band, config says 3
-
-        result = check_e05_vrt_completeness(tmp_path, config)
-        assert result.status == CheckStatus.FAILED
-        assert "bands" in result.message
-
-    def test_wrong_data_type(self, tmp_path: Path) -> None:
-        tiles = _make_tiles(1, 1)
-        config = _make_config(tiles, data_type="int16")
-        _write_vrt(tmp_path, tiles, data_type="Float32")
-
-        result = check_e05_vrt_completeness(tmp_path, config)
-        assert result.status == CheckStatus.FAILED
-        assert "dataType" in result.message
-
-    def test_wrong_dimensions(self, tmp_path: Path) -> None:
-        tiles = _make_tiles(2, 2)
-        config = _make_config(tiles)
-        # Write VRT with wrong tile size (32 instead of 64)
-        _write_vrt(tmp_path, tiles, tile_px=32)
-
-        result = check_e05_vrt_completeness(tmp_path, config)
-        assert result.status == CheckStatus.FAILED
-        assert "dimensions" in result.message
-
-    def test_no_vrt_file(self, tmp_path: Path) -> None:
-        tiles = _make_tiles(1, 1)
-        config = _make_config(tiles)
-
-        result = check_e05_vrt_completeness(tmp_path, config)
-        assert result.status == CheckStatus.FAILED
-        assert "not found" in result.message
-
-    def test_multiband_vrt(self, tmp_path: Path) -> None:
-        tiles = _make_tiles(2, 2)
-        config = _make_config(tiles, band_count=3)
-        _write_vrt(tmp_path, tiles, band_count=3)
-
-        result = check_e05_vrt_completeness(tmp_path, config)
-        assert result.status == CheckStatus.PASSED
-
-
-# ---------------------------------------------------------------------------
-# E06: VRT Spatial Correctness
-# ---------------------------------------------------------------------------
-
-
-class TestE06VrtSpatialCorrectness:
-    def test_correct_bbox(self, tmp_path: Path) -> None:
-        from datensee.validation.spatial import check_e06_vrt_spatial_correctness
-
-        tiles = _make_tiles(2, 2)
-        config = _make_config(tiles)
-        _write_vrt(tmp_path, tiles)
-
-        result = check_e06_vrt_spatial_correctness(tmp_path, config)
-        assert result.status == CheckStatus.PASSED
-
-    def test_no_vrt(self, tmp_path: Path) -> None:
-        from datensee.validation.spatial import check_e06_vrt_spatial_correctness
-
-        tiles = _make_tiles(1, 1)
-        config = _make_config(tiles)
-
-        result = check_e06_vrt_spatial_correctness(tmp_path, config)
-        assert result.status == CheckStatus.FAILED
-        assert "not found" in result.message
 
 
 # ---------------------------------------------------------------------------
