@@ -123,6 +123,10 @@
         }
       }
     },
+    "snapshot_time": {
+      "type": "integer",
+      "description": "Unix nanos at which all asset references in ee_expression were pinned. Workers see a consistent view of mutable assets. Diagnostic only on the Java side — pinning is already baked into ee_expression by the CLI."
+    },
     "runner": {
       "type": "object",
       "additionalProperties": false,

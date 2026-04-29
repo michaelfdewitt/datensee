@@ -17,6 +17,7 @@ from datensee.config import TileCoordinate
 from datensee.retry import (
     DEFAULT_MAX_DEPTH,
     JOURNAL_REASON_DEPTH_CAP,
+    JOURNAL_REASON_SPLIT_DISABLED,
     JOURNAL_REASON_TERMINAL,
     JOURNAL_REASON_UNKNOWN_KIND,
     JournalParseError,
@@ -227,6 +228,27 @@ class TestPlanRetry:
         plan_retry([original])
         assert original == before
 
+    def test_allow_split_false_demotes_split_eligible_to_carryover(self) -> None:
+        # In non-M6 exports (one COG per compute tile), split children
+        # would clobber the parent's filename. plan_retry must refuse
+        # to split when allow_split is False.
+        records = [
+            _record(error_kind="MEMORY_EXCEEDED"),
+            _record(error_kind="COMPUTATION_TIMEOUT"),
+            _record(error_kind="RATE_LIMITED"),  # retry_same is still allowed
+        ]
+        plan = plan_retry(records, allow_split=False)
+        assert plan.stats.get("split", 0) == 0
+        assert plan.stats["split_disabled"] == 2
+        assert plan.stats["retry_same"] == 1
+        # Two split-eligible records carry over with the right reason.
+        kinds_in_carryover = {r["error_kind"] for r in plan.carryover}
+        assert kinds_in_carryover == {"MEMORY_EXCEEDED", "COMPUTATION_TIMEOUT"}
+        for record in plan.carryover:
+            assert record["journal_reason"] == JOURNAL_REASON_SPLIT_DISABLED
+        # The retry_same record produced one child, not in carryover.
+        assert len(plan.next_tiles) == 1
+
 
 # ---------------------------------------------------------------------------
 # Journal I/O
@@ -347,12 +369,18 @@ class TestApiRetryCarryoverMerge:
         monkeypatch.setattr(notebook, "ensure_jar", lambda: tmp_path / "stub.jar")
         monkeypatch.setattr(notebook, "ensure_auth", lambda: None)
 
+        # output_tile_size > tile_size enables M6 two-tier mode, which is
+        # required for adaptive splits to be safe — split children share
+        # (row, col) with the parent, and only the M6 assembler keys
+        # output COGs by bbox-derived block position rather than (row, col).
         result = api.retry(
             journal=journal,
             ee_expression='{"result":"0","values":{"0":{"constantValue":1}}}',
             project="test-project",
             output=str(tmp_path),
             runner="local",
+            tile_size=512,
+            output_tile_size=1024,
             max_depth=2,
         )
 
@@ -415,6 +443,8 @@ class TestApiRetryCarryoverMerge:
             project="test-project",
             output=str(tmp_path),
             runner="local",
+            tile_size=512,
+            output_tile_size=1024,
             max_depth=2,
         )
 
@@ -436,3 +466,124 @@ class TestApiRetryCarryoverMerge:
     # what amounts to a logged warning + early return. The skip branch
     # is small enough to verify by code inspection. Tracked under the
     # "Dataflow merge isn't wired" caveat in docs/retry-with-journal.md.
+
+
+class TestApiRetryReadsFromMeta:
+    """When _export_meta.json is present, retry needs no shape args."""
+
+    _EXPRESSION = '{"result":"0","values":{"0":{"constantValue":1}}}'
+
+    def _stage_export(self, tmp_path: Path) -> None:
+        from datensee.meta import build_meta, write_meta
+
+        meta = build_meta(
+            crs="EPSG:4326",
+            scale_meters=30.0,
+            tile_size_pixels=512,
+            output_tile_size_pixels=1024,
+            gee_project="staged-project",
+            ee_expression=self._EXPRESSION,
+        )
+        write_meta(str(tmp_path), meta)
+
+    def test_retry_with_only_output_path_succeeds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from datensee import api, notebook
+        from datensee import submit as submit_mod
+
+        self._stage_export(tmp_path)
+        # Stage a journal alongside the meta — default journal location.
+        record = _record(error_kind="RATE_LIMITED")
+        (tmp_path / "_failures.json").write_text(json.dumps(record) + "\n")
+
+        captured: dict[str, object] = {}
+
+        def fake_submit(config, **_kwargs):
+            captured["ee_expression"] = config.ee_expression
+            captured["gee_project"] = config.gee_project
+            captured["crs"] = config.tile_grid.crs
+            captured["scale_meters"] = config.tile_grid.scale_meters
+            captured["tile_size_pixels"] = config.tile_grid.tile_size_pixels
+            captured["output_tile_size_pixels"] = config.output.output_tile_size_pixels
+            (tmp_path / "_failures.json").write_text("")
+            return None
+
+        monkeypatch.setattr(submit_mod, "submit_job", fake_submit)
+        monkeypatch.setattr(notebook, "ensure_jar", lambda: tmp_path / "stub.jar")
+        monkeypatch.setattr(notebook, "ensure_auth", lambda: None)
+
+        result = api.retry(output=str(tmp_path))
+
+        # Everything should have been resolved from the staged meta.
+        assert captured["gee_project"] == "staged-project"
+        assert captured["crs"] == "EPSG:4326"
+        assert captured["scale_meters"] == 30.0
+        assert captured["tile_size_pixels"] == 512
+        assert captured["output_tile_size_pixels"] == 1024
+        assert captured["ee_expression"] == self._EXPRESSION
+        assert result.next_tiles_count == 1  # the RATE_LIMITED retry-same
+
+    def test_retry_with_mismatched_arg_raises_export_meta_mismatch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from datensee import api, notebook
+        from datensee import submit as submit_mod
+        from datensee.meta import ExportMetaMismatch
+
+        self._stage_export(tmp_path)
+        (tmp_path / "_failures.json").write_text(
+            json.dumps(_record(error_kind="RATE_LIMITED")) + "\n"
+        )
+
+        monkeypatch.setattr(submit_mod, "submit_job", lambda *_a, **_kw: None)
+        monkeypatch.setattr(notebook, "ensure_jar", lambda: tmp_path / "stub.jar")
+        monkeypatch.setattr(notebook, "ensure_auth", lambda: None)
+
+        # The original output_tile_size was 1024; passing a different
+        # value must raise rather than silently corrupt the output grid.
+        with pytest.raises(ExportMetaMismatch) as exc_info:
+            api.retry(output=str(tmp_path), output_tile_size=4096)
+        assert "output_tile_size_pixels" in str(exc_info.value)
+
+    def test_retry_without_meta_and_without_required_args_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from datensee import api, notebook
+        from datensee import submit as submit_mod
+
+        # No meta sidecar.
+        (tmp_path / "_failures.json").write_text(
+            json.dumps(_record(error_kind="RATE_LIMITED")) + "\n"
+        )
+
+        monkeypatch.setattr(submit_mod, "submit_job", lambda *_a, **_kw: None)
+        monkeypatch.setattr(notebook, "ensure_jar", lambda: tmp_path / "stub.jar")
+        monkeypatch.setattr(notebook, "ensure_auth", lambda: None)
+
+        # Legacy export with no meta and no expression supplied → must
+        # raise FileNotFoundError naming what's missing.
+        with pytest.raises(FileNotFoundError) as exc_info:
+            api.retry(output=str(tmp_path), project="some-project")
+        assert "ee_expression" in str(exc_info.value)
+
+    def test_retry_with_meta_and_explicit_journal_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The journal arg is independent of the meta path — caller can
+        point retry at a specific journal even when meta is alongside."""
+        from datensee import api, notebook
+        from datensee import submit as submit_mod
+
+        self._stage_export(tmp_path)
+        custom_journal = tmp_path / "manually_curated.ndjson"
+        custom_journal.write_text(
+            json.dumps(_record(error_kind="RATE_LIMITED")) + "\n"
+        )
+
+        monkeypatch.setattr(submit_mod, "submit_job", lambda *_a, **_kw: None)
+        monkeypatch.setattr(notebook, "ensure_jar", lambda: tmp_path / "stub.jar")
+        monkeypatch.setattr(notebook, "ensure_auth", lambda: None)
+
+        result = api.retry(output=str(tmp_path), journal=custom_journal)
+        assert result.next_tiles_count == 1

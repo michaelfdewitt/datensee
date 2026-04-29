@@ -186,6 +186,15 @@ class PipelineConfig(BaseModel):
     output: OutputConfig
     runner: RunnerConfig = Field(default_factory=RunnerConfig)
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
+    snapshot_time: int | None = Field(
+        default=None,
+        description=(
+            "Unix nanos at which the EE expression's asset references "
+            "were pinned (snapshot consistency across parallel tile "
+            "fetches). Set by api.export(); read by api.retry() to pin "
+            "split children to the same snapshot as their parents."
+        ),
+    )
 
     @property
     def tile_count(self) -> int:

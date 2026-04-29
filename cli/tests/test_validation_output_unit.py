@@ -249,10 +249,11 @@ class TestE08FailureAccounting:
         for t in tiles[:3]:
             _write_fake_tiff(tmp_path / tile_filename(t))
 
-        # Record the 4th as a failure
+        # Record the 4th as a failure (NDJSON, one record per line — same shape
+        # the Java pipeline writes via FailedTileWriter).
         missing = tiles[3]
-        failures = [{"row": missing.row, "col": missing.col, "error": "timeout"}]
-        (tmp_path / "failures.json").write_text(json.dumps(failures))
+        record = {"row": missing.row, "col": missing.col, "error": "timeout"}
+        (tmp_path / "_failures.json").write_text(json.dumps(record) + "\n")
 
         result = check_e08_failure_accounting(tmp_path, config)
         assert result.status == CheckStatus.PASSED
@@ -261,7 +262,7 @@ class TestE08FailureAccounting:
         tiles = _make_tiles(2, 2)
         config = _make_config(tiles, output_path=str(tmp_path))
 
-        # Only write 2 of 4 tiles, no failures.json
+        # Only write 2 of 4 tiles, no _failures.json
         for t in tiles[:2]:
             _write_fake_tiff(tmp_path / tile_filename(t))
 
@@ -282,13 +283,33 @@ class TestE08FailureAccounting:
         assert "not in config" in result.message
 
     def test_no_failures_json(self, tmp_path: Path) -> None:
-        """Missing failures.json is fine — means zero failures."""
+        """Missing _failures.json is fine — means zero failures."""
         tiles = _make_tiles(1, 1)
         config = _make_config(tiles, output_path=str(tmp_path))
         _write_fake_tiff(tmp_path / tile_filename(tiles[0]))
 
         result = check_e08_failure_accounting(tmp_path, config)
         assert result.status == CheckStatus.PASSED
+
+    def test_multi_record_ndjson_failures_journal(self, tmp_path: Path) -> None:
+        """E08 must read the NDJSON _failures.json the Java pipeline writes —
+        one JSON object per line — so multi-failure runs are accounted for."""
+        tiles = _make_tiles(2, 2)
+        config = _make_config(tiles, output_path=str(tmp_path))
+
+        # Write 2 of 4 tiles to disk; the other 2 are dead-lettered.
+        for t in tiles[:2]:
+            _write_fake_tiff(tmp_path / tile_filename(t))
+
+        ndjson = "\n".join(
+            json.dumps({"row": t.row, "col": t.col, "error_kind": "RATE_LIMITED"})
+            for t in tiles[2:]
+        ) + "\n"
+        (tmp_path / "_failures.json").write_text(ndjson)
+
+        result = check_e08_failure_accounting(tmp_path, config)
+        assert result.status == CheckStatus.PASSED
+        assert "4 tiles accounted for" in result.message
 
 
 # ---------------------------------------------------------------------------

@@ -67,6 +67,7 @@ JOURNAL_REASON_FAILED: str = "failed"
 JOURNAL_REASON_DEPTH_CAP: str = "depth_cap"
 JOURNAL_REASON_TERMINAL: str = "terminal"
 JOURNAL_REASON_UNKNOWN_KIND: str = "unknown_kind"
+JOURNAL_REASON_SPLIT_DISABLED: str = "split_disabled"
 
 # Maps the action returned by `decide()` to the canonical journal_reason
 # stamped on a carryover record. Only carryover actions appear here —
@@ -76,6 +77,7 @@ _ACTION_TO_JOURNAL_REASON: dict[str, str] = {
     "depth_cap": JOURNAL_REASON_DEPTH_CAP,
     "terminal": JOURNAL_REASON_TERMINAL,
     "unknown_kind": JOURNAL_REASON_UNKNOWN_KIND,
+    "split_disabled": JOURNAL_REASON_SPLIT_DISABLED,
 }
 
 
@@ -171,6 +173,7 @@ def decide(
     max_depth: int = DEFAULT_MAX_DEPTH,
     split_allowlist: frozenset[str] = SPLIT_ELIGIBLE_KINDS,
     retry_allowlist: frozenset[str] = RETRY_SAME_KINDS,
+    allow_split: bool = True,
 ) -> RetryDecision:
     """Decide split-vs-retry-same-vs-drop for one journal entry.
 
@@ -183,6 +186,11 @@ def decide(
             EE-specific complexity signals only.
         retry_allowlist: Error kinds that retry the same bbox. Default
             is transient infrastructure failures.
+        allow_split: When False, split-eligible records carry over with
+            ``action="split_disabled"`` instead of producing children.
+            Required when the export is one-COG-per-compute-tile
+            (non-M6): split children would share ``(row, col)`` with
+            their parent and clobber the same output filename.
 
     Returns:
         RetryDecision describing the outcome and any emitted children.
@@ -191,6 +199,8 @@ def decide(
     kind = record.get("error_kind", "UNKNOWN")
 
     if kind in split_allowlist:
+        if not allow_split:
+            return RetryDecision((), "split_disabled", record)
         if len(parent.lineage) >= max_depth:
             return RetryDecision((), "depth_cap", record)
         children = split_tile(parent)
@@ -224,14 +234,20 @@ def plan_retry(
     max_depth: int = DEFAULT_MAX_DEPTH,
     split_allowlist: frozenset[str] = SPLIT_ELIGIBLE_KINDS,
     retry_allowlist: frozenset[str] = RETRY_SAME_KINDS,
+    allow_split: bool = True,
 ) -> RetryPlan:
     """Apply :func:`decide` to every record in a journal, return the plan.
 
     Carryover records are stamped (in place, on a shallow copy) with the
     appropriate ``journal_reason`` — ``depth_cap`` / ``terminal`` /
-    ``unknown_kind`` — so that when the retry CLI appends them onto
-    ``_failures.json``, a downstream reader can tell at a glance why
-    each entry is sitting in the journal.
+    ``unknown_kind`` / ``split_disabled`` — so that when the retry CLI
+    appends them onto ``_failures.json``, a downstream reader can tell
+    at a glance why each entry is sitting in the journal.
+
+    Set ``allow_split=False`` for non-M6 exports (one COG per compute
+    tile). In that mode, split children would share their parent's
+    ``(row, col)`` filename and four successful children would clobber
+    one another.
     """
     next_tiles: list[TileCoordinate] = []
     carryover: list[dict] = []
@@ -242,6 +258,7 @@ def plan_retry(
             max_depth=max_depth,
             split_allowlist=split_allowlist,
             retry_allowlist=retry_allowlist,
+            allow_split=allow_split,
         )
         stats[d.action] = stats.get(d.action, 0) + 1
         if d.children:

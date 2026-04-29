@@ -190,6 +190,7 @@ def export(
     max_qps: int = 100,
     labels: dict[str, str] | None = None,
     jar: Path | str | None = None,
+    snapshot_time: int | None = None,
     dry_run: bool = False,
     progress_callback: Callable[[int, int], None] | None = None,
     confirm_callback: Callable[[PipelineConfig], None] | None = None,
@@ -226,6 +227,11 @@ def export(
             Only applied in 'dataflow' mode. Useful for filtering jobs.list
             responses downstream (e.g. {"foundree": "1"}).
         jar: Path to the pipeline JAR (auto-detected if None).
+        snapshot_time: Unix nanos to pin every asset reference in
+            ``ee_expression`` to. Defaults to wall-clock now at submit
+            time. Override only when you need a deterministic snapshot
+            (e.g. reproducing a prior export). Workers see a consistent
+            view of mutable assets across the whole job.
         dry_run: If True, validate but don't submit.
         progress_callback: Optional callback(completed, total) for local
             mode progress. Ignored for Dataflow mode.
@@ -274,6 +280,19 @@ def export(
     if geojson_geometry.get("type") == "Feature":
         geojson_geometry = geojson_geometry["geometry"]
 
+    # Snapshot the *user-supplied* expression for the meta sidecar before
+    # we wrap it in clip — `datensee retry` is invoked with the user's
+    # original expression and needs to hash to the same value.
+    ee_expression_user = ee_expression
+
+    # Pin every asset load in the expression to a single snapshot time.
+    # All workers share this T so a mutating ImageCollection can't let
+    # tile A see the new version while tile B sees the old one.
+    from datensee.pinning import pin_expression
+
+    snapshot_time_nanos = snapshot_time if snapshot_time is not None else time.time_ns()
+    ee_expression = pin_expression(ee_expression, snapshot_time_nanos)
+
     # Clip expression to region
     ee_expression = clip_expression(ee_expression, geojson_geometry)
 
@@ -311,6 +330,7 @@ def export(
         ),
         runner=runner_config,
         rate_limit=RateLimitConfig(max_qps=max_qps),
+        snapshot_time=snapshot_time_nanos,
     )
 
     # The confirm callback fires for both dry-runs and real submissions so
@@ -329,6 +349,26 @@ def export(
         jar_path = find_jar(Path(jar) if isinstance(jar, str) else jar)
     else:
         jar_path = ensure_jar()
+
+    # Persist the export shape so a later `datensee retry` can verify
+    # its args match. Done before submit so the sidecar exists even if
+    # the pipeline crashes — a retry against a partially-completed
+    # export is exactly the case where the meta is most useful.
+    from datensee.meta import build_meta, write_meta
+
+    write_meta(
+        output,
+        build_meta(
+            crs=crs,
+            scale_meters=scale,
+            tile_size_pixels=tile_size,
+            output_tile_size_pixels=output_tile_size,
+            gee_project=project,
+            ee_expression=ee_expression_user,
+            snapshot_time=snapshot_time_nanos,
+        ),
+        credentials=credentials,
+    )
 
     # Submit
     from datensee.submit import submit_job
@@ -462,8 +502,14 @@ class RetryResult(BaseModel):
     ``next_tiles_count`` is the number of TileCoordinates fed back into
     the pipeline (split children + same-bbox retries). ``stats`` is the
     breakdown by action (split / retry_same / depth_cap / terminal /
-    unknown_kind). ``carryover_count`` is how many original journal
-    entries did not make progress this round.
+    unknown_kind / split_disabled). ``carryover_count`` is how many
+    original journal entries did not make progress this round.
+
+    ``tiles_failed_this_round`` is the number of fresh failures the
+    pipeline emitted on this attempt (i.e. records the pipeline wrote to
+    ``_failures.json`` before the retry CLI appended its carryover). Set
+    only for local mode; ``None`` when running on Dataflow because the
+    pipeline writes the journal asynchronously.
     """
 
     job_id: str | None = None
@@ -471,17 +517,18 @@ class RetryResult(BaseModel):
     next_tiles_count: int = 0
     carryover_count: int = 0
     stats: dict[str, int] = {}
+    tiles_failed_this_round: int | None = None
 
 
 def retry(
     *,
-    journal: Path | str,
-    ee_expression: str,
-    project: str,
     output: str,
-    scale: float = 30.0,
-    crs: str = "EPSG:4326",
-    tile_size: int = 512,
+    journal: Path | str | None = None,
+    ee_expression: str | None = None,
+    project: str | None = None,
+    scale: float | None = None,
+    crs: str | None = None,
+    tile_size: int | None = None,
     output_tile_size: int | None = None,
     runner: Literal["local", "dataflow"] = "local",
     region_gcp: str = "us-central1",
@@ -503,20 +550,28 @@ def retry(
     temporary NDJSON file and submitted to the same pipeline via
     ``tile_grid.tiles_file``.
 
-    The pipeline-config arguments (``ee_expression``, ``scale``, ``crs``,
-    ``tile_size``, ``output_tile_size``, etc.) must match the original
-    export — children inherit the output tile keys their parents had
-    and need to land in the same M6 output COG.
+    Shape arguments default to the values persisted in
+    ``{output}/_export_meta.json`` by the original export. With that
+    sidecar present, calling ``retry(output=PATH)`` is sufficient —
+    everything else is read from disk. Any explicitly-passed arg must
+    match the persisted value or :class:`meta.ExportMetaMismatch` is
+    raised, since a mismatch would key new COGs to a different output
+    grid than the existing ones.
 
     Args:
+        output: Output path of the original export. Doubles as the
+            anchor for the failures journal and the meta sidecar.
         journal: Path to the failures journal (NDJSON of FailedTileRecord).
-        ee_expression: Same EE expression as the original export.
-        project: Same GCP project.
-        output: Same output path. The retry round writes its own
-            successes here and a fresh ``_failures.json`` for any new
-            permanent failures.
-        scale, crs, tile_size, output_tile_size: Must match the original
-            export so split children align with the output grid.
+            Defaults to ``{output}/_failures.json``.
+        ee_expression: Same EE expression as the original export. When
+            None, read from ``_export_meta.json``.
+        project: Same GCP project. When None, read from meta.
+        scale, crs, tile_size, output_tile_size: Must match the
+            original export so split children align with the output
+            grid. When None, read from meta. ``output_tile_size``
+            staying ``None`` means the original was one-COG-per-compute
+            (non-M6); split actions are then demoted to
+            ``split_disabled`` carryover.
         max_depth: Max quadtree depth. Records already at this depth
             are not split — they remain in the next round's failures.
             Default 2 (one root → 16 sub-tiles max).
@@ -525,7 +580,19 @@ def retry(
 
     Returns:
         RetryResult with the submitted job id (if any) plus stats.
+
+    Raises:
+        FileNotFoundError: If no meta sidecar exists and a required
+            shape arg was not supplied.
+        meta.ExportMetaMismatch: If a passed arg disagrees with meta.
     """
+    import logging
+
+    from datensee.meta import (
+        EXPORT_META_FILENAME,
+        read_meta,
+        verify_retry_compatibility,
+    )
     from datensee.notebook import ensure_auth, ensure_jar
     from datensee.retry import plan_retry, read_journal, write_tiles_file
     from datensee.submit import submit_job
@@ -533,9 +600,89 @@ def retry(
     if credentials is None:
         ensure_auth()
 
+    # Resolve shape args against the persisted meta. The meta is the
+    # canonical source of "what the original export was"; any explicit
+    # arg the caller passes must agree with it. A missing sidecar
+    # (legacy export) means we can't verify — we fall back to whatever
+    # the caller supplied, and only the function-default values for
+    # anything they left blank.
+    persisted_meta = read_meta(output, credentials=credentials)
+    if persisted_meta is not None:
+        # Fill in any None args from meta.
+        if ee_expression is None:
+            ee_expression = persisted_meta.ee_expression
+        if project is None:
+            project = persisted_meta.gee_project
+        if scale is None:
+            scale = persisted_meta.scale_meters
+        if crs is None:
+            crs = persisted_meta.crs
+        if tile_size is None:
+            tile_size = persisted_meta.tile_size_pixels
+        if output_tile_size is None:
+            output_tile_size = persisted_meta.output_tile_size_pixels
+        # Now verify everything (caller-passed values too) matches.
+        verify_retry_compatibility(
+            persisted_meta,
+            crs=crs,
+            scale_meters=scale,
+            tile_size_pixels=tile_size,
+            output_tile_size_pixels=output_tile_size,
+            gee_project=project,
+            ee_expression=ee_expression,
+        )
+    else:
+        # Legacy export — no meta to fall back on. Apply documented
+        # defaults for the fields that have them; require the rest.
+        if scale is None:
+            scale = 30.0
+        if crs is None:
+            crs = "EPSG:4326"
+        if tile_size is None:
+            tile_size = 512
+        missing = [
+            name
+            for name, value in (
+                ("ee_expression", ee_expression),
+                ("project", project),
+            )
+            if value is None
+        ]
+        if missing:
+            raise FileNotFoundError(
+                f"{EXPORT_META_FILENAME} not found in {output!r} and "
+                f"required arg(s) not provided: {', '.join(missing)}. "
+                "Either pass them explicitly or run the original export "
+                "with a datensee version that writes the meta sidecar."
+            )
+        logging.getLogger(__name__).warning(
+            "datensee retry: %s not found in %s — skipping shape "
+            "verification. Be sure your retry args match the original "
+            "export, especially output_tile_size.",
+            EXPORT_META_FILENAME,
+            output,
+        )
+
+    # Default the journal path to the canonical location under output.
+    if journal is None:
+        if output.startswith("gs://"):
+            raise ValueError(
+                "datensee retry against a GCS output requires --journal "
+                "to be set explicitly (we don't auto-locate "
+                "{output}/_failures.json on GCS)."
+            )
+        journal = Path(output) / "_failures.json"
+
     journal_path = Path(journal) if isinstance(journal, str) else journal
     records = read_journal(journal_path)
-    plan = plan_retry(records, max_depth=max_depth)
+
+    # Splitting requires M6 two-tier output: split children inherit
+    # (row, col) from their parent, and the non-M6 writer keys output
+    # filenames on (row, col) alone — four successful split children
+    # would all write to the same `tile_rNNNN_cNNNN.tif`. Refuse to
+    # split when the retry isn't running against a two-tier export.
+    allow_split = output_tile_size is not None and output_tile_size > tile_size
+    plan = plan_retry(records, max_depth=max_depth, allow_split=allow_split)
 
     if not plan.next_tiles:
         return RetryResult(
@@ -583,6 +730,26 @@ def retry(
     else:
         runner_config = RunnerConfig(mode="local")
 
+    # Pin retry children to the same snapshot as the original export.
+    # If the parent COGs were fetched at T, the new children must also
+    # see T or we'd splice newer EE data into a partly-stale output COG.
+    # Legacy meta (snapshot_time=None) means the original export was
+    # unpinned; we fall back to fresh T and warn — no worse than before
+    # for the parents, slightly better for the children.
+    from datensee.pinning import pin_expression
+
+    if persisted_meta is not None and persisted_meta.snapshot_time is not None:
+        snapshot_time_nanos = persisted_meta.snapshot_time
+    else:
+        snapshot_time_nanos = time.time_ns()
+        logging.getLogger(__name__).warning(
+            "datensee retry: no snapshot_time in meta — original export was "
+            "unpinned. Retry children will pin to %d (now). The output COGs "
+            "may end up with sub-tiles fetched at different snapshots.",
+            snapshot_time_nanos,
+        )
+    ee_expression = pin_expression(ee_expression, snapshot_time_nanos)
+
     pipeline_config = PipelineConfig(
         ee_expression=ee_expression,
         gee_project=project,
@@ -598,6 +765,7 @@ def retry(
         ),
         runner=runner_config,
         rate_limit=RateLimitConfig(max_qps=max_qps),
+        snapshot_time=snapshot_time_nanos,
     )
 
     if dry_run:
@@ -637,6 +805,19 @@ def retry(
     # so we'd be appending to a file that doesn't exist yet (or worse,
     # racing with the pipeline writer). Tracked as a TODO; for now we
     # log + skip in Dataflow mode.
+    # Snapshot the pipeline's fresh failures *before* appending carryover,
+    # so `tiles_failed_this_round` reflects what the pipeline produced
+    # on this attempt and not records we recycled from a prior round.
+    tiles_failed_this_round: int | None = None
+    if runner == "local" and not output.startswith("gs://"):
+        failures_path = Path(output) / "_failures.json"
+        if failures_path.exists():
+            tiles_failed_this_round = sum(
+                1 for line in failures_path.read_text().splitlines() if line.strip()
+            )
+        else:
+            tiles_failed_this_round = 0
+
     if plan.carryover:
         if runner == "local" and not output.startswith("gs://"):
             failures_path = Path(output) / "_failures.json"
@@ -660,5 +841,6 @@ def retry(
         duration_seconds=duration,
         next_tiles_count=len(plan.next_tiles),
         carryover_count=len(plan.carryover),
+        tiles_failed_this_round=tiles_failed_this_round,
         stats=plan.stats,
     )

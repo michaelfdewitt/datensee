@@ -15,7 +15,8 @@ public record PipelineConfig(
     @JsonProperty("tile_grid") TileGridConfig tileGrid,
     @JsonProperty("output") OutputConfig output,
     @JsonProperty("runner") RunnerConfig runner,
-    @JsonProperty("rate_limit") RateLimitConfig rateLimit
+    @JsonProperty("rate_limit") RateLimitConfig rateLimit,
+    @JsonProperty("snapshot_time") Long snapshotTime
 ) {
 
     /** Convenience method for logging. */
@@ -47,7 +48,18 @@ public record PipelineConfig(
         }
     }
 
-    /** Output destination and COG parameters. */
+    /**
+     * Output destination and COG parameters.
+     *
+     * <p>{@code bandCount} and {@code dataType} are <strong>informational
+     * metadata</strong> describing what the EE expression is expected to
+     * return, not contracts the pipeline enforces. The transcoder reads
+     * the actual sample structure from each TIFF returned by EE; if EE
+     * yields a different shape from what the config claims, the COG is
+     * built around the TIFF's truth and the config's claim is silently
+     * superseded. Treat these fields as documentation for humans and
+     * downstream tools — never as authority for runtime behavior.
+     */
     public record OutputConfig(
         @JsonProperty("output_path") String outputPath,
         @JsonProperty("band_count") int bandCount,
@@ -55,12 +67,18 @@ public record PipelineConfig(
         @JsonProperty("output_tile_size_pixels") Integer outputTileSizePixels,
         CogConfig cog
     ) {
-        /** Returns band count, defaulting to 1 if not set. */
+        /**
+         * Returns the configured band count (informational; see class
+         * javadoc), defaulting to 1 when not set.
+         */
         public int effectiveBandCount() {
             return bandCount > 0 ? bandCount : 1;
         }
 
-        /** Returns data type, defaulting to float32 if not set. */
+        /**
+         * Returns the configured data type (informational; see class
+         * javadoc), defaulting to float32 when not set.
+         */
         public String effectiveDataType() {
             return dataType != null && !dataType.isBlank() ? dataType : "float32";
         }

@@ -177,6 +177,112 @@ class AssembledCogWriterTest {
         assertArrayEquals(expectedPixels, decoded);
     }
 
+    @Test
+    void partialGroupEmitsSidecarWithMissingBlocks(@TempDir Path tempDir) throws Exception {
+        // 2×2 output tile with only 3 of 4 compute tiles present —
+        // simulates one upstream fetch failure that was dead-lettered.
+        // Asserts: COG still written (zero-filled at the missing block),
+        // sidecar JSON written enumerating the gap.
+        int innerSize = 16;
+        int outerSize = 32;
+        double pixelSize = 1.0;
+        double outputXMin = 0.0;
+        double outputYMax = 32.0;
+
+        List<FetchedTile> tiles = new ArrayList<>();
+        for (int row = 0; row < 2; row++) {
+            for (int col = 0; col < 2; col++) {
+                if (row == 1 && col == 1) {
+                    continue;  // drop the bottom-right block
+                }
+                byte[] tilePixels = new byte[innerSize * innerSize];
+                java.util.Arrays.fill(tilePixels, (byte) 0xAA);
+                double xMin = outputXMin + col * innerSize * pixelSize;
+                double xMax = xMin + innerSize * pixelSize;
+                double yMax = outputYMax - row * innerSize * pixelSize;
+                double yMin = yMax - innerSize * pixelSize;
+                byte[] tiff = synthesizeStripUint8Tiff(
+                    innerSize, innerSize, tilePixels, pixelSize, xMin, yMax
+                );
+                tiles.add(new FetchedTile(
+                    new TileCoordinate(xMin, yMin, xMax, yMax, row, col, 0, 0, List.of()),
+                    tiff, innerSize, innerSize
+                ));
+            }
+        }
+
+        AssembledCogWriter.AssembleAndWriteDoFn doFn =
+            new AssembledCogWriter.AssembleAndWriteDoFn(
+                tempDir.toString(), innerSize, outerSize, "deflate"
+            );
+        doFn.setup();
+        doFn.process(KV.of(new OutputTileKey(0, 0), tiles));
+
+        Path cogPath = tempDir.resolve("tile_r0000_c0000.tif");
+        org.junit.jupiter.api.Assertions.assertTrue(
+            Files.exists(cogPath),
+            "Partial group must still emit the COG (zero-filled at the gap)"
+        );
+
+        Path sidecarPath = tempDir.resolve("tile_r0000_c0000.tif.partial.json");
+        org.junit.jupiter.api.Assertions.assertTrue(
+            Files.exists(sidecarPath),
+            "Partial group must emit a sidecar listing missing blocks"
+        );
+        String sidecar = Files.readString(sidecarPath);
+        org.junit.jupiter.api.Assertions.assertTrue(
+            sidecar.contains("\"tx\":1") && sidecar.contains("\"ty\":1"),
+            "Sidecar must enumerate the missing block at (tx=1, ty=1); got: " + sidecar
+        );
+    }
+
+    @Test
+    void completeGroupWritesNoSidecar(@TempDir Path tempDir) throws Exception {
+        // Mirror smallerCaseFourComputeTilesInto32x32OutputCog but assert
+        // the partial sidecar is NOT written when every block is present.
+        int innerSize = 16;
+        int outerSize = 32;
+        byte[] expectedPixels = new byte[outerSize * outerSize];
+        for (int i = 0; i < expectedPixels.length; i++) {
+            expectedPixels[i] = (byte) (i & 0xFF);
+        }
+        double pixelSize = 1.0;
+
+        List<FetchedTile> tiles = new ArrayList<>();
+        for (int row = 0; row < 2; row++) {
+            for (int col = 0; col < 2; col++) {
+                byte[] tilePixels = new byte[innerSize * innerSize];
+                for (int dy = 0; dy < innerSize; dy++) {
+                    int srcOff = (row * innerSize + dy) * outerSize + col * innerSize;
+                    System.arraycopy(expectedPixels, srcOff, tilePixels, dy * innerSize, innerSize);
+                }
+                double xMin = col * innerSize * pixelSize;
+                double xMax = xMin + innerSize * pixelSize;
+                double yMax = 32.0 - row * innerSize * pixelSize;
+                double yMin = yMax - innerSize * pixelSize;
+                byte[] tiff = synthesizeStripUint8Tiff(
+                    innerSize, innerSize, tilePixels, pixelSize, xMin, yMax
+                );
+                tiles.add(new FetchedTile(
+                    new TileCoordinate(xMin, yMin, xMax, yMax, row, col, 0, 0, List.of()),
+                    tiff, innerSize, innerSize
+                ));
+            }
+        }
+
+        AssembledCogWriter.AssembleAndWriteDoFn doFn =
+            new AssembledCogWriter.AssembleAndWriteDoFn(
+                tempDir.toString(), innerSize, outerSize, "deflate"
+            );
+        doFn.setup();
+        doFn.process(KV.of(new OutputTileKey(0, 0), tiles));
+
+        org.junit.jupiter.api.Assertions.assertFalse(
+            Files.exists(tempDir.resolve("tile_r0000_c0000.tif.partial.json")),
+            "Complete group must NOT emit a partial sidecar"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------

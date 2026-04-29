@@ -27,7 +27,7 @@ import numpy as np
 import pytest
 
 from datensee.auth import get_access_token
-from datensee.tiling import _pixel_size_native, decompose_region
+from datensee.tiling import _pixel_sizes_native, decompose_region
 
 HV_ENDPOINT = (
     "https://earthengine-highvolume.googleapis.com/v1/projects/{project}/image:computePixels"
@@ -856,9 +856,12 @@ class TestPixelAlignment:
         `shift_pixels` in the x direction (easting) and compare pixels
         in the overlap area.
         """
-        pixel_native = _pixel_size_native(crs, scale_meters)
-        shift_native = shift_pixels * pixel_native
-        pixel_native * tile_size_pixels
+        # Sierra Nevada / SF Bay are both ~37–38° N — close enough that a
+        # single centroid-lat call is fine for the shift-and-compare math
+        # that follows. The X pixel size is the one that matters here
+        # because the shift is applied in the easting direction.
+        pixel_native_x, _ = _pixel_sizes_native(crs, scale_meters, centroid_lat_deg=37.5)
+        shift_native = shift_pixels * pixel_native_x
 
         # Two overlapping WGS84 regions. The shift is applied in native
         # CRS units, but converted back to WGS84 for the GeoJSON input

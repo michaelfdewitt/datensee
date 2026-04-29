@@ -29,22 +29,24 @@ def _tiles_on_disk(output_dir: Path) -> set[tuple[int, int]]:
 
 
 def _tiles_in_failures(output_dir: Path) -> set[tuple[int, int]]:
-    """Read failures.json (if present) and return (row, col) of failed tiles."""
-    failures_path = output_dir / "failures.json"
+    """Read _failures.json (NDJSON written by the pipeline) and return (row, col) of failed tiles."""
+    failures_path = output_dir / "_failures.json"
     if not failures_path.exists():
         return set()
 
+    failed: set[tuple[int, int]] = set()
     try:
-        data = json.loads(failures_path.read_text())
+        for raw_line in failures_path.read_text().splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            entry = json.loads(line)
+            row = entry.get("row")
+            col = entry.get("col")
+            if row is not None and col is not None:
+                failed.add((int(row), int(col)))
     except (json.JSONDecodeError, OSError):
         return set()
-
-    failed: set[tuple[int, int]] = set()
-    for entry in data if isinstance(data, list) else data.get("failures", []):
-        row = entry.get("row")
-        col = entry.get("col")
-        if row is not None and col is not None:
-            failed.add((int(row), int(col)))
     return failed
 
 
@@ -61,7 +63,7 @@ def check_e08_failure_accounting(
     """E08: Verify tiles_on_disk + tiles_in_failures == tiles_in_config.
 
     Every tile in the config must be accounted for — either as a file on disk
-    or as an entry in failures.json. No tiles should be silently lost.
+    or as an entry in _failures.json. No tiles should be silently lost.
     """
     expected = _tiles_in_config(config)
     on_disk = _tiles_on_disk(output_dir)

@@ -33,17 +33,37 @@ def _reproject_geometry(
     return transform(transformer.transform, geom)
 
 
-def _pixel_size_native(crs: str, scale_meters: float) -> float:
-    """Return the pixel size in native CRS units.
+def _pixel_sizes_native(
+    crs: str,
+    scale_meters: float,
+    centroid_lat_deg: float | None = None,
+) -> tuple[float, float]:
+    """Return (pixel_x, pixel_y) in native CRS units.
 
-    For geographic CRS (degrees), approximate degrees-per-meter at the equator.
-    For projected CRS, units are assumed to be meters.
+    Projected CRSs are assumed to use meters; both axes return ``scale_meters``.
+
+    Geographic CRSs vary: meters-per-degree of longitude shrinks with
+    ``cos(lat)`` and a single equatorial constant gives ~50% error at
+    lat 60°. We compute X and Y separately at the bbox centroid latitude
+    on the WGS84 ellipsoid via :class:`pyproj.Geod`. ``centroid_lat_deg``
+    is required for geographic CRSs and ignored for projected ones.
     """
     crs_obj = pyproj.CRS.from_user_input(crs)
-    if crs_obj.is_geographic:
-        deg_per_meter = 1.0 / 111_320.0
-        return scale_meters * deg_per_meter
-    return scale_meters
+    if not crs_obj.is_geographic:
+        return scale_meters, scale_meters
+    if centroid_lat_deg is None:
+        raise ValueError(
+            "centroid_lat_deg is required for geographic CRSs to compute "
+            "latitude-dependent meters-per-degree of longitude."
+        )
+    geod = pyproj.Geod(ellps="WGS84")
+    _, _, meters_per_deg_lon = geod.inv(
+        0.0, centroid_lat_deg, 1.0, centroid_lat_deg
+    )
+    _, _, meters_per_deg_lat = geod.inv(
+        0.0, centroid_lat_deg - 0.5, 0.0, centroid_lat_deg + 0.5
+    )
+    return scale_meters / meters_per_deg_lon, scale_meters / meters_per_deg_lat
 
 
 def decompose_region(
@@ -88,6 +108,8 @@ def decompose_region(
         )
 
     geom_wgs84 = shape(geojson_geometry)
+    wgs84_minx, wgs84_miny, wgs84_maxx, wgs84_maxy = geom_wgs84.bounds
+    centroid_lat_deg = (wgs84_miny + wgs84_maxy) / 2.0
 
     if crs == "EPSG:4326":
         geom_native = geom_wgs84
@@ -96,16 +118,19 @@ def decompose_region(
 
     minx, miny, maxx, maxy = geom_native.bounds
 
-    pixel_native = _pixel_size_native(crs, scale_meters)
-    tile_size_native = pixel_native * tile_size_pixels
+    pixel_native_x, pixel_native_y = _pixel_sizes_native(
+        crs, scale_meters, centroid_lat_deg=centroid_lat_deg
+    )
+    tile_size_native_x = pixel_native_x * tile_size_pixels
+    tile_size_native_y = pixel_native_y * tile_size_pixels
 
     # Tile indices and counts — ceil ensures we cover the full bbox.
     # Grid origin is implicitly (0, 0) in the target CRS: tile boundaries
-    # are aligned to col * tile_size_native, row * tile_size_native.
-    col_start = math.floor(minx / tile_size_native)
-    row_start = math.floor(miny / tile_size_native)
-    col_end = math.ceil(maxx / tile_size_native)
-    row_end = math.ceil(maxy / tile_size_native)
+    # are aligned to col * tile_size_native_x, row * tile_size_native_y.
+    col_start = math.floor(minx / tile_size_native_x)
+    row_start = math.floor(miny / tile_size_native_y)
+    col_end = math.ceil(maxx / tile_size_native_x)
+    row_end = math.ceil(maxy / tile_size_native_y)
 
     # Output-tile mapping (M6). Both grids snap to the same global origin
     # at (0, 0), so an absolute compute-grid index can be quotiented by N
@@ -123,10 +148,10 @@ def decompose_region(
     tiles: list[TileCoordinate] = []
     for row_idx in range(row_start, row_end):
         for col_idx in range(col_start, col_end):
-            tile_xmin = col_idx * tile_size_native
-            tile_ymin = row_idx * tile_size_native
-            tile_xmax = tile_xmin + tile_size_native
-            tile_ymax = tile_ymin + tile_size_native
+            tile_xmin = col_idx * tile_size_native_x
+            tile_ymin = row_idx * tile_size_native_y
+            tile_xmax = tile_xmin + tile_size_native_x
+            tile_ymax = tile_ymin + tile_size_native_y
 
             # Skip tiles that don't intersect the actual geometry.
             tile_box = Polygon.from_bounds(tile_xmin, tile_ymin, tile_xmax, tile_ymax)

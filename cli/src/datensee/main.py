@@ -41,6 +41,24 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
+def _parse_snapshot_time(raw: str | None) -> int | None:
+    """Parse the --snapshot-time CLI value into Unix nanos."""
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if raw.isdigit():
+        return int(raw)
+    from datetime import datetime
+    try:
+        # Accept the trailing 'Z' shorthand for UTC.
+        normalized = raw.replace("Z", "+00:00") if raw.endswith("Z") else raw
+        return int(datetime.fromisoformat(normalized).timestamp() * 1_000_000_000)
+    except ValueError as exc:
+        raise typer.BadParameter(
+            f"--snapshot-time {raw!r} is neither Unix nanos nor ISO-8601: {exc}"
+        ) from exc
+
+
 @app.callback()
 def main(
     version: Annotated[
@@ -198,6 +216,18 @@ def export(
             min=1,
         ),
     ] = 100,
+    snapshot_time: Annotated[
+        str | None,
+        typer.Option(
+            "--snapshot-time",
+            help=(
+                "Pin every asset reference in the EE expression to this "
+                "moment. Accepts an ISO-8601 UTC timestamp (e.g. "
+                "'2026-04-30T12:00:00Z') or Unix nanoseconds. Defaults to "
+                "submit time. Override only to reproduce a prior export."
+            ),
+        ),
+    ] = None,
     dry_run: Annotated[
         bool,
         typer.Option("--dry-run", help="Print the pipeline command without executing."),
@@ -217,6 +247,7 @@ def export(
     """Submit an Earth Engine export job to Cloud Dataflow (or local runner)."""
     ee_expression = expression_file.read_text().strip()
     geojson_geometry = json.loads(region_file.read_text())
+    snapshot_time_nanos = _parse_snapshot_time(snapshot_time)
 
     def confirm(config: PipelineConfig) -> None:
         console.print(render_export_summary(config))
@@ -238,6 +269,7 @@ def export(
             temp_location=temp_location,
             max_qps=max_qps,
             jar=jar,
+            snapshot_time=snapshot_time_nanos,
             dry_run=dry_run,
             confirm_callback=confirm,
         )
@@ -452,55 +484,70 @@ def validate_cmd(
 
 @app.command("retry")
 def retry_cmd(
-    expression_file: Annotated[
-        Path,
-        typer.Argument(
-            help="JSON file containing the serialized EE computation expression "
-            "(must match the original export).",
-            exists=True,
-            readable=True,
-        ),
-    ],
-    journal: Annotated[
-        Path,
-        typer.Option(
-            "--journal",
-            "-j",
-            help="Path to the failures journal (NDJSON, e.g. {output}/_failures.json).",
-            exists=True,
-            readable=True,
-        ),
-    ],
-    project: Annotated[
-        str,
-        typer.Option("--project", "-p", help="GCP project ID with EE API enabled."),
-    ],
     output: Annotated[
         str,
         typer.Option(
             "--output",
             "-o",
-            help="Output path: must match the original export so split children "
-            "land in the same output COGs.",
+            help="Output path of the original export — anchors the meta "
+            "sidecar and the failures journal.",
         ),
     ],
+    expression_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--expression",
+            "-e",
+            help="JSON file with the serialized EE computation expression. "
+            "Optional when _export_meta.json is present in --output.",
+            exists=True,
+            readable=True,
+        ),
+    ] = None,
+    journal: Annotated[
+        Path | None,
+        typer.Option(
+            "--journal",
+            "-j",
+            help="Path to the failures journal (NDJSON). Defaults to "
+            "{output}/_failures.json for local outputs.",
+            exists=True,
+            readable=True,
+        ),
+    ] = None,
+    project: Annotated[
+        str | None,
+        typer.Option(
+            "--project",
+            "-p",
+            help="GCP project ID. Optional when _export_meta.json is present.",
+        ),
+    ] = None,
     scale: Annotated[
-        float,
-        typer.Option("--scale", "-s", help="Pixel size in meters.", min=0.1),
-    ] = 30.0,
+        float | None,
+        typer.Option(
+            "--scale",
+            "-s",
+            help="Pixel size in meters. Reads from meta when omitted.",
+            min=0.1,
+        ),
+    ] = None,
     crs: Annotated[
-        str,
-        typer.Option("--crs", help="Target CRS (must match original export)."),
-    ] = "EPSG:4326",
+        str | None,
+        typer.Option("--crs", help="Target CRS. Reads from meta when omitted."),
+    ] = None,
     tile_size: Annotated[
-        int,
-        typer.Option("--tile-size", help="Compute tile edge size in pixels."),
-    ] = 512,
+        int | None,
+        typer.Option(
+            "--tile-size",
+            help="Compute tile edge in pixels. Reads from meta when omitted.",
+        ),
+    ] = None,
     output_tile_size: Annotated[
         int | None,
         typer.Option(
             "--output-tile-size",
-            help="M6 output tile size — must match original export.",
+            help="M6 output tile size. Reads from meta when omitted.",
         ),
     ] = None,
     runner: Annotated[
@@ -540,38 +587,55 @@ def retry_cmd(
 ) -> None:
     """Re-submit failed tiles from a journal, splitting where appropriate.
 
-    Reads ``--journal`` (an NDJSON failures journal written by a prior
-    pipeline run), classifies each entry by ``error_kind``, and for
-    EE-specific complexity errors (``MEMORY_EXCEEDED``,
-    ``COMPUTATION_TIMEOUT``) emits 4 quadtree children. Transient
-    infrastructure errors (rate-limit, generic 5xx, unknown) retry the
-    same bbox. Auth and fatal errors are dropped from the retry stream
-    and surfaced to the user.
+    Reads the failures journal written by a prior pipeline run,
+    classifies each entry by ``error_kind``, and for EE-specific
+    complexity errors (``MEMORY_EXCEEDED``, ``COMPUTATION_TIMEOUT``)
+    emits 4 quadtree children. Transient infrastructure errors
+    (rate-limit, generic 5xx, unknown) retry the same bbox. Auth and
+    fatal errors are dropped from the retry stream and surfaced to the
+    user.
 
-    The pipeline-config arguments must match the original export so
-    split children land in the same M6 output COGs as their parents.
+    With ``_export_meta.json`` in the output directory (written by every
+    export from this version of datensee on), retry needs no shape args:
+
+        datensee retry --output ./my-export
+
+    will read the original CRS, scale, tile sizes, project, and
+    expression from the sidecar. Any explicitly-passed shape arg must
+    match the persisted value or the command refuses to run, since a
+    mismatch would key new COGs to a different output grid than the
+    existing ones.
     """
     from datensee.api import retry as run_retry
+    from datensee.meta import ExportMetaMismatch
 
-    ee_expression = expression_file.read_text().strip()
+    ee_expression = expression_file.read_text().strip() if expression_file else None
 
-    result = run_retry(
-        journal=journal,
-        ee_expression=ee_expression,
-        project=project,
-        output=output,
-        scale=scale,
-        crs=crs,
-        tile_size=tile_size,
-        output_tile_size=output_tile_size,
-        runner=runner,  # type: ignore[arg-type]
-        region_gcp=region_gcp,
-        temp_location=temp_location,
-        max_qps=max_qps,
-        jar=jar,
-        max_depth=max_depth,
-        dry_run=dry_run,
-    )
+    try:
+        result = run_retry(
+            output=output,
+            journal=journal,
+            ee_expression=ee_expression,
+            project=project,
+            scale=scale,
+            crs=crs,
+            tile_size=tile_size,
+            output_tile_size=output_tile_size,
+            runner=runner,  # type: ignore[arg-type]
+            region_gcp=region_gcp,
+            temp_location=temp_location,
+            max_qps=max_qps,
+            jar=jar,
+            max_depth=max_depth,
+            dry_run=dry_run,
+        )
+    except ExportMetaMismatch as exc:
+        for line in str(exc).splitlines():
+            console.print(f"[red]{line}[/red]" if line.strip() else "")
+        raise typer.Exit(code=1) from exc
+    except FileNotFoundError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
 
     console.print("[bold]Retry plan[/bold]")
     for action, count in sorted(result.stats.items()):
@@ -592,3 +656,10 @@ def retry_cmd(
 
     if result.job_id:
         console.print(f"[green]Job submitted:[/green] {result.job_id}")
+
+    if result.tiles_failed_this_round is not None:
+        succeeded = result.next_tiles_count - result.tiles_failed_this_round
+        console.print(
+            f"[bold]This round:[/bold] {succeeded}/{result.next_tiles_count} "
+            f"succeeded ({result.tiles_failed_this_round} fresh failures)"
+        )

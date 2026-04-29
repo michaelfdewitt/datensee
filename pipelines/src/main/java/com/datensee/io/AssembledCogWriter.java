@@ -48,18 +48,46 @@ import org.slf4j.LoggerFactory;
  * large output COGs — the per-tile fetch granularity is preserved as
  * the COG's own internal random-access granularity.
  *
- * <p>Failure handling: today, an output tile is only emitted if
- * <em>all</em> its expected compute tiles successfully landed in the
- * group. If some compute tiles failed upstream and were dead-lettered,
- * the assembler emits a partially-populated COG by zero-filling the
- * missing blocks. Whether to skip vs zero-fill vs flag-as-failed for
- * partial groups is a design decision documented in
- * {@code docs/handoff.md}.
+ * <p>Failure handling: when one or more compute tiles in a group are
+ * absent (either dropped to the dead-letter PCollection upstream, or
+ * never present because the compute tile didn't intersect the export
+ * region), the assembler still emits the output COG with zero-filled
+ * blocks at the missing positions — partial data is more useful than
+ * no data. To make the holes <em>visible</em> rather than silent, the
+ * assembler:
+ *
+ * <ul>
+ *   <li>increments the {@code output_tiles_partial} Beam counter for each
+ *       affected output tile;</li>
+ *   <li>logs a {@code WARN} listing the missing block positions; and</li>
+ *   <li>writes a sidecar {@code <filename>.partial.json} alongside the
+ *       COG enumerating the missing block coordinates so a downstream
+ *       reader can cross-reference against the failures journal.</li>
+ * </ul>
+ *
+ * <p>The number of compute tiles in a complete group depends on whether
+ * the output tile lies on the region edge, so the assembler can't
+ * distinguish "edge tile, fewer compute tiles by design" from "interior
+ * tile with fetch failures" on its own — that disambiguation is the
+ * caller's job (cross-reference partial sidecars with {@code _failures.json}).
  */
 public final class AssembledCogWriter
     extends PTransform<PCollection<FetchedTile>, PDone> {
 
     private static final Logger LOG = LoggerFactory.getLogger(AssembledCogWriter.class);
+
+    /**
+     * How far a compute-tile's bbox-derived block origin may drift, in
+     * pixels, from a perfect block boundary before the assembler treats
+     * it as a misaligned tile. With CRS coordinates in millions
+     * (UTM/equal-area projections at small scales), {@code Math.round}
+     * still produces stable integer block indices for any drift well
+     * below 1 pixel — but small ULP differences from float arithmetic
+     * shouldn't trip the alignment guard. 0.001 px = ~3 cm at 30 m/px
+     * resolution, which is comfortably tighter than any real-world
+     * misalignment but loose enough to absorb double-precision noise.
+     */
+    static final double TILE_ALIGNMENT_TOLERANCE_PX = 1e-3;
 
     private final String outputPath;
     private final int computeTileSize;
@@ -72,10 +100,25 @@ public final class AssembledCogWriter
         int outputTileSize,
         String compression
     ) {
-        // The (outputTileSize % computeTileSize == 0) invariant is enforced
-        // at the wire boundary by PipelineConfig's pydantic validator and
-        // again at COG-emit time by transcodeFromTileBlocks; no need for a
-        // third check here.
+        // The (outputTileSize % computeTileSize == 0) invariant is also
+        // enforced at the wire boundary by PipelineConfig's pydantic
+        // validator. We re-check here because Java has multiple potential
+        // clients (CLI-driven pipelines today; Cloud Run / FoundrEE bridge
+        // tomorrow) and the assembler's block math assumes a clean
+        // multiple — `transcodeFromTileBlocks` only checks the weaker
+        // (width % tileSize == 0) invariant.
+        if (computeTileSize <= 0) {
+            throw new IllegalArgumentException(
+                "computeTileSize must be positive, got " + computeTileSize
+            );
+        }
+        if (outputTileSize <= 0 || outputTileSize % computeTileSize != 0) {
+            throw new IllegalArgumentException(
+                "outputTileSize (" + outputTileSize + ") must be a positive multiple of "
+                + "computeTileSize (" + computeTileSize + "); got remainder "
+                + (outputTileSize % computeTileSize)
+            );
+        }
         this.outputPath = outputPath;
         this.computeTileSize = computeTileSize;
         this.outputTileSize = outputTileSize;
@@ -109,6 +152,7 @@ public final class AssembledCogWriter
 
         private transient Storage storage;
         private final Counter outputTilesWritten = Metrics.counter("datensee", "output_tiles_written");
+        private final Counter outputTilesPartial = Metrics.counter("datensee", "output_tiles_partial");
         private final Counter computeTilesAssembled = Metrics.counter("datensee", "compute_tiles_assembled");
 
         AssembleAndWriteDoFn(
@@ -186,12 +230,25 @@ public final class AssembledCogWriter
             }
 
             for (FetchedTile t : computeTiles) {
-                int localXPx = (int) Math.round(
-                    (t.coordinate().xMin() - outputXMin) / pixelNative
-                );
-                int localYPx = (int) Math.round(
-                    (outputYMax - t.coordinate().yMax()) / pixelNative
-                );
+                // Compute the bbox-derived position in pixels and verify
+                // both that the float drift from a perfect integer is
+                // within tolerance (catches off-grid bboxes) and that
+                // the rounded position is a clean multiple of the
+                // compute tile size (catches off-block bboxes).
+                double rawXPx = (t.coordinate().xMin() - outputXMin) / pixelNative;
+                double rawYPx = (outputYMax - t.coordinate().yMax()) / pixelNative;
+                int localXPx = (int) Math.round(rawXPx);
+                int localYPx = (int) Math.round(rawYPx);
+                if (Math.abs(rawXPx - localXPx) > TILE_ALIGNMENT_TOLERANCE_PX
+                    || Math.abs(rawYPx - localYPx) > TILE_ALIGNMENT_TOLERANCE_PX) {
+                    throw new IOException(
+                        "Compute tile " + t.coordinate().id()
+                        + " bbox is not pixel-aligned within output tile " + key
+                        + " (raw position " + rawXPx + "," + rawYPx + " px;"
+                        + " tolerance " + TILE_ALIGNMENT_TOLERANCE_PX + " px)."
+                        + " Check that scale and CRS match the original export."
+                    );
+                }
                 if (localXPx % computeTileSize != 0
                     || localYPx % computeTileSize != 0) {
                     throw new IOException(
@@ -227,6 +284,19 @@ public final class AssembledCogWriter
                 compression
             );
 
+            // Surface zero-filled blocks so partial groups are visible
+            // rather than silent. We can't tell "edge tile (legitimately
+            // sparse)" from "interior tile with fetch failures" here —
+            // that's a downstream cross-reference against _failures.json.
+            List<int[]> missingBlocks = new ArrayList<>();
+            for (int ty = 0; ty < tilesDown; ty++) {
+                for (int tx = 0; tx < tilesAcross; tx++) {
+                    if (tilePixels.get(ty * tilesAcross + tx) == null) {
+                        missingBlocks.add(new int[] {tx, ty});
+                    }
+                }
+            }
+
             String filename = key.filename();
             String destination;
             if (outputPath.startsWith("gs://")) {
@@ -234,11 +304,47 @@ public final class AssembledCogWriter
             } else {
                 destination = writeToLocal(filename, cog);
             }
-            LOG.info(
-                "Wrote output tile {} ({} compute tiles, {} bytes) to {}",
-                key, computeTiles.size(), cog.length, destination
-            );
+            if (missingBlocks.isEmpty()) {
+                LOG.info(
+                    "Wrote output tile {} ({} compute tiles, {} bytes) to {}",
+                    key, computeTiles.size(), cog.length, destination
+                );
+            } else {
+                LOG.warn(
+                    "Wrote PARTIAL output tile {} ({} compute tiles, {} bytes, "
+                    + "{} blocks zero-filled) to {}; see {}.partial.json",
+                    key, computeTiles.size(), cog.length, missingBlocks.size(),
+                    destination, filename
+                );
+                outputTilesPartial.inc();
+                writePartialSidecar(filename, key, missingBlocks);
+            }
             outputTilesWritten.inc();
+        }
+
+        private void writePartialSidecar(
+            String filename, OutputTileKey key, List<int[]> missingBlocks
+        ) throws IOException {
+            StringBuilder json = new StringBuilder();
+            json.append("{\"output_tile\":\"").append(filename).append("\",")
+                .append("\"out_row\":").append(key.outRow()).append(",")
+                .append("\"out_col\":").append(key.outCol()).append(",")
+                .append("\"missing_blocks\":[");
+            for (int i = 0; i < missingBlocks.size(); i++) {
+                if (i > 0) {
+                    json.append(",");
+                }
+                int[] tc = missingBlocks.get(i);
+                json.append("{\"tx\":").append(tc[0]).append(",\"ty\":").append(tc[1]).append("}");
+            }
+            json.append("]}\n");
+            byte[] data = json.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            String sidecarName = filename + ".partial.json";
+            if (outputPath.startsWith("gs://")) {
+                writeToGcs(sidecarName, data);
+            } else {
+                writeToLocal(sidecarName, data);
+            }
         }
 
         private String writeToGcs(String filename, byte[] data) {

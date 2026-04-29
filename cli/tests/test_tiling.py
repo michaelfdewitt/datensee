@@ -105,18 +105,27 @@ def test_decompose_projected_crs_produces_different_tiles() -> None:
 
 
 def test_tiles_are_full_size() -> None:
-    """Every tile must be exactly tile_size_native wide — no edge clipping."""
-    grid = decompose_region(SMALL_SQUARE, scale_meters=30.0, tile_size_pixels=256)
-    from datensee.tiling import _pixel_size_native
+    """Every tile must be exactly tile_size_native wide — no edge clipping.
 
-    pixel = _pixel_size_native("EPSG:4326", 30.0)
-    expected_size = pixel * 256
+    Geographic CRSs use latitude-dependent meters-per-degree, so the
+    expected size is computed at the bbox centroid latitude (the same
+    value decompose_region uses internally).
+    """
+    grid = decompose_region(SMALL_SQUARE, scale_meters=30.0, tile_size_pixels=256)
+    from datensee.tiling import _pixel_sizes_native
+    from shapely.geometry import shape
+
+    miny, maxy = shape(SMALL_SQUARE).bounds[1], shape(SMALL_SQUARE).bounds[3]
+    centroid_lat = (miny + maxy) / 2.0
+    pixel_x, pixel_y = _pixel_sizes_native("EPSG:4326", 30.0, centroid_lat_deg=centroid_lat)
+    expected_w = pixel_x * 256
+    expected_h = pixel_y * 256
 
     for tile in grid.tiles:
         w = tile.x_max - tile.x_min
         h = tile.y_max - tile.y_min
-        assert abs(w - expected_size) < 1e-10, f"Tile width {w} != {expected_size}"
-        assert abs(h - expected_size) < 1e-10, f"Tile height {h} != {expected_size}"
+        assert abs(w - expected_w) < 1e-10, f"Tile width {w} != {expected_w}"
+        assert abs(h - expected_h) < 1e-10, f"Tile height {h} != {expected_h}"
 
 
 def test_tiles_are_full_size_utm() -> None:
@@ -134,14 +143,18 @@ def test_tiles_are_full_size_utm() -> None:
 def test_grid_snapped_to_global_origin() -> None:
     """Tile boundaries must be multiples of tile_size_native from (0, 0)."""
     grid = decompose_region(SMALL_SQUARE, scale_meters=30.0, tile_size_pixels=256)
-    from datensee.tiling import _pixel_size_native
+    from datensee.tiling import _pixel_sizes_native
+    from shapely.geometry import shape
 
-    tile_size_native = _pixel_size_native("EPSG:4326", 30.0) * 256
+    miny, maxy = shape(SMALL_SQUARE).bounds[1], shape(SMALL_SQUARE).bounds[3]
+    centroid_lat = (miny + maxy) / 2.0
+    pixel_x, pixel_y = _pixel_sizes_native("EPSG:4326", 30.0, centroid_lat_deg=centroid_lat)
+    tile_size_x = pixel_x * 256
+    tile_size_y = pixel_y * 256
 
     for tile in grid.tiles:
-        # x_min / tile_size_native should be an integer
-        col_idx = tile.x_min / tile_size_native
-        row_idx = tile.y_min / tile_size_native
+        col_idx = tile.x_min / tile_size_x
+        row_idx = tile.y_min / tile_size_y
         assert abs(col_idx - round(col_idx)) < 1e-9, (
             f"x_min={tile.x_min} not snapped (col_idx={col_idx})"
         )
@@ -167,15 +180,22 @@ def test_grid_snapped_to_global_origin_utm() -> None:
 
 
 def test_shifted_region_produces_aligned_grid() -> None:
-    """Two overlapping regions must produce identical tile boundaries
-    in the overlap area (because the grid is globally snapped)."""
+    """Two overlapping regions at the same centroid latitude produce
+    identical tile boundaries in the overlap area.
+
+    Geographic-CRS pixel size is latitude-dependent (1° of longitude is
+    smaller in meters as |lat| grows), so global grid alignment only
+    holds when both regions share a centroid latitude — or when the
+    grid is in a projected CRS (see ``_utm`` variant). Both regions
+    here share the same y-bounds so the assertion is meaningful.
+    """
     region_a = {
         "type": "Polygon",
         "coordinates": [[[0.0, 0.0], [0.5, 0.0], [0.5, 0.5], [0.0, 0.5], [0.0, 0.0]]],
     }
     region_b = {
         "type": "Polygon",
-        "coordinates": [[[0.2, 0.2], [0.7, 0.2], [0.7, 0.7], [0.2, 0.7], [0.2, 0.2]]],
+        "coordinates": [[[0.2, 0.0], [0.7, 0.0], [0.7, 0.5], [0.2, 0.5], [0.2, 0.0]]],
     }
 
     grid_a = decompose_region(region_a, scale_meters=100.0, tile_size_pixels=256)
