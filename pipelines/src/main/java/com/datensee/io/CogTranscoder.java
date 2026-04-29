@@ -136,22 +136,144 @@ public final class CogTranscoder {
         // Extract pixel data from strips or tiles
         byte[] pixelData = extractPixelData(entries, rawGeotiff, order);
 
+        int sampleFormat = entries.containsKey(TAG_SAMPLE_FORMAT)
+            ? getIntValue(entries, TAG_SAMPLE_FORMAT) : 1;
+
+        return partitionCompressBuild(
+            pixelData, width, height, tileSize,
+            bitsPerSample, samplesPerPixel, sampleFormat,
+            entries, order, compression
+        );
+    }
+
+    /**
+     * Multi-tile entry point for the M6 assembler.
+     *
+     * <p>Takes a pre-assembled pixel buffer (the union of compute tiles
+     * keyed under one output tile) plus a representative compute tile
+     * whose GeoTIFF metadata describes the sample structure and CRS,
+     * and returns a multi-block COG for the assembled image.
+     *
+     * <p>The {@code outputTileOriginX} / {@code outputTileOriginY} pair
+     * supplies the output tile's geographic origin in CRS units; this is
+     * written as the {@code ModelTiepointTag} so the resulting COG is
+     * georeferenced to the correct top-left corner. All other GeoTIFF
+     * tags (ModelPixelScale, GeoKeyDirectoryTag, GeoAsciiParams, etc.)
+     * are inherited from the supplied source tile — every compute tile
+     * shares them.
+     *
+     * @param pixelData              row-major assembled pixel bytes
+     *                               (W × H × samples × bytes-per-sample)
+     * @param width                  assembled image width in pixels
+     *                               (output tile size, multiple of tileSize)
+     * @param height                 assembled image height in pixels
+     *                               (output tile size, multiple of tileSize)
+     * @param tileSize               COG internal block size = compute tile size
+     * @param sourceTiffForMetadata  any compute tile from the group; used
+     *                               for sample structure and CRS metadata
+     * @param outputTileOriginX      x-coordinate of output tile origin
+     *                               (typically xMin)
+     * @param outputTileOriginY      y-coordinate of output tile origin
+     *                               (typically yMax)
+     * @param compression            "lzw", "deflate", or "none"
+     */
+    public static byte[] transcodeFromAssembledPixels(
+        byte[] pixelData,
+        int width, int height,
+        int tileSize,
+        byte[] sourceTiffForMetadata,
+        double outputTileOriginX,
+        double outputTileOriginY,
+        String compression
+    ) throws IOException {
+        if (width % tileSize != 0 || height % tileSize != 0) {
+            throw new IOException(
+                "Assembled image " + width + "x" + height
+                + " is not a whole-number multiple of tileSize=" + tileSize
+            );
+        }
+
+        // Parse sourceTiff to inherit sample structure + GeoTIFF tags.
+        ByteBuffer buf = ByteBuffer.wrap(sourceTiffForMetadata);
+        short bom = buf.getShort(0);
+        ByteOrder order = (bom == 0x4D4D) ? ByteOrder.BIG_ENDIAN : ByteOrder.LITTLE_ENDIAN;
+        buf.order(order);
+        short magic = buf.getShort(2);
+        if (magic != 42) {
+            throw new IOException("Source metadata blob is not a TIFF (magic=" + magic + ")");
+        }
+        int ifdOffset = buf.getInt(4);
+        buf.position(ifdOffset);
+        int entryCount = Short.toUnsignedInt(buf.getShort());
+        Map<Integer, IfdEntry> sourceEntries = new LinkedHashMap<>();
+        for (int i = 0; i < entryCount; i++) {
+            IfdEntry entry = IfdEntry.read(buf, order, sourceTiffForMetadata);
+            sourceEntries.put(entry.tag, entry);
+        }
+
+        int bitsPerSample = getIntValue(sourceEntries, TAG_BITS_PER_SAMPLE);
+        int samplesPerPixel = sourceEntries.containsKey(277)
+            ? getIntValue(sourceEntries, 277) : 1;
+        int sampleFormat = sourceEntries.containsKey(TAG_SAMPLE_FORMAT)
+            ? getIntValue(sourceEntries, TAG_SAMPLE_FORMAT) : 1;
+
+        int expectedBytes = width * height * samplesPerPixel * (bitsPerSample / 8);
+        if (pixelData.length != expectedBytes) {
+            throw new IOException(
+                "Assembled pixel buffer is " + pixelData.length
+                + " bytes; expected " + expectedBytes
+                + " (" + width + "x" + height + " * " + samplesPerPixel
+                + " samples * " + (bitsPerSample / 8) + " bytes/sample)"
+            );
+        }
+
+        // Override the source ImageWidth/ImageLength and ModelTiepoint
+        // (33922) — everything else (ModelPixelScale, GeoKeyDirectory,
+        // GeoAsciiParams, sample-structure tags) is inherited via the
+        // copy loop in buildCogTiff.
+        Map<Integer, IfdEntry> overridden = new LinkedHashMap<>(sourceEntries);
+        overridden.put(TAG_IMAGE_WIDTH, IfdEntry.shortValue(TAG_IMAGE_WIDTH, width));
+        overridden.put(TAG_IMAGE_LENGTH, IfdEntry.shortValue(TAG_IMAGE_LENGTH, height));
+        overridden.put(33922, IfdEntry.doubleArray(33922, new double[] {
+            0.0, 0.0, 0.0, outputTileOriginX, outputTileOriginY, 0.0
+        }));
+
+        return partitionCompressBuild(
+            pixelData, width, height, tileSize,
+            bitsPerSample, samplesPerPixel, sampleFormat,
+            overridden, order, compression
+        );
+    }
+
+    /**
+     * Shared multi-block emit path: split row-major pixel data into
+     * {@code tilesAcross × tilesDown} blocks, apply predictor + compress
+     * each block independently (TIFF spec requires self-contained tiles),
+     * then assemble into the final COG layout.
+     */
+    private static byte[] partitionCompressBuild(
+        byte[] pixelData,
+        int width, int height,
+        int tileSize,
+        int bitsPerSample, int samplesPerPixel, int sampleFormat,
+        Map<Integer, IfdEntry> entries,
+        ByteOrder order,
+        String compression
+    ) throws IOException {
+        int tilesAcross = width / tileSize;
+        int tilesDown = height / tileSize;
+
         LOG.debug(
-            "Input: {}x{}, {}bps, {} samples, {}x{} blocks, {} bytes pixel data",
+            "Assembling: {}x{}, {}bps, {} samples, {}x{} blocks, {} bytes pixel data",
             width, height, bitsPerSample, samplesPerPixel,
             tilesAcross, tilesDown, pixelData.length
         );
 
-        // Determine compression
         int compressCode;
         int predictorCode = PREDICTOR_NONE;
         switch (compression.toLowerCase()) {
             case "lzw" -> {
                 compressCode = COMPRESS_LZW;
-                // Use horizontal differencing for integer types (>= 8bps),
-                // skip for float (sample format 3) as it can hurt compression.
-                int sampleFormat = entries.containsKey(TAG_SAMPLE_FORMAT)
-                    ? getIntValue(entries, TAG_SAMPLE_FORMAT) : 1;
                 if (sampleFormat != 3) {  // not floating point
                     predictorCode = PREDICTOR_HORIZONTAL;
                 }
@@ -163,10 +285,6 @@ public final class CogTranscoder {
 
         int bytesPerSample = bitsPerSample / 8;
 
-        // Split row-major pixel data into tilesAcross × tilesDown blocks
-        // and compress each block independently. The TIFF spec requires
-        // each tile to be self-contained: predictor + compression are
-        // applied per tile, not over the whole image.
         List<byte[]> compressedBlocks = new ArrayList<>(tilesAcross * tilesDown);
         for (int ty = 0; ty < tilesDown; ty++) {
             for (int tx = 0; tx < tilesAcross; tx++) {
@@ -194,12 +312,36 @@ public final class CogTranscoder {
             }
         }
 
-        // Build new TIFF with tile layout
         return buildCogTiff(
             entries, compressedBlocks, order,
             width, height, tileSize,
             compressCode, predictorCode
         );
+    }
+
+    /**
+     * Extract just the raw row-major pixel bytes from a TIFF, decompressing
+     * if needed. Used by the M6 assembler to read each compute tile's
+     * pixels before stitching them into an output buffer.
+     */
+    public static byte[] extractPixelsFromTiff(byte[] rawTiff) throws IOException {
+        ByteBuffer buf = ByteBuffer.wrap(rawTiff);
+        short bom = buf.getShort(0);
+        ByteOrder order = (bom == 0x4D4D) ? ByteOrder.BIG_ENDIAN : ByteOrder.LITTLE_ENDIAN;
+        buf.order(order);
+        short magic = buf.getShort(2);
+        if (magic != 42) {
+            throw new IOException("Not a TIFF file (magic=" + magic + ")");
+        }
+        int ifdOffset = buf.getInt(4);
+        buf.position(ifdOffset);
+        int entryCount = Short.toUnsignedInt(buf.getShort());
+        Map<Integer, IfdEntry> entries = new LinkedHashMap<>();
+        for (int i = 0; i < entryCount; i++) {
+            IfdEntry entry = IfdEntry.read(buf, order, rawTiff);
+            entries.put(entry.tag, entry);
+        }
+        return extractPixelData(entries, rawTiff, order);
     }
 
     /**
@@ -806,6 +948,14 @@ public final class CogTranscoder {
 
         static IfdEntry longArray(int tag, long[] values) {
             return new IfdEntry(tag, 4, values.length, values, null);
+        }
+
+        static IfdEntry doubleArray(int tag, double[] values) {
+            long[] bits = new long[values.length];
+            for (int i = 0; i < values.length; i++) {
+                bits[i] = Double.doubleToRawLongBits(values[i]);
+            }
+            return new IfdEntry(tag, 12, values.length, bits, null);
         }
 
         static IfdEntry read(ByteBuffer buf, ByteOrder order, byte[] raw) {

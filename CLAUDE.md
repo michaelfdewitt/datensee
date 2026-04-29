@@ -212,7 +212,7 @@ These are the areas where the real complexity lives:
 4. **M4: UX Polish** ✅ — Rich progress bar (local mode), cost estimation (EECU range, Dataflow USD, storage), summary panels, confirmation for large jobs, enhanced Dataflow status polling with metrics.
 5. **M5: Distribution** ✅ — `pip install datensee`, smart JAR discovery, `datensee jar` subcommands (download/build/path), Apache 2.0 license, full PyPI metadata.
 6. **Notebook Integration** ✅ — Public Python API (`api.py`), Colab/Jupyter auto-auth, HTML display adapters (job progress, cost estimate, tile grid, tile preview), quickstart notebook, `notebook`/`all` optional dependency groups.
-7. **M6: Two-Tier Tiling** — Separate compute tiles (small, for EE HV API) from output tiles (large, for practical file counts). Compute tiles are fetched in parallel, then grouped by output tile via a Beam GroupByKey + shuffle, assembled into larger rasters, and written as COGs. This decouples fetch parallelism from output file granularity.
+7. **M6: Two-Tier Tiling** ✅ — Compute tiles (small, for EE HV API) and output tiles (large, for practical file counts) are separated. Compute tiles are fetched in parallel, then grouped by output tile via Beam `GroupByKey`, assembled by `AssembledCogWriter` into a contiguous pixel buffer, and written as multi-block COGs whose internal block size equals the compute tile size. Opt-in via `output.output_tile_size_pixels` (must be a multiple of `tile_grid.tile_size_pixels`); the default behavior is one COG per compute tile. See [`docs/handoff.md`](docs/handoff.md) for the wiring summary.
 
 ## Testing
 

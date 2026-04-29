@@ -52,6 +52,7 @@ public record PipelineConfig(
         @JsonProperty("output_path") String outputPath,
         @JsonProperty("band_count") int bandCount,
         @JsonProperty("data_type") String dataType,
+        @JsonProperty("output_tile_size_pixels") Integer outputTileSizePixels,
         CogConfig cog
     ) {
         /** Returns band count, defaulting to 1 if not set. */
@@ -62,6 +63,16 @@ public record PipelineConfig(
         /** Returns data type, defaulting to float32 if not set. */
         public String effectiveDataType() {
             return dataType != null && !dataType.isBlank() ? dataType : "float32";
+        }
+
+        /**
+         * Returns the output COG edge size in pixels, defaulting to the
+         * compute tile size when M6 two-tier tiling is disabled.
+         */
+        public int effectiveOutputTileSizePixels(int computeTileSize) {
+            return outputTileSizePixels != null && outputTileSizePixels > 0
+                ? outputTileSizePixels
+                : computeTileSize;
         }
     }
 

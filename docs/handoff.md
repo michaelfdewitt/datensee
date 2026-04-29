@@ -51,11 +51,13 @@ VrtAssembler — emits a `.vrt` manifest stitching tiles into one virtual raster
 
 The output of the pipeline is N tile COGs + 1 VRT, **not** a single mosaic COG. M6 (two-tier tiling) will change that.
 
-### Single-tile invariant — IMPORTANT
+### Multi-block COGs (M6)
 
-`CogTranscoder` only emits **single-tile COGs**. The invariant is now enforced (April 2026): `transcode()` throws `IOException` if `imageWidth != tileSize` or `imageHeight != tileSize`. This is safe because `TileFetchDoFn` always requests `dimensions={tileSize, tileSize}` from the EE HV API.
+`CogTranscoder` emits multi-block COGs. The image dimensions must be a whole-number multiple of `tileSize` (the COG's internal block size); partial-edge tiles aren't supported. For one-COG-per-fetch (the default mode), `imageWidth == imageHeight == tileSize` and there's a single block. For M6 two-tier tiling, the assembler builds an `output_tile_size × output_tile_size` buffer (always a multiple of `tileSize`) and `CogTranscoder` partitions it into `(output_tile_size / tileSize)²` inner blocks, each compressed independently per the TIFF spec.
 
-If you ever want to relax this — for instance to support a multi-tile output COG in M6 — `buildCogTiff` needs real partitioning: split `pixelData` into `tilesAcross * tilesDown` blocks and emit arrays for `TileOffsets` (324) and `TileByteCounts` (325). Today they're single-element.
+Two entry points:
+- `transcode(rawGeotiff, tileSize, compression)` — input is an EE-HV-shaped GeoTIFF; used by the one-COG-per-tile path.
+- `transcodeFromAssembledPixels(pixelData, width, height, tileSize, sourceTiffForMetadata, outputTileOriginX, outputTileOriginY, compression)` — input is a pre-assembled pixel buffer plus a representative compute tile for CRS/sample-structure metadata. Used by [`AssembledCogWriter`](../pipelines/src/main/java/com/datensee/io/AssembledCogWriter.java). The source tile's `ModelTiepoint` is overridden with the output tile's origin; everything else (`ModelPixelScale`, `GeoKeyDirectoryTag`, `GeoAsciiParams`, etc.) is inherited.
 
 ### Why deflate is the default, not LZW
 
@@ -130,13 +132,31 @@ The failures journal (`{output}/_failures.json`) is now a structured NDJSON of `
 
 ---
 
+## M6 two-tier tiling — wiring summary
+
+Compute tiles flow into the pipeline as before. When `output.output_tile_size_pixels` is set on `OutputConfig`, `DatensEEPipeline` swaps the per-tile writer (`CogWriter`) for `AssembledCogWriter`, which:
+
+1. Keys each `FetchedTile` by `(out_row, out_col)` (assigned in `tiling.decompose_region` from `output_tile_size_pixels // tile_size_pixels`).
+2. `GroupByKey` shuffles compute tiles together by output tile.
+3. `AssembleAndWriteDoFn` allocates an output buffer of size `output_tile_size × output_tile_size`, copies each compute tile's pixel data into the right offset (computed from bbox math, CRS-axis-order-independent), and calls `CogTranscoder.transcodeFromAssembledPixels`.
+4. The resulting multi-block COG is written as `tile_r{out_row:04d}_c{out_col:04d}.tif`.
+
+The internal block size of the output COG is the compute tile size, so EE's `loadGeoTIFF` can random-access individual compute-tile-sized regions efficiently.
+
+`VrtAssembler` is two-tier-aware: in M6 mode it deduplicates compute tiles by `(out_row, out_col)`, takes the union bbox per output tile, and writes one `<SimpleSource>` per output COG referencing that file's `output_tile_size`.
+
+When `output_tile_size_pixels` is unset (the default), routing falls through to the existing one-COG-per-tile path with no behavior change.
+
+---
+
 ## Known limitations / TODOs in priority order
 
 1. **LZW encoder is broken.** Either fix against a TIFF-LZW canonical vector or rip it out. Default is deflate; LZW only routes if user explicitly sets `compress: "lzw"`.
-2. **Single-tile-per-COG only.** Multi-tile partitioning is not implemented. Required for M6 (two-tier tiling).
+2. **Adaptive-retry splitter not implemented.** Wire contract is in tree (see [`docs/retry-with-journal.md`](retry-with-journal.md)) — error classification + the `datensee retry --journal` CLI + the splitter logic itself are follow-ups.
 3. **`/proc/self/fd/<N>` is Linux-only.** Service-driven auth path won't work on macOS or Windows. Standalone CLI on those OSes uses ADC and is fine.
 4. **Predictor is only applied for LZW.** Deflate would also benefit from horizontal differencing for integer types — pure compression-ratio win, no correctness issue.
 5. **`extractPixelData` for tile-layout inputs concatenates tile bytes in tile order**, not pixel-row order. Safe today because EE HV always returns strip layout; would silently produce wrong pixels for a multi-tile input.
+6. **Partial output tiles are zero-filled.** If some compute tiles in an output group failed and were dead-lettered, the assembler emits a partially-populated COG with zero-filled gaps. Whether to skip the output tile entirely or surface a warning is a design decision left for the next iteration.
 
 ---
 

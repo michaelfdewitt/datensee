@@ -51,6 +51,7 @@ def decompose_region(
     scale_meters: float,
     crs: str = "EPSG:4326",
     tile_size_pixels: int = 512,
+    output_tile_size_pixels: int | None = None,
 ) -> TileGrid:
     """Decompose a GeoJSON geometry into a snapped, regular tile grid.
 
@@ -59,15 +60,33 @@ def decompose_region(
     independent calls will produce pixel-aligned grids regardless of the
     input region. Edge tiles are full-size (never clipped).
 
+    M6 two-tier tiling: when ``output_tile_size_pixels`` is set (must be a
+    positive multiple of ``tile_size_pixels``), each compute tile is also
+    stamped with ``out_row``/``out_col`` — the indices of the *output* tile
+    it belongs to. The output grid is snapped to the same global origin
+    so output tiles align with compute tiles. When unset, ``out_row`` and
+    ``out_col`` mirror ``row`` and ``col`` (one COG per compute tile).
+
     Args:
         geojson_geometry: GeoJSON geometry dict (polygon or multipolygon), in WGS84.
         scale_meters: Pixel size in meters. Tiles will be tile_size_pixels × scale wide.
         crs: Target CRS for the tile grid (EPSG code or proj string).
-        tile_size_pixels: Number of pixels per tile edge.
+        tile_size_pixels: Compute tile edge in pixels.
+        output_tile_size_pixels: Output COG edge in pixels (multiple of
+            tile_size_pixels). When None, one COG per compute tile.
 
     Returns:
         TileGrid covering the bounding box of the input geometry.
     """
+    if (
+        output_tile_size_pixels is not None
+        and output_tile_size_pixels % tile_size_pixels != 0
+    ):
+        raise ValueError(
+            f"output_tile_size_pixels ({output_tile_size_pixels}) must be a multiple "
+            f"of tile_size_pixels ({tile_size_pixels})"
+        )
+
     geom_wgs84 = shape(geojson_geometry)
 
     if crs == "EPSG:4326":
@@ -88,6 +107,18 @@ def decompose_region(
     col_end = math.ceil(maxx / tile_size_native)
     row_end = math.ceil(maxy / tile_size_native)
 
+    # Output-tile mapping (M6). Both grids snap to the same global origin
+    # at (0, 0), so an absolute compute-grid index can be quotiented by N
+    # to get its absolute output-grid index. Localizing to the bbox uses
+    # the floor of the bbox-start indices so all compute tiles inside one
+    # output tile share the same out_row/out_col.
+    if output_tile_size_pixels is None or output_tile_size_pixels == tile_size_pixels:
+        n_per_output = 1
+    else:
+        n_per_output = output_tile_size_pixels // tile_size_pixels
+    out_row_start = row_start // n_per_output
+    out_col_start = col_start // n_per_output
+
     tiles: list[TileCoordinate] = []
     for row_idx in range(row_start, row_end):
         for col_idx in range(col_start, col_end):
@@ -101,14 +132,18 @@ def decompose_region(
             if not geom_native.intersects(tile_box):
                 continue
 
+            local_row = row_idx - row_start
+            local_col = col_idx - col_start
             tiles.append(
                 TileCoordinate(
                     x_min=tile_xmin,
                     y_min=tile_ymin,
                     x_max=tile_xmax,
                     y_max=tile_ymax,
-                    row=row_idx - row_start,
-                    col=col_idx - col_start,
+                    row=local_row,
+                    col=local_col,
+                    out_row=(row_idx // n_per_output) - out_row_start,
+                    out_col=(col_idx // n_per_output) - out_col_start,
                 )
             )
 

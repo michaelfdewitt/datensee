@@ -1,5 +1,7 @@
 """Tests for region → tile grid decomposition."""
 
+import pytest
+
 from datensee.tiling import decompose_region
 
 CALIFORNIA_BBOX = {
@@ -214,3 +216,99 @@ def test_adjacent_tiles_share_boundaries() -> None:
                 f"Gap/overlap between ({row},{col}) and ({row + 1},{col}): "
                 f"{tile.y_max} vs {above.y_min}"
             )
+
+
+# ---------------------------------------------------------------------------
+# M6 two-tier tiling: out_row / out_col assignment
+# ---------------------------------------------------------------------------
+
+
+def test_out_row_col_default_to_row_col_when_two_tier_disabled() -> None:
+    grid = decompose_region(CALIFORNIA_BBOX, scale_meters=10000.0, tile_size_pixels=256)
+    for t in grid.tiles:
+        assert t.out_row == t.row
+        assert t.out_col == t.col
+
+
+def test_out_row_col_when_output_tile_equals_compute_tile() -> None:
+    """Setting output_tile_size_pixels equal to tile_size_pixels is a no-op."""
+    grid = decompose_region(
+        CALIFORNIA_BBOX,
+        scale_meters=10000.0,
+        tile_size_pixels=256,
+        output_tile_size_pixels=256,
+    )
+    for t in grid.tiles:
+        assert t.out_row == t.row
+        assert t.out_col == t.col
+
+
+def test_out_row_col_groups_compute_tiles_into_output_tiles() -> None:
+    """Each compute tile carries the (out_row, out_col) of its containing output tile."""
+    grid = decompose_region(
+        CALIFORNIA_BBOX,
+        scale_meters=10000.0,
+        tile_size_pixels=64,
+        output_tile_size_pixels=256,  # 4×4 compute tiles per output tile
+    )
+
+    # All compute tiles inside one output tile must agree on (out_row, out_col).
+    by_out_key: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for t in grid.tiles:
+        by_out_key.setdefault((t.out_row, t.out_col), []).append((t.row, t.col))
+
+    # Each output cell should hold up to 4×4 = 16 compute tiles (less at the
+    # bbox edge where the bbox doesn't cover the full output cell).
+    for (out_row, out_col), members in by_out_key.items():
+        assert len(members) <= 16, (
+            f"Output ({out_row},{out_col}) should contain at most 16 compute "
+            f"tiles, got {len(members)}: {members}"
+        )
+
+    # Bounding boxes of compute tiles in the same output cell must form a
+    # contiguous block — no orphan tile in a cell that doesn't share a wall
+    # with at least one sibling.
+    for members in by_out_key.values():
+        members.sort()
+        rows = {r for r, _ in members}
+        cols = {c for _, c in members}
+        # Within an output cell, compute tiles should occupy consecutive
+        # rows and consecutive cols (modulo bbox clipping).
+        assert max(rows) - min(rows) <= 3
+        assert max(cols) - min(cols) <= 3
+
+
+def test_out_row_col_uses_floor_division_for_assignment() -> None:
+    """Compute tile (row, col) → (row // N, col // N) for output assignment."""
+    grid = decompose_region(
+        SMALL_SQUARE,
+        scale_meters=30.0,
+        tile_size_pixels=64,
+        output_tile_size_pixels=192,  # N = 3
+    )
+    n = 192 // 64
+    # When the bbox starts at column 0, out_col == col // N with no offset.
+    # With a non-zero start, both indices shift identically — the relation
+    # `(out_col_local + offset_out) * N <= (col_local + offset_compute) <
+    # (out_col_local + offset_out + 1) * N` still holds.
+    # Easier check: for each tile, col // N agrees with its sibling's col // N.
+    by_out = {}
+    for t in grid.tiles:
+        by_out.setdefault((t.out_row, t.out_col), []).append(t)
+    # Within a group, all rows/cols must share the same row // N / col // N.
+    for tiles in by_out.values():
+        target_block_row = tiles[0].row // n
+        target_block_col = tiles[0].col // n
+        for t in tiles:
+            assert t.row // n == target_block_row
+            assert t.col // n == target_block_col
+
+
+def test_invalid_output_tile_size_rejected() -> None:
+    with pytest.raises(ValueError, match="must be a multiple"):
+        decompose_region(
+            SMALL_SQUARE,
+            scale_meters=30.0,
+            tile_size_pixels=64,
+            output_tile_size_pixels=100,  # not a multiple of 64
+        )

@@ -194,8 +194,18 @@ def export(
     ] = "EPSG:4326",
     tile_size: Annotated[
         int,
-        typer.Option("--tile-size", help="Tile edge size in pixels."),
+        typer.Option("--tile-size", help="Compute tile edge size in pixels."),
     ] = 512,
+    output_tile_size: Annotated[
+        int | None,
+        typer.Option(
+            "--output-tile-size",
+            help=(
+                "M6 two-tier tiling: output COG edge in pixels (multiple of "
+                "--tile-size). Defaults to one COG per compute tile."
+            ),
+        ),
+    ] = None,
     runner: Annotated[
         str,
         typer.Option("--runner", help="Runner mode: 'local' or 'dataflow'."),
@@ -270,6 +280,7 @@ def export(
         scale_meters=scale,
         crs=crs,
         tile_size_pixels=tile_size,
+        output_tile_size_pixels=output_tile_size,
     )
     console.print(f"  → {len(tile_grid.tiles)} tiles")
 
@@ -293,7 +304,10 @@ def export(
         ee_expression=ee_expression,
         gee_project=project,
         tile_grid=tile_grid,
-        output=OutputConfig(output_path=output),
+        output=OutputConfig(
+            output_path=output,
+            output_tile_size_pixels=output_tile_size,
+        ),
         runner=runner_config,
         rate_limit=RateLimitConfig(max_qps=max_qps),
     )

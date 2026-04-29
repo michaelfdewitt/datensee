@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.datensee.fetch.TileFetchDoFn;
 import com.datensee.fetch.TileFetchTransform;
+import com.datensee.io.AssembledCogWriter;
 import com.datensee.io.CogWriter;
 import com.datensee.io.FailedTileWriter;
 import com.datensee.io.TileCoordinateParser;
@@ -128,10 +129,29 @@ public final class DatensEEPipeline {
         String compression = config.output().cog() != null
             && config.output().cog().compress() != null
             ? config.output().cog().compress() : "deflate";
-        fetched.apply(
-            "WriteTiles",
-            new CogWriter(config.output().outputPath(), tileSize, compression)
-        );
+
+        // M6 routing: when output_tile_size_pixels is set and larger
+        // than the compute tile size, group compute tiles by output tile
+        // and assemble. Otherwise fall through to one COG per compute tile.
+        int outputTileSize = config.output().effectiveOutputTileSizePixels(tileSize);
+        boolean twoTier = outputTileSize > tileSize;
+        if (twoTier) {
+            LOG.info(
+                "M6 two-tier tiling: output tile size = {}px (= {}x{} compute tiles per output COG)",
+                outputTileSize, outputTileSize / tileSize, outputTileSize / tileSize
+            );
+            fetched.apply(
+                "AssembleAndWriteOutputTiles",
+                new AssembledCogWriter(
+                    config.output().outputPath(), tileSize, outputTileSize, compression
+                )
+            );
+        } else {
+            fetched.apply(
+                "WriteTiles",
+                new CogWriter(config.output().outputPath(), tileSize, compression)
+            );
+        }
 
         // --- Write failure report ---
         String failuresPath = failuresOutputPath(config.output().outputPath());
@@ -143,6 +163,9 @@ public final class DatensEEPipeline {
                 .withSuffix(".json"));
 
         // --- VRT assembly ---
+        // VRT references the actual on-disk files. In two-tier mode,
+        // those are output tiles (tile size = outputTileSize); otherwise
+        // they're compute tiles (tile size = tileSize).
         fetched.apply(
             "AssembleVrt",
             new VrtAssembler(
@@ -150,7 +173,8 @@ public final class DatensEEPipeline {
                 crs,
                 config.output().effectiveBandCount(),
                 config.output().effectiveDataType(),
-                tileSize
+                outputTileSize,
+                twoTier
             )
         );
 

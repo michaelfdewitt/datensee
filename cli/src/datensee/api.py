@@ -183,6 +183,7 @@ def export(
     scale: float = 30.0,
     crs: str = "EPSG:4326",
     tile_size: int = 512,
+    output_tile_size: int | None = None,
     runner: Literal["local", "dataflow"] = "dataflow",
     region_gcp: str = "us-central1",
     temp_location: str | None = None,
@@ -209,7 +210,13 @@ def export(
         output: Output path — GCS URI (gs://…) for Dataflow, or local dir.
         scale: Pixel size in meters.
         crs: Target CRS (EPSG code or proj string).
-        tile_size: Tile edge size in pixels.
+        tile_size: Compute tile edge size in pixels (sent to the EE HV API).
+        output_tile_size: M6 two-tier tiling — output COG edge size in
+            pixels. Must be a positive multiple of ``tile_size``. When
+            None (the default), one COG is written per compute tile.
+            When set to a multiple > tile_size, compute tiles are grouped
+            and assembled into larger COGs whose internal block size is
+            tile_size. Decouples fetch parallelism from output file count.
         runner: 'local' or 'dataflow'.
         region_gcp: Dataflow region (e.g. 'us-central1').
         temp_location: GCS URI for Dataflow temp files (required for Dataflow).
@@ -270,6 +277,7 @@ def export(
         scale_meters=scale,
         crs=crs,
         tile_size_pixels=tile_size,
+        output_tile_size_pixels=output_tile_size,
     )
 
     # Build config
@@ -291,7 +299,10 @@ def export(
         ee_expression=ee_expression,
         gee_project=project,
         tile_grid=tile_grid,
-        output=OutputConfig(output_path=output),
+        output=OutputConfig(
+            output_path=output,
+            output_tile_size_pixels=output_tile_size,
+        ),
         runner=runner_config,
         rate_limit=RateLimitConfig(max_qps=max_qps),
     )

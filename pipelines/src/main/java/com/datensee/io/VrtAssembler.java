@@ -41,7 +41,28 @@ public final class VrtAssembler
     private final int bandCount;
     private final String dataType;
     private final int tileSizePixels;
+    private final boolean twoTier;
 
+    public VrtAssembler(
+        String outputPath,
+        String crs,
+        int bandCount,
+        String dataType,
+        int tileSizePixels,
+        boolean twoTier
+    ) {
+        this.outputPath = outputPath;
+        this.crs = crs;
+        this.bandCount = bandCount;
+        this.dataType = dataType;
+        this.tileSizePixels = tileSizePixels;
+        this.twoTier = twoTier;
+    }
+
+    /**
+     * Backward-compatible constructor for non-M6 mode (one COG per
+     * compute tile). Kept for existing tests / callers.
+     */
     public VrtAssembler(
         String outputPath,
         String crs,
@@ -49,26 +70,34 @@ public final class VrtAssembler
         String dataType,
         int tileSizePixels
     ) {
-        this.outputPath = outputPath;
-        this.crs = crs;
-        this.bandCount = bandCount;
-        this.dataType = dataType;
-        this.tileSizePixels = tileSizePixels;
+        this(outputPath, crs, bandCount, dataType, tileSizePixels, false);
     }
 
     @Override
     public PDone expand(PCollection<FetchedTile> input) {
         input
-            .apply("ExtractTileMetadata", ParDo.of(new ExtractMetadata()))
+            .apply("ExtractTileMetadata", ParDo.of(new ExtractMetadata(twoTier)))
             .apply("CollectAllTiles", Combine.globally(new TileListCombiner()))
             .apply("WriteVrt", ParDo.of(new WriteVrtDoFn(
-                outputPath, crs, bandCount, dataType, tileSizePixels
+                outputPath, crs, bandCount, dataType, tileSizePixels, twoTier
             )));
         return PDone.in(input.getPipeline());
     }
 
-    /** Extracts the coordinate from a FetchedTile (drops the pixel data). */
+    /**
+     * Extracts the coordinate from a FetchedTile (drops the pixel data).
+     *
+     * <p>In two-tier (M6) mode, each compute tile contributes to one
+     * output tile keyed by {@code (outRow, outCol)}; we deduplicate
+     * downstream so the VRT references each output tile exactly once.
+     */
     static final class ExtractMetadata extends DoFn<FetchedTile, TileCoordinate> {
+        private final boolean twoTier;
+
+        ExtractMetadata(boolean twoTier) {
+            this.twoTier = twoTier;
+        }
+
         @ProcessElement
         public void processElement(
             @Element FetchedTile tile,
@@ -135,6 +164,7 @@ public final class VrtAssembler
         private final int bandCount;
         private final String dataType;
         private final int tileSizePixels;
+        private final boolean twoTier;
 
         private transient Storage storage;
 
@@ -143,13 +173,15 @@ public final class VrtAssembler
             String crs,
             int bandCount,
             String dataType,
-            int tileSizePixels
+            int tileSizePixels,
+            boolean twoTier
         ) {
             this.outputPath = outputPath;
             this.crs = crs;
             this.bandCount = bandCount;
             this.dataType = dataType;
             this.tileSizePixels = tileSizePixels;
+            this.twoTier = twoTier;
         }
 
         @Setup
@@ -175,23 +207,69 @@ public final class VrtAssembler
             }
         }
 
+        /**
+         * One source-rect per on-disk file. In two-tier mode, that's one
+         * per *output* tile (deduplicated from the compute-tile stream
+         * by {@code (outRow, outCol)} with bbox derived from the union
+         * of contributing compute tiles). Otherwise, one per compute tile.
+         */
+        private record SourceTile(
+            int outRow, int outCol,
+            double xMin, double yMin, double xMax, double yMax
+        ) { }
+
+        private List<SourceTile> aggregateSources(List<TileCoordinate> tiles) {
+            if (!twoTier) {
+                return tiles.stream()
+                    .map(t -> new SourceTile(
+                        t.row(), t.col(),
+                        t.xMin(), t.yMin(), t.xMax(), t.yMax()
+                    ))
+                    .toList();
+            }
+            // Group by (outRow, outCol) and take the union bbox of each
+            // group. With a snapped global grid every group's bbox is
+            // exactly outputTileSize * pixelSize on each side; the
+            // union math is just min/max.
+            Map<Long, double[]> byKey = new java.util.LinkedHashMap<>();
+            for (TileCoordinate t : tiles) {
+                long k = ((long) t.outRow() << 32) | (t.outCol() & 0xFFFFFFFFL);
+                double[] bbox = byKey.computeIfAbsent(k, _k -> new double[] {
+                    Double.POSITIVE_INFINITY, Double.POSITIVE_INFINITY,
+                    Double.NEGATIVE_INFINITY, Double.NEGATIVE_INFINITY
+                });
+                bbox[0] = Math.min(bbox[0], t.xMin());
+                bbox[1] = Math.min(bbox[1], t.yMin());
+                bbox[2] = Math.max(bbox[2], t.xMax());
+                bbox[3] = Math.max(bbox[3], t.yMax());
+            }
+            List<SourceTile> result = new java.util.ArrayList<>();
+            for (Map.Entry<Long, double[]> e : byKey.entrySet()) {
+                int outRow = (int) (e.getKey() >> 32);
+                int outCol = (int) (e.getKey() & 0xFFFFFFFFL);
+                double[] bbox = e.getValue();
+                result.add(new SourceTile(outRow, outCol, bbox[0], bbox[1], bbox[2], bbox[3]));
+            }
+            return result;
+        }
+
         private String buildVrt(List<TileCoordinate> tiles) {
-            List<TileCoordinate> sorted = tiles.stream()
-                .sorted(Comparator.comparingInt(TileCoordinate::row)
-                    .thenComparingInt(TileCoordinate::col))
+            List<SourceTile> sources = aggregateSources(tiles).stream()
+                .sorted(Comparator.comparingInt(SourceTile::outRow)
+                    .thenComparingInt(SourceTile::outCol))
                 .toList();
 
-            double globalXMin = sorted.stream()
-                .mapToDouble(TileCoordinate::xMin).min().orElseThrow();
-            double globalYMin = sorted.stream()
-                .mapToDouble(TileCoordinate::yMin).min().orElseThrow();
-            double globalXMax = sorted.stream()
-                .mapToDouble(TileCoordinate::xMax).max().orElseThrow();
-            double globalYMax = sorted.stream()
-                .mapToDouble(TileCoordinate::yMax).max().orElseThrow();
+            double globalXMin = sources.stream()
+                .mapToDouble(SourceTile::xMin).min().orElseThrow();
+            double globalYMin = sources.stream()
+                .mapToDouble(SourceTile::yMin).min().orElseThrow();
+            double globalXMax = sources.stream()
+                .mapToDouble(SourceTile::xMax).max().orElseThrow();
+            double globalYMax = sources.stream()
+                .mapToDouble(SourceTile::yMax).max().orElseThrow();
 
-            double tileWidth = sorted.getFirst().xMax() - sorted.getFirst().xMin();
-            double tileHeight = sorted.getFirst().yMax() - sorted.getFirst().yMin();
+            double tileWidth = sources.getFirst().xMax() - sources.getFirst().xMin();
+            double tileHeight = sources.getFirst().yMax() - sources.getFirst().yMin();
             double pixelWidth = tileWidth / tileSizePixels;
             double pixelHeight = tileHeight / tileSizePixels;
 
@@ -211,10 +289,10 @@ public final class VrtAssembler
                 sb.append(String.format("  <VRTRasterBand dataType=\"%s\" band=\"%d\">%n",
                     gdalType, band));
 
-                for (TileCoordinate tile : sorted) {
+                for (SourceTile tile : sources) {
                     int xOff = (int) Math.round((tile.xMin() - globalXMin) / pixelWidth);
                     int yOff = (int) Math.round((globalYMax - tile.yMax()) / pixelHeight);
-                    String filename = String.format("tile_r%04d_c%04d.tif", tile.row(), tile.col());
+                    String filename = String.format("tile_r%04d_c%04d.tif", tile.outRow(), tile.outCol());
 
                     sb.append("    <SimpleSource>\n");
                     sb.append(String.format(
