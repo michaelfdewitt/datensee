@@ -1,29 +1,29 @@
-# DatensEE Eval Catalog
+# DatensEE Validation Check Catalog
 
-Evals validate pipeline output correctness — are the pixels right, is the spatial metadata right, do tiles stitch together seamlessly?
+The validation suite is a post-export integration test that confirms output correctness — are the pixels right, is the spatial metadata right, do tiles stitch together seamlessly?
 
 ## Usage
 
 ```bash
-# Run all zero-cost evals against local output
-datensee eval ./output --config config.json
+# Run all zero-cost checks against local output
+datensee validate ./output --config config.json
 
-# Run specific evals
-datensee eval ./output --config config.json --evals E01,E03,E08
+# Run specific checks
+datensee validate ./output --config config.json --checks E01,E03,E08
 
 # Include E07 pixel accuracy (costs EECUs)
-datensee eval ./output --config config.json --reference --gee-project my-project
+datensee validate ./output --config config.json --reference --gee-project my-project
 
 # Machine-readable output
-datensee eval ./output --config config.json --json report.json
+datensee validate ./output --config config.json --json report.json
 
-# Auto-run evals after export
-datensee export expr.json region.json -p my-project -o ./output --eval
+# Auto-run checks after export
+datensee export expr.json region.json -p my-project -o ./output --validate
 ```
 
 ```python
 # Programmatic usage
-from datensee.eval import validate_output, EvalID
+from datensee.validation import validate_output, CheckID
 from datensee.config import PipelineConfig
 
 config = PipelineConfig.read_json("config.json")
@@ -33,11 +33,11 @@ assert report.all_passed
 
 ## Sampling
 
-Most evals don't check every tile. The default strategy is **stratified** (4 corners + random edges + random interior, N=20, seed=42 for reproducibility). Evals E01, E05, E08 always run on ALL tiles since they're just file existence / XML checks.
+Most checks don't need every tile. The default strategy is **stratified** (4 corners + random edges + random interior, N=20, seed=42 for reproducibility). Checks E01, E05, E08 always run on ALL tiles since they're just file existence / XML inspection.
 
 Strategies: `all`, `stratified` (default), `random`.
 
-## Zero-Cost Evals
+## Zero-Cost Checks
 
 These read existing output only — no EE API calls required.
 
@@ -60,7 +60,7 @@ Tile pixel dimensions match `tile_size_pixels` from config. Band count and data 
 | **Runs on** | Sampled tiles |
 | **Pass criteria** | Exact match for all sampled tiles |
 | **Catches** | Tiling logic bugs, wrong band count, dtype mismatch |
-| **Requires** | `rasterio` (`pip install datensee[eval]`) |
+| **Requires** | `rasterio` (`pip install datensee[validation]`) |
 
 ### E03 — Tile Geospatial Metadata
 
@@ -135,7 +135,7 @@ Total output size is within 0.2x–5x of the cost estimator's prediction.
 | **Pass criteria** | Within bounds |
 | **Catches** | Empty tiles, excessive compression, missing data |
 
-## API-Cost Eval
+## API-Cost Check
 
 ### E07 — Pixel Value Accuracy
 
@@ -151,12 +151,12 @@ The crown jewel. For sampled tiles, re-fetch the same tile from the EE HV API in
 
 If E07 passes, the entire chain is correct: tiling, coordinate transforms, HV API requests, pixel decoding, GeoTIFF writing.
 
-## Exit Codes
+## Exit codes
 
-- `0` — All evals passed (or skipped)
-- `1` — One or more evals failed
+- `0` — All checks passed (or skipped)
+- `1` — One or more checks failed
 
-## JSON Report Format
+## JSON report format
 
 ```json
 {
@@ -168,7 +168,7 @@ If E07 passes, the entire chain is correct: tiling, coordinate transforms, HV AP
   },
   "results": [
     {
-      "eval_id": "E01",
+      "check_id": "E01",
       "status": "passed",
       "message": "All 100 tiles are valid TIFF files",
       "details": {}

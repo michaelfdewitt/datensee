@@ -1,4 +1,4 @@
-"""Tile file integrity evals — E01, E02, E09.
+"""Tile file integrity checks — E01, E02, E09.
 
 E01: Every expected tile exists, has TIFF magic bytes, >1 KB.
 E02: Tile pixel dimensions, band count, and data type match config.
@@ -12,9 +12,9 @@ from pathlib import Path
 import numpy as np
 
 from datensee.config import PipelineConfig, TileCoordinate
-from datensee.eval.catalog import EvalID
-from datensee.eval.report import EvalResult, EvalStatus
-from datensee.eval.tiff import read_tiff_info, read_tiff_pixels, validate_tiff_magic
+from datensee.validation.catalog import CheckID
+from datensee.validation.report import CheckResult, CheckStatus
+from datensee.validation.tiff import read_tiff_info, read_tiff_pixels, validate_tiff_magic
 
 _MIN_TILE_BYTES = 1024  # 1 KB
 
@@ -24,10 +24,10 @@ def tile_filename(tile: TileCoordinate) -> str:
     return f"tile_r{tile.row:04d}_c{tile.col:04d}.tif"
 
 
-def eval_e01_tile_file_integrity(
+def check_e01_tile_file_integrity(
     output_dir: Path,
     tiles: list[TileCoordinate],
-) -> EvalResult:
+) -> CheckResult:
     """E01: Verify every expected tile exists as a valid TIFF >1 KB.
 
     Runs on ALL tiles (cheap — just stat + 2-byte read per file).
@@ -54,9 +54,9 @@ def eval_e01_tile_file_integrity(
     total_issues = len(missing) + len(bad_magic) + len(too_small)
 
     if total_issues == 0:
-        return EvalResult(
-            eval_id=EvalID.E01,
-            status=EvalStatus.PASSED,
+        return CheckResult(
+            check_id=CheckID.E01,
+            status=CheckStatus.PASSED,
             message=f"All {len(tiles)} tiles are valid TIFF files",
         )
 
@@ -68,9 +68,9 @@ def eval_e01_tile_file_integrity(
     if too_small:
         parts.append(f"{len(too_small)} too small (<1 KB)")
 
-    return EvalResult(
-        eval_id=EvalID.E01,
-        status=EvalStatus.FAILED,
+    return CheckResult(
+        check_id=CheckID.E01,
+        status=CheckStatus.FAILED,
         message=f"{total_issues}/{len(tiles)} tiles failed: {', '.join(parts)}",
         details={
             "missing": missing[:10],
@@ -91,11 +91,11 @@ _DTYPE_MAP: dict[str, set[str]] = {
 }
 
 
-def eval_e02_tile_dimensions(
+def check_e02_tile_dimensions(
     output_dir: Path,
     config: PipelineConfig,
     sampled_tiles: list[TileCoordinate],
-) -> EvalResult:
+) -> CheckResult:
     """E02: Verify tile dimensions, band count, and data type match config.
 
     Runs on sampled tiles (requires rasterio for metadata reading).
@@ -136,9 +136,9 @@ def eval_e02_tile_dimensions(
             failures.append({"tile": tile_filename(tile), "issues": issues})
 
     if not failures:
-        return EvalResult(
-            eval_id=EvalID.E02,
-            status=EvalStatus.PASSED,
+        return CheckResult(
+            check_id=CheckID.E02,
+            status=CheckStatus.PASSED,
             message=(
                 f"All {checked} sampled tiles match config "
                 f"({expected_size}x{expected_size}, "
@@ -146,9 +146,9 @@ def eval_e02_tile_dimensions(
             ),
         )
 
-    return EvalResult(
-        eval_id=EvalID.E02,
-        status=EvalStatus.FAILED,
+    return CheckResult(
+        check_id=CheckID.E02,
+        status=CheckStatus.FAILED,
         message=f"{len(failures)}/{checked} sampled tiles have wrong dimensions/dtype/bands",
         details={"failures": failures[:10]},
     )
@@ -173,11 +173,11 @@ _DTYPE_RANGES: dict[str, tuple[float, float]] = {
 _MAX_ALL_NAN_FRACTION = 0.05
 
 
-def eval_e09_pixel_range_sanity(
+def check_e09_pixel_range_sanity(
     output_dir: Path,
     config: PipelineConfig,
     sampled_tiles: list[TileCoordinate],
-) -> EvalResult:
+) -> CheckResult:
     """E09: Verify sampled pixel values fall within expected range.
 
     For each sampled tile:
@@ -234,9 +234,9 @@ def eval_e09_pixel_range_sanity(
             )
 
     if checked == 0:
-        return EvalResult(
-            eval_id=EvalID.E09,
-            status=EvalStatus.SKIPPED,
+        return CheckResult(
+            check_id=CheckID.E09,
+            status=CheckStatus.SKIPPED,
             message="No tiles could be read for pixel range check",
         )
 
@@ -254,18 +254,18 @@ def eval_e09_pixel_range_sanity(
         )
 
     if not issues:
-        return EvalResult(
-            eval_id=EvalID.E09,
-            status=EvalStatus.PASSED,
+        return CheckResult(
+            check_id=CheckID.E09,
+            status=CheckStatus.PASSED,
             message=(
                 f"{checked} tiles checked: {in_range_frac:.0%} of pixels in range, "
                 f"{len(all_nan_tiles)} all-NaN tiles"
             ),
         )
 
-    return EvalResult(
-        eval_id=EvalID.E09,
-        status=EvalStatus.FAILED,
+    return CheckResult(
+        check_id=CheckID.E09,
+        status=CheckStatus.FAILED,
         message="; ".join(issues),
         details={
             "in_range_fraction": round(in_range_frac, 4),

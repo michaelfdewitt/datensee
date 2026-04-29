@@ -23,7 +23,23 @@ _BYTES_PER_PIXEL: dict[str, int] = {
 
 
 class TileCoordinate(BaseModel):
-    """A single tile's bounding box in the target CRS."""
+    """A single compute tile's bounding box in the target CRS.
+
+    `row` and `col` are the compute-tile indices within the export bbox
+    and stay pinned to the *root* compute tile — they do not change when
+    a tile is split adaptively. `out_row` / `out_col` (M6 two-tier
+    tiling) identify the output tile this compute tile belongs to;
+    when two-tier tiling is disabled they equal `row` and `col`.
+
+    `lineage` (adaptive quadtree retry — sketch only at present) records
+    the path from the root compute tile down to a sub-tile. Each entry
+    is a quadrant index 0–3, layout-independent of CRS axis order:
+    ``0=x-low/y-low, 1=x-high/y-low, 2=x-low/y-high, 3=x-high/y-high``.
+    Empty list = root compute tile (the common case). Lineage is
+    informational on the success path — the bounding box is the
+    geometric truth the assembler keys on; lineage exists for the
+    failure-journal / retry-decision logic.
+    """
 
     x_min: float
     y_min: float
@@ -31,6 +47,12 @@ class TileCoordinate(BaseModel):
     y_max: float
     row: int
     col: int
+    out_row: int = 0
+    out_col: int = 0
+    lineage: list[int] = Field(
+        default_factory=list,
+        description="Quadtree path from root compute tile (each entry 0–3).",
+    )
 
 
 class TileGrid(BaseModel):
@@ -78,12 +100,29 @@ class OutputConfig(BaseModel):
 
     output_path accepts either a GCS URI (gs://bucket/prefix) or a local
     directory path for local-runner mode.
+
+    output_tile_size_pixels (M6 two-tier tiling) specifies the edge length
+    of the *output* COGs. When unset or equal to the compute tile size
+    (`tile_grid.tile_size_pixels`), each compute tile becomes its own
+    output COG. When set to a multiple of the compute tile size, compute
+    tiles are grouped and assembled into larger output COGs whose
+    internal block size is the compute tile size. This decouples fetch
+    parallelism from output file granularity.
     """
 
     output_path: str = Field(description="Output path: GCS URI (gs://…) or local directory")
     band_count: int = Field(default=1, gt=0, description="Number of output bands")
     data_type: Literal["float32", "float64", "int16", "int32", "uint8", "uint16"] = Field(
         default="float32", description="Pixel data type for output raster"
+    )
+    output_tile_size_pixels: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Edge length of output tile COGs in pixels. Must be a multiple of "
+            "tile_grid.tile_size_pixels. Defaults to tile_size_pixels (one COG per "
+            "compute tile)."
+        ),
     )
     cog: CogParameters = Field(default_factory=CogParameters)
 
@@ -167,6 +206,30 @@ class PipelineConfig(BaseModel):
         except (json.JSONDecodeError, TypeError) as exc:
             raise ValueError(f"ee_expression must be a valid JSON string: {exc}") from exc
         return self
+
+    @model_validator(mode="after")
+    def output_tile_size_must_be_multiple_of_compute_tile_size(self) -> PipelineConfig:
+        out_size = self.output.output_tile_size_pixels
+        if out_size is None:
+            return self
+        compute_size = self.tile_grid.tile_size_pixels
+        if out_size % compute_size != 0:
+            raise ValueError(
+                f"output.output_tile_size_pixels ({out_size}) must be a multiple of "
+                f"tile_grid.tile_size_pixels ({compute_size}). Got remainder "
+                f"{out_size % compute_size}."
+            )
+        if out_size < compute_size:
+            raise ValueError(
+                f"output.output_tile_size_pixels ({out_size}) must be >= "
+                f"tile_grid.tile_size_pixels ({compute_size})."
+            )
+        return self
+
+    @property
+    def effective_output_tile_size_pixels(self) -> int:
+        """Output COG edge length: either the configured value or the compute tile size."""
+        return self.output.output_tile_size_pixels or self.tile_grid.tile_size_pixels
 
     def write_json(self, path: Path) -> None:
         """Serialize config to JSON file for handoff to the Java pipeline."""

@@ -213,6 +213,192 @@ def submit(req: SubmitRequest) -> JSONResponse:
     )
 
 
+class TaskSubmitRequest(BaseModel):
+    """Cloud Tasks target payload — minimal, with task_id for Spanner lookup."""
+
+    task_id: str
+    user_id: str
+    access_token: str
+
+
+def _get_spanner_db():
+    """Lazy singleton for the Spanner database handle."""
+    if not hasattr(_get_spanner_db, "_db"):
+        from google.cloud import spanner
+
+        instance_id = os.environ.get("SPANNER_INSTANCE", "foundree-tasks")
+        database_id = os.environ.get("SPANNER_DATABASE", "foundree")
+        project = os.environ.get("FOUNDREE_GCP_PROJECT", "foundree-e521c")
+        client = spanner.Client(project=project)
+        instance = client.instance(instance_id)
+        _get_spanner_db._db = instance.database(database_id)
+    return _get_spanner_db._db
+
+
+def _read_task_payload(task_id: str, user_id: str) -> dict[str, Any] | None:
+    """Read the export payload from Spanner."""
+    import json
+
+    db = _get_spanner_db()
+    with db.snapshot() as snapshot:
+        row = snapshot.read(
+            table="ExportTasks",
+            columns=["Payload", "State"],
+            keyset=spanner_keyset(keys=[(user_id, task_id)]),
+        )
+        rows = list(row)
+        if not rows:
+            return None
+        payload_str, state = rows[0]
+        if state != "PENDING":
+            log.warning("Task %s is %s, not PENDING — skipping", task_id, state)
+            return None
+        return json.loads(payload_str)
+
+
+def _update_task_state(
+    task_id: str,
+    user_id: str,
+    state: str,
+    *,
+    job_id: str | None = None,
+    error: str | None = None,
+    error_kind: str | None = None,
+) -> None:
+    """Update a task's state in Spanner."""
+    from google.cloud.spanner import COMMIT_TIMESTAMP
+
+    db = _get_spanner_db()
+    columns = ["UserId", "TaskId", "State", "UpdatedAt"]
+    values: list[Any] = [user_id, task_id, state, COMMIT_TIMESTAMP]
+    if job_id is not None:
+        columns.append("DataflowJobId")
+        values.append(job_id)
+    if error is not None:
+        columns.append("Error")
+        values.append(error)
+    if error_kind is not None:
+        columns.append("ErrorKind")
+        values.append(error_kind)
+    with db.batch() as batch:
+        batch.update(
+            table="ExportTasks",
+            columns=columns,
+            values=[values],
+        )
+
+
+def _delete_task(task_id: str, user_id: str) -> None:
+    """Delete a task from Spanner (used after successful Dataflow submission)."""
+    from google.cloud.spanner import KeySet
+
+    db = _get_spanner_db()
+    with db.batch() as batch:
+        batch.delete(
+            table="ExportTasks",
+            keyset=KeySet(keys=[(user_id, task_id)]),
+        )
+
+
+def spanner_keyset(keys: list[tuple]) -> Any:
+    """Build a Spanner KeySet."""
+    from google.cloud.spanner import KeySet
+
+    return KeySet(keys=keys)
+
+
+@app.post("/submit-task")
+def submit_task(req: TaskSubmitRequest) -> JSONResponse:
+    """Cloud Tasks target — reads payload from Spanner, submits, updates state.
+
+    Returns 200 for business-logic failures (so Cloud Tasks doesn't retry them).
+    Returns 5xx only for transient infrastructure errors (Spanner down, etc.)
+    so Cloud Tasks retries those.
+    """
+    log.info("submit-task: task_id=%s user_id=%s", req.task_id, req.user_id)
+
+    payload = _read_task_payload(req.task_id, req.user_id)
+    if payload is None:
+        log.warning("Task %s not found or not PENDING", req.task_id)
+        return JSONResponse({"ok": False, "error": "task not found or not PENDING"})
+
+    try:
+        import datensee
+        from datensee import api as datensee_api
+    except Exception as exc:
+        log.error("datensee import failed: %s", exc)
+        _update_task_state(req.task_id, req.user_id, "FAILED", error=str(exc), error_kind="import")
+        return JSONResponse({"ok": False, "error": f"datensee not installed: {exc}"})
+
+    credentials = None
+    try:
+        from google.oauth2.credentials import Credentials
+
+        credentials = Credentials(token=req.access_token)
+    except Exception as exc:
+        log.error("failed to build Credentials: %s", exc)
+        _update_task_state(
+            req.task_id, req.user_id, "FAILED",
+            error=f"failed to build Credentials: {exc}",
+            error_kind="auth",
+        )
+        return JSONResponse({"ok": False, "error": f"auth failed: {exc}"})
+
+    project = payload.get("project", "")
+    output = payload.get("output", "")
+    dry_run = payload.get("dry_run", False)
+    labels = {"foundree": "1"}
+    temp_location = payload.get("temp_location") or (
+        output.rstrip("/") + "/_tmp" if output.startswith("gs://") else None
+    )
+
+    try:
+        result = datensee_api.export(
+            ee_expression=payload.get("expression", ""),
+            region=payload.get("region", {}),
+            project=project,
+            output=output,
+            scale=payload.get("scale", 30.0),
+            crs=payload.get("crs", "EPSG:4326"),
+            tile_size=payload.get("tile_size", 512),
+            runner="dataflow",
+            region_gcp=payload.get("region_gcp", "us-central1"),
+            temp_location=temp_location,
+            max_qps=payload.get("max_qps", 100),
+            labels=labels,
+            dry_run=dry_run,
+            credentials=credentials,
+        )
+    except ValueError as exc:
+        _update_task_state(req.task_id, req.user_id, "FAILED", error=str(exc), error_kind="validation")
+        return JSONResponse({"ok": False, "error": str(exc)})
+    except Exception as exc:
+        log.error("datensee.export failed for task %s: %s\n%s", req.task_id, exc, traceback.format_exc())
+        _update_task_state(
+            req.task_id, req.user_id, "FAILED",
+            error=str(exc),
+            error_kind="runtime",
+        )
+        return JSONResponse({"ok": False, "error": str(exc)})
+    finally:
+        credentials = None
+
+    job_id = result.job_id
+    if job_id:
+        _update_task_state(req.task_id, req.user_id, "SUBMITTED", job_id=job_id)
+        log.info("Task %s submitted: job_id=%s", req.task_id, job_id)
+    else:
+        _update_task_state(req.task_id, req.user_id, "SUBMITTED")
+        log.info("Task %s submitted (no job_id — dry_run=%s)", req.task_id, dry_run)
+
+    return JSONResponse({
+        "ok": True,
+        "task_id": req.task_id,
+        "job_id": job_id,
+        "tile_count": result.config.tile_count if result.config else None,
+    })
+
+
 @app.exception_handler(Exception)
 async def unhandled(request: Request, exc: Exception) -> JSONResponse:
     """Last-resort handler — never leak internals back to the caller."""

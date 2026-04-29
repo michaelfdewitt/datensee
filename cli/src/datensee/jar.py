@@ -187,7 +187,9 @@ def download_jar(version: str, github_token: str | None = None) -> Path:
     console.print(f"Downloading pipeline JAR v{version}...")
 
     try:
-        with httpx.stream("GET", url, headers=stream_headers, follow_redirects=True, timeout=300) as response:
+        with httpx.stream(
+            "GET", url, headers=stream_headers, follow_redirects=True, timeout=300
+        ) as response:
             response.raise_for_status()
             total = int(response.headers.get("content-length", 0))
 

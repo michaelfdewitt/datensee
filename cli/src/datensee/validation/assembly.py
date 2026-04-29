@@ -1,4 +1,4 @@
-"""Assembly and accounting evals — E05, E08, E10.
+"""Assembly and accounting checks — E05, E08, E10.
 
 E05: VRT references every tile with correct band count/type/dimensions.
 E08: tiles_on_disk + tiles_in_failures == tiles_in_config.
@@ -14,9 +14,9 @@ from pathlib import Path
 
 from datensee.assemble import _vrt_data_type
 from datensee.config import PipelineConfig
-from datensee.eval.catalog import EvalID
-from datensee.eval.report import EvalResult, EvalStatus
-from datensee.eval.tile_integrity import tile_filename
+from datensee.validation.catalog import CheckID
+from datensee.validation.report import CheckResult, CheckStatus
+from datensee.validation.tile_integrity import tile_filename
 
 # Regex to extract (row, col) from tile filenames like tile_r0003_c0012.tif
 _TILE_FILENAME_RE = re.compile(r"^tile_r(\d{4})_c(\d{4})\.tif$")
@@ -58,10 +58,10 @@ def _tiles_in_config(config: PipelineConfig) -> set[tuple[int, int]]:
     return {(t.row, t.col) for t in tiles}
 
 
-def eval_e08_failure_accounting(
+def check_e08_failure_accounting(
     output_dir: Path,
     config: PipelineConfig,
-) -> EvalResult:
+) -> CheckResult:
     """E08: Verify tiles_on_disk + tiles_in_failures == tiles_in_config.
 
     Every tile in the config must be accounted for — either as a file on disk
@@ -76,9 +76,9 @@ def eval_e08_failure_accounting(
     unexpected = accounted - expected
 
     if not unaccounted and not unexpected:
-        return EvalResult(
-            eval_id=EvalID.E08,
-            status=EvalStatus.PASSED,
+        return CheckResult(
+            check_id=CheckID.E08,
+            status=CheckStatus.PASSED,
             message=(
                 f"All {len(expected)} tiles accounted for "
                 f"({len(on_disk)} on disk, {len(in_failures)} in failures)"
@@ -91,9 +91,9 @@ def eval_e08_failure_accounting(
     if unexpected:
         parts.append(f"{len(unexpected)} tiles on disk/failures but not in config")
 
-    return EvalResult(
-        eval_id=EvalID.E08,
-        status=EvalStatus.FAILED,
+    return CheckResult(
+        check_id=CheckID.E08,
+        status=CheckStatus.FAILED,
         message="; ".join(parts),
         details={
             "unaccounted": sorted(unaccounted)[:20],
@@ -110,10 +110,10 @@ def eval_e08_failure_accounting(
 # ---------------------------------------------------------------------------
 
 
-def eval_e05_vrt_completeness(
+def check_e05_vrt_completeness(
     output_dir: Path,
     config: PipelineConfig,
-) -> EvalResult:
+) -> CheckResult:
     """E05: Verify mosaic.vrt references every tile with correct metadata.
 
     Checks:
@@ -125,18 +125,18 @@ def eval_e05_vrt_completeness(
     """
     vrt_path = output_dir / "mosaic.vrt"
     if not vrt_path.exists():
-        return EvalResult(
-            eval_id=EvalID.E05,
-            status=EvalStatus.FAILED,
+        return CheckResult(
+            check_id=CheckID.E05,
+            status=CheckStatus.FAILED,
             message="mosaic.vrt not found in output directory",
         )
 
     try:
         tree = ET.parse(vrt_path)
     except ET.ParseError as exc:
-        return EvalResult(
-            eval_id=EvalID.E05,
-            status=EvalStatus.FAILED,
+        return CheckResult(
+            check_id=CheckID.E05,
+            status=CheckStatus.FAILED,
             message=f"mosaic.vrt is not valid XML: {exc}",
         )
 
@@ -184,18 +184,18 @@ def eval_e05_vrt_completeness(
             issues.append(f"VRT dimensions {vrt_x}x{vrt_y} != expected {expected_x}x{expected_y}")
 
     if not issues:
-        return EvalResult(
-            eval_id=EvalID.E05,
-            status=EvalStatus.PASSED,
+        return CheckResult(
+            check_id=CheckID.E05,
+            status=CheckStatus.PASSED,
             message=(
                 f"VRT references all {len(expected_names)} tiles, "
                 f"{expected_bands} band(s), {expected_dtype}"
             ),
         )
 
-    return EvalResult(
-        eval_id=EvalID.E05,
-        status=EvalStatus.FAILED,
+    return CheckResult(
+        check_id=CheckID.E05,
+        status=CheckStatus.FAILED,
         message="; ".join(issues),
         details={
             "missing_tiles": sorted(missing)[:10] if missing else [],
@@ -212,10 +212,10 @@ _SIZE_LOW_FACTOR = 0.2
 _SIZE_HIGH_FACTOR = 5.0
 
 
-def eval_e10_size_plausibility(
+def check_e10_size_plausibility(
     output_dir: Path,
     config: PipelineConfig,
-) -> EvalResult:
+) -> CheckResult:
     """E10: Verify total output size is plausible vs. raw (uncompressed) prediction.
 
     Actual compressed size should be within 0.2x–5x of the raw size. Wide bounds
@@ -224,9 +224,9 @@ def eval_e10_size_plausibility(
     predicted_bytes = config.raw_output_bytes
 
     if predicted_bytes == 0:
-        return EvalResult(
-            eval_id=EvalID.E10,
-            status=EvalStatus.SKIPPED,
+        return CheckResult(
+            check_id=CheckID.E10,
+            status=CheckStatus.SKIPPED,
             message="Cannot estimate size (tile count unknown)",
         )
 
@@ -237,9 +237,9 @@ def eval_e10_size_plausibility(
     ratio = actual_bytes / predicted_bytes if predicted_bytes > 0 else 0.0
 
     if low <= actual_bytes <= high:
-        return EvalResult(
-            eval_id=EvalID.E10,
-            status=EvalStatus.PASSED,
+        return CheckResult(
+            check_id=CheckID.E10,
+            status=CheckStatus.PASSED,
             message=(
                 f"Output size {_fmt(actual_bytes)} is {ratio:.1f}x "
                 f"of predicted {_fmt(predicted_bytes)}"
@@ -252,9 +252,9 @@ def eval_e10_size_plausibility(
         )
 
     direction = "smaller" if actual_bytes < low else "larger"
-    return EvalResult(
-        eval_id=EvalID.E10,
-        status=EvalStatus.FAILED,
+    return CheckResult(
+        check_id=CheckID.E10,
+        status=CheckStatus.FAILED,
         message=(
             f"Output size {_fmt(actual_bytes)} is {ratio:.1f}x of predicted "
             f"{_fmt(predicted_bytes)} — {direction} than expected "

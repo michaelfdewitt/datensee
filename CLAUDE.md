@@ -1,5 +1,7 @@
 # CLAUDE.md — DatensEE Orchestrator
 
+> See also: [`docs/handoff.md`](docs/handoff.md) for deployment story, COG pipeline gotchas, recent fixes, known limitations, and the test runbook.
+
 ## What This Project Is
 
 A CLI + Python library that lets Google Earth Engine users run image exports at massive scale by parallelizing tile fetches across Google Cloud Dataflow workers. Users provide the same computation description they already use in Earth Engine — the tool handles tiling, parallel fetching via the EE High Volume API, assembly into Cloud Optimized GeoTIFFs, and upload to GCS. Works from the terminal, Python scripts, or Colab/Jupyter notebooks.

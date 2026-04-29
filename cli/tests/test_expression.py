@@ -74,6 +74,53 @@ def test_clip_with_multipolygon() -> None:
     assert geom_node["functionName"] == "GeometryConstructors.MultiPolygon"
 
 
+def test_clip_rejects_image_collection_result() -> None:
+    """clip_expression must reject expressions whose result is an ImageCollection."""
+    collection_expr = json.dumps(
+        {
+            "result": "0",
+            "values": {
+                "0": {
+                    "functionInvocationValue": {
+                        "functionName": "ImageCollection.load",
+                        "arguments": {"id": {"constantValue": "LANDSAT/LC09/C02/T1_L2"}},
+                    }
+                }
+            },
+        }
+    )
+    with pytest.raises(ValueError, match="ImageCollection"):
+        clip_expression(collection_expr, _POLYGON)
+
+
+def test_clip_rejects_filtered_collection() -> None:
+    """A filtered collection is still a collection — must be rejected."""
+    expr = json.dumps(
+        {
+            "result": "filtered",
+            "values": {
+                "col": {
+                    "functionInvocationValue": {
+                        "functionName": "ImageCollection.load",
+                        "arguments": {"id": {"constantValue": "LANDSAT/LC09/C02/T1_L2"}},
+                    }
+                },
+                "filtered": {
+                    "functionInvocationValue": {
+                        "functionName": "Collection.filter",
+                        "arguments": {
+                            "collection": {"valueReference": "col"},
+                            "filter": {"constantValue": "dummy"},
+                        },
+                    }
+                },
+            },
+        }
+    )
+    with pytest.raises(ValueError, match="ImageCollection"):
+        clip_expression(expr, _POLYGON)
+
+
 def test_clip_rejects_unsupported_geometry_type() -> None:
     point = {"type": "Point", "coordinates": [0, 0]}
     with pytest.raises(ValueError, match="Unsupported geometry type"):

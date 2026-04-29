@@ -235,11 +235,11 @@ def export(
         bool,
         typer.Option("--yes", "-y", help="Skip confirmation prompt for large jobs."),
     ] = False,
-    run_eval: Annotated[
+    run_validate: Annotated[
         bool,
         typer.Option(
-            "--eval/--no-eval",
-            help="Run zero-cost evals after pipeline completes (local mode only).",
+            "--validate/--no-validate",
+            help="Run zero-cost output checks after pipeline completes (local mode only).",
         ),
     ] = False,
 ) -> None:
@@ -320,10 +320,10 @@ def export(
         tiles_failed = max(0, pipeline_config.tile_count - tiles_ok)
         console.print(render_post_run_summary(duration, tiles_ok, tiles_failed, str(vrt)))
 
-    if not dry_run and run_eval and runner == "local" and not output.startswith("gs://"):
-        from datensee.eval import validate_output
+    if not dry_run and run_validate and runner == "local" and not output.startswith("gs://"):
+        from datensee.validation import validate_output
 
-        console.print("\n[bold]Running evals[/bold]")
+        console.print("\n[bold]Running output checks[/bold]")
         report = validate_output(Path(output), pipeline_config)
         console.print(report.render())
         if not report.all_passed:
@@ -409,12 +409,12 @@ def jar_build_cmd() -> None:
 
 
 # ---------------------------------------------------------------------------
-# eval command
+# validate command (post-export integration test suite)
 # ---------------------------------------------------------------------------
 
 
-@app.command("eval")
-def eval_cmd(
+@app.command("validate")
+def validate_cmd(
     output_path: Annotated[
         str,
         typer.Argument(help="Output directory (local) or GCS prefix to validate."),
@@ -429,23 +429,23 @@ def eval_cmd(
             readable=True,
         ),
     ],
-    evals: Annotated[
+    checks: Annotated[
         str | None,
         typer.Option(
-            "--evals",
+            "--checks",
             "-e",
-            help="Comma-separated eval IDs to run (e.g. E01,E03,E07). Default: all zero-cost.",
+            help="Comma-separated check IDs to run (e.g. E01,E03,E07). Default: all zero-cost.",
         ),
     ] = None,
     sample: Annotated[
         int,
-        typer.Option("--sample", help="Tile sample size for sampling-based evals."),
+        typer.Option("--sample", help="Tile sample size for sampling-based checks."),
     ] = 20,
     reference: Annotated[
         bool,
         typer.Option(
             "--reference",
-            help="Enable E07 pixel accuracy eval (costs EECUs).",
+            help="Enable E07 pixel accuracy check (costs EECUs).",
         ),
     ] = False,
     gee_project: Annotated[
@@ -457,25 +457,25 @@ def eval_cmd(
         typer.Option("--json", help="Write machine-readable JSON report to this file."),
     ] = None,
 ) -> None:
-    """Validate pipeline output with the DatensEE eval suite.
+    """Validate pipeline output with the DatensEE check suite.
 
-    Runs structural, spatial, and pixel-level checks against exported tiles.
-    By default runs all zero-cost evals (E01-E06, E08-E10). Use --reference
-    to also run E07 (pixel value comparison against EE HV API).
+    Runs structural, spatial, and pixel-level integration checks against
+    exported tiles. By default runs all zero-cost checks (E01-E06, E08-E10).
+    Use --reference to also run E07 (pixel value comparison against EE HV API).
     """
-    from datensee.eval import EvalID, validate_output, zero_cost_evals
+    from datensee.validation import CheckID, validate_output, zero_cost_checks
 
     config = PipelineConfig.read_json(config_file)
 
-    # Parse eval IDs
-    eval_ids: list[EvalID] | None = None
-    if evals:
-        eval_ids = [EvalID(e.strip().upper()) for e in evals.split(",")]
+    # Parse check IDs
+    check_ids: list[CheckID] | None = None
+    if checks:
+        check_ids = [CheckID(e.strip().upper()) for e in checks.split(",")]
     elif reference:
-        eval_ids = zero_cost_evals() + [EvalID.E07]
+        check_ids = zero_cost_checks() + [CheckID.E07]
 
     # E07 requires a project
-    if eval_ids and EvalID.E07 in eval_ids and not gee_project:
+    if check_ids and CheckID.E07 in check_ids and not gee_project:
         project = config.gee_project
         console.print(f"[dim]Using gee_project from config: {project}[/dim]")
     else:
@@ -484,7 +484,7 @@ def eval_cmd(
     report = validate_output(
         output_path,
         config,
-        evals=eval_ids,
+        checks=check_ids,
         sample_size=sample,
         gee_project=project,
     )

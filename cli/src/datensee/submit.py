@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -108,46 +109,47 @@ def submit_job(
             )
             return None
 
-        try:
-            subprocess.run(
-                cmd,
-                check=True,
-                text=True,
-                pass_fds=pass_fds,
-                capture_output=True,
-            )
-        except subprocess.CalledProcessError as exc:
-            # Tee the child's streams to our own so Cloud Run / CLI logs
-            # still carry the full stack trace, then raise a rich
-            # RuntimeError whose message contains the tail — otherwise the
-            # caller only sees argv + exit code, which is useless.
-            if exc.stdout:
-                sys.stderr.write(exc.stdout)
-            if exc.stderr:
-                sys.stderr.write(exc.stderr)
-            sys.stderr.flush()
-            combined = (exc.stderr or "") + (exc.stdout or "")
-            tail = "\n".join(combined.splitlines()[-40:]).strip()
-            summary = tail or f"exit {exc.returncode} with no output"
+        # Stream the child's merged stdout/stderr live to our own stderr so
+        # it lands in Cloud Run / CLI logs in real time, and simultaneously
+        # keep a bounded tail buffer for the RuntimeError message on
+        # non-zero exit. capture_output=True would have swallowed the
+        # success path entirely.
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            pass_fds=pass_fds,
+            bufsize=1,
+        )
+        tail_lines: deque[str] = deque(maxlen=200)
+        job_id: str | None = None
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            sys.stderr.write(line)
+            stripped = line.rstrip("\n")
+            tail_lines.append(stripped)
+            if stripped.startswith("DATENSEE_JOB_ID="):
+                job_id = stripped.removeprefix("DATENSEE_JOB_ID=")
+        sys.stderr.flush()
+        returncode = proc.wait()
+        if returncode != 0:
+            tail = "\n".join(tail_lines).strip()
+            summary = tail or f"exit {returncode} with no output"
             raise RuntimeError(
-                f"datensee pipeline JVM failed (exit {exc.returncode}):\n{summary}"
-            ) from exc
+                f"datensee pipeline JVM failed (exit {returncode}):\n{summary}"
+            )
     finally:
-        # Parent-side close of the read end (the child has inherited its
-        # own copy). If the child never ran — spawn failure, early raise —
-        # this still cleans up the FD.
         if token_fd is not None:
             try:
                 os.close(token_fd)
             except OSError:
                 pass
 
-    # For local runs, job ID is not applicable.
     if config.runner.mode == "local":
         return None
 
-    # TODO: parse Dataflow job ID from stdout/stderr.
-    return None
+    return job_id
 
 
 def _prepare_user_token_fd(credentials: Credentials | None) -> int | None:

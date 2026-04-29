@@ -10,6 +10,43 @@ from __future__ import annotations
 import json
 from typing import Any
 
+# EE function names whose return type is ImageCollection, not Image.
+# This isn't exhaustive — EE has many functions — but it catches the most
+# common mistake: forgetting to reduce a collection before exporting.
+# TODO(datensee): Support ImageCollection inputs by auto-reducing (e.g.
+# mosaic/median) or by exporting each image separately. For now we reject
+# them so the user gets a clear error instead of a Dataflow job that
+# dead-letters every tile.
+_COLLECTION_RETURNING_FUNCTIONS: frozenset[str] = frozenset(
+    {
+        "ImageCollection.load",
+        "Collection.filter",
+        "Collection.map",
+        "Collection.sort",
+        "Collection.limit",
+        "Collection.distinct",
+        "Collection.flatten",
+        "Collection.merge",
+        "Filter.listContains",
+        "Collection.filterBounds",
+        "Collection.filterDate",
+        "Collection.filterMetadata",
+    }
+)
+
+
+def _result_function_name(expression: dict[str, Any]) -> str | None:
+    """Return the function name of the result node, or None if not a function."""
+    result_key = expression.get("result")
+    values = expression.get("values", {})
+    node = values.get(result_key)
+    if node is None:
+        return None
+    invocation = node.get("functionInvocationValue")
+    if invocation is None:
+        return None
+    return invocation.get("functionName")
+
 
 def clip_expression(ee_expression: str, geojson_geometry: dict[str, Any]) -> str:
     """Wrap an EE expression in Image.clip(region).
@@ -27,6 +64,15 @@ def clip_expression(ee_expression: str, geojson_geometry: dict[str, Any]) -> str
         New serialized EE expression with clip applied.
     """
     original = json.loads(ee_expression)
+
+    fn_name = _result_function_name(original)
+    if fn_name in _COLLECTION_RETURNING_FUNCTIONS:
+        msg = (
+            f"Expression result is an ImageCollection (via {fn_name}), "
+            f"but Image.clip requires an Image. Reduce the collection first "
+            f"(e.g. .median(), .mosaic(), .first()) before exporting."
+        )
+        raise ValueError(msg)
 
     # EE Cloud API serialization uses a flat {result, values} structure where
     # "result" names the root node and "values" is a map of node-id → node.

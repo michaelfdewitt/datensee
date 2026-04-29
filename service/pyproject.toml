@@ -8,6 +8,7 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "google-auth>=2.30",
+    "google-cloud-spanner>=3.40",
 ]
 
 [build-system]

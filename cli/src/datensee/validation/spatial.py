@@ -1,4 +1,4 @@
-"""Spatial evals — E03, E04, E06.
+"""Spatial checks — E03, E04, E06.
 
 E03: CRS and affine transform match config tile coordinates.
 E04: Adjacent tiles' shared edge pixels form smooth continuation.
@@ -12,20 +12,20 @@ from pathlib import Path
 import numpy as np
 
 from datensee.config import PipelineConfig, TileCoordinate
-from datensee.eval.catalog import EvalID
-from datensee.eval.report import EvalResult, EvalStatus
-from datensee.eval.tiff import read_tiff_info, read_tiff_pixels
-from datensee.eval.tile_integrity import tile_filename
+from datensee.validation.catalog import CheckID
+from datensee.validation.report import CheckResult, CheckStatus
+from datensee.validation.tiff import read_tiff_info, read_tiff_pixels
+from datensee.validation.tile_integrity import tile_filename
 
 # E03 tolerance for affine origin comparison (in CRS units).
 _ORIGIN_TOLERANCE = 1e-6
 
 
-def eval_e03_tile_geospatial_metadata(
+def check_e03_tile_geospatial_metadata(
     output_dir: Path,
     config: PipelineConfig,
     sampled_tiles: list[TileCoordinate],
-) -> EvalResult:
+) -> CheckResult:
     """E03: Verify CRS matches config and affine origin matches tile coordinates.
 
     For each sampled tile, the GeoTIFF's CRS must match the config CRS,
@@ -69,15 +69,15 @@ def eval_e03_tile_geospatial_metadata(
             failures.append({"tile": tile_filename(tile), "issues": issues})
 
     if not failures:
-        return EvalResult(
-            eval_id=EvalID.E03,
-            status=EvalStatus.PASSED,
+        return CheckResult(
+            check_id=CheckID.E03,
+            status=CheckStatus.PASSED,
             message=f"All {checked} sampled tiles have correct CRS and affine origin",
         )
 
-    return EvalResult(
-        eval_id=EvalID.E03,
-        status=EvalStatus.FAILED,
+    return CheckResult(
+        check_id=CheckID.E03,
+        status=CheckStatus.FAILED,
         message=f"{len(failures)}/{checked} sampled tiles have metadata issues",
         details={"failures": failures[:10]},
     )
@@ -116,13 +116,13 @@ def _crs_matches(actual: str, expected: str) -> bool:
 _BOUNDARY_THRESHOLD = 50.0
 
 
-def eval_e04_boundary_continuity(
+def check_e04_boundary_continuity(
     output_dir: Path,
     config: PipelineConfig,
     sampled_tiles: list[TileCoordinate],
     *,
     threshold: float = _BOUNDARY_THRESHOLD,
-) -> EvalResult:
+) -> CheckResult:
     """E04: Verify adjacent tiles' shared edge pixels form a smooth continuation.
 
     For sampled tiles, find right and top neighbors in the tile grid. Read the
@@ -155,24 +155,24 @@ def eval_e04_boundary_continuity(
                     discontinuities.append(result)
 
     if pairs_checked == 0:
-        return EvalResult(
-            eval_id=EvalID.E04,
-            status=EvalStatus.SKIPPED,
+        return CheckResult(
+            check_id=CheckID.E04,
+            status=CheckStatus.SKIPPED,
             message="No adjacent tile pairs found in sample",
         )
 
     if not discontinuities:
-        return EvalResult(
-            eval_id=EvalID.E04,
-            status=EvalStatus.PASSED,
+        return CheckResult(
+            check_id=CheckID.E04,
+            status=CheckStatus.PASSED,
             message=(
                 f"All {pairs_checked} tile boundary pairs are continuous (threshold={threshold})"
             ),
         )
 
-    return EvalResult(
-        eval_id=EvalID.E04,
-        status=EvalStatus.FAILED,
+    return CheckResult(
+        check_id=CheckID.E04,
+        status=CheckStatus.FAILED,
         message=(
             f"{len(discontinuities)}/{pairs_checked} tile boundaries exceed threshold={threshold}"
         ),
@@ -235,10 +235,10 @@ def _check_edge(
 # ---------------------------------------------------------------------------
 
 
-def eval_e06_vrt_spatial_correctness(
+def check_e06_vrt_spatial_correctness(
     output_dir: Path,
     config: PipelineConfig,
-) -> EvalResult:
+) -> CheckResult:
     """E06: Verify VRT bounding box covers the tile grid extent.
 
     The VRT's geo-extent (from GeoTransform + raster dimensions) must cover
@@ -248,18 +248,18 @@ def eval_e06_vrt_spatial_correctness(
 
     vrt_path = output_dir / "mosaic.vrt"
     if not vrt_path.exists():
-        return EvalResult(
-            eval_id=EvalID.E06,
-            status=EvalStatus.FAILED,
+        return CheckResult(
+            check_id=CheckID.E06,
+            status=CheckStatus.FAILED,
             message="mosaic.vrt not found",
         )
 
     try:
         tree = ET.parse(vrt_path)
     except ET.ParseError as exc:
-        return EvalResult(
-            eval_id=EvalID.E06,
-            status=EvalStatus.FAILED,
+        return CheckResult(
+            check_id=CheckID.E06,
+            status=CheckStatus.FAILED,
             message=f"VRT parse error: {exc}",
         )
 
@@ -268,9 +268,9 @@ def eval_e06_vrt_spatial_correctness(
     # Parse GeoTransform: "x_origin, pixel_w, 0, y_origin, 0, -pixel_h"
     gt_el = root.find("GeoTransform")
     if gt_el is None or gt_el.text is None:
-        return EvalResult(
-            eval_id=EvalID.E06,
-            status=EvalStatus.FAILED,
+        return CheckResult(
+            check_id=CheckID.E06,
+            status=CheckStatus.FAILED,
             message="VRT missing GeoTransform element",
         )
 
@@ -288,9 +288,9 @@ def eval_e06_vrt_spatial_correctness(
     # Expected extent from config
     tiles = config.tile_grid.tiles or []
     if not tiles:
-        return EvalResult(
-            eval_id=EvalID.E06,
-            status=EvalStatus.SKIPPED,
+        return CheckResult(
+            check_id=CheckID.E06,
+            status=CheckStatus.SKIPPED,
             message="No tiles in config to compare against",
         )
 
@@ -312,9 +312,9 @@ def eval_e06_vrt_spatial_correctness(
         issues.append(f"VRT y_max {vrt_y_max} < grid y_max {grid_y_max}")
 
     if not issues:
-        return EvalResult(
-            eval_id=EvalID.E06,
-            status=EvalStatus.PASSED,
+        return CheckResult(
+            check_id=CheckID.E06,
+            status=CheckStatus.PASSED,
             message="VRT bounding box covers the full tile grid extent",
             details={
                 "vrt_bbox": [vrt_x_min, vrt_y_min, vrt_x_max, vrt_y_max],
@@ -322,9 +322,9 @@ def eval_e06_vrt_spatial_correctness(
             },
         )
 
-    return EvalResult(
-        eval_id=EvalID.E06,
-        status=EvalStatus.FAILED,
+    return CheckResult(
+        check_id=CheckID.E06,
+        status=CheckStatus.FAILED,
         message=f"VRT bbox does not cover grid: {'; '.join(issues)}",
         details={
             "vrt_bbox": [vrt_x_min, vrt_y_min, vrt_x_max, vrt_y_max],

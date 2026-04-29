@@ -1,4 +1,4 @@
-"""Unit tests for the eval system — synthetic GeoTIFFs, no network."""
+"""Unit tests for output validation checks — synthetic GeoTIFFs, no network."""
 
 from __future__ import annotations
 
@@ -16,16 +16,16 @@ from datensee.config import (
     TileCoordinate,
     TileGrid,
 )
-from datensee.eval.assembly import (
-    eval_e05_vrt_completeness,
-    eval_e08_failure_accounting,
-    eval_e10_size_plausibility,
+from datensee.validation.assembly import (
+    check_e05_vrt_completeness,
+    check_e08_failure_accounting,
+    check_e10_size_plausibility,
 )
-from datensee.eval.catalog import CostTier, EvalID, get_eval, list_evals, zero_cost_evals
-from datensee.eval.report import EvalReport, EvalResult, EvalStatus
-from datensee.eval.sampling import SamplingStrategy, sample_tiles
-from datensee.eval.tiff import validate_tiff_magic
-from datensee.eval.tile_integrity import eval_e01_tile_file_integrity, tile_filename
+from datensee.validation.catalog import CheckID, CostTier, get_check, list_checks, zero_cost_checks
+from datensee.validation.report import CheckResult, CheckStatus, ValidationReport
+from datensee.validation.sampling import SamplingStrategy, sample_tiles
+from datensee.validation.tiff import validate_tiff_magic
+from datensee.validation.tile_integrity import check_e01_tile_file_integrity, tile_filename
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -90,20 +90,20 @@ def _write_fake_tiff(path: Path, size_bytes: int = 2048) -> None:
 
 class TestCatalog:
     def test_list_evals_returns_all_ten(self) -> None:
-        assert len(list_evals()) == 10
+        assert len(list_checks()) == 10
 
     def test_zero_cost_excludes_e07(self) -> None:
-        zero = zero_cost_evals()
-        assert EvalID.E07 not in zero
-        assert EvalID.E01 in zero
+        zero = zero_cost_checks()
+        assert CheckID.E07 not in zero
+        assert CheckID.E01 in zero
 
     def test_get_eval_returns_definition(self) -> None:
-        defn = get_eval(EvalID.E01)
+        defn = get_check(CheckID.E01)
         assert defn.name == "Tile File Integrity"
         assert defn.cost_tier == CostTier.ZERO_COST
 
     def test_e07_is_api_cost(self) -> None:
-        assert get_eval(EvalID.E07).cost_tier == CostTier.API_COST
+        assert get_check(CheckID.E07).cost_tier == CostTier.API_COST
 
 
 # ---------------------------------------------------------------------------
@@ -188,9 +188,9 @@ class TestE01TileFileIntegrity:
         for t in tiles:
             _write_fake_tiff(tmp_path / tile_filename(t))
 
-        result = eval_e01_tile_file_integrity(tmp_path, tiles)
-        assert result.status == EvalStatus.PASSED
-        assert result.eval_id == EvalID.E01
+        result = check_e01_tile_file_integrity(tmp_path, tiles)
+        assert result.status == CheckStatus.PASSED
+        assert result.check_id == CheckID.E01
 
     def test_missing_tiles(self, tmp_path: Path) -> None:
         tiles = _make_tiles(2, 2)
@@ -198,8 +198,8 @@ class TestE01TileFileIntegrity:
         for t in tiles[:2]:
             _write_fake_tiff(tmp_path / tile_filename(t))
 
-        result = eval_e01_tile_file_integrity(tmp_path, tiles)
-        assert result.status == EvalStatus.FAILED
+        result = check_e01_tile_file_integrity(tmp_path, tiles)
+        assert result.status == CheckStatus.FAILED
         assert "2 missing" in result.message
 
     def test_bad_magic_bytes(self, tmp_path: Path) -> None:
@@ -208,21 +208,21 @@ class TestE01TileFileIntegrity:
         # Write a non-TIFF file
         (tmp_path / tile_filename(tiles[1])).write_bytes(b"PK" + b"\x00" * 2000)
 
-        result = eval_e01_tile_file_integrity(tmp_path, tiles)
-        assert result.status == EvalStatus.FAILED
+        result = check_e01_tile_file_integrity(tmp_path, tiles)
+        assert result.status == CheckStatus.FAILED
         assert "1 invalid TIFF" in result.message
 
     def test_too_small_file(self, tmp_path: Path) -> None:
         tiles = _make_tiles(1, 1)
         (tmp_path / tile_filename(tiles[0])).write_bytes(b"II\x2a\x00" + b"\x00" * 10)
 
-        result = eval_e01_tile_file_integrity(tmp_path, tiles)
-        assert result.status == EvalStatus.FAILED
+        result = check_e01_tile_file_integrity(tmp_path, tiles)
+        assert result.status == CheckStatus.FAILED
         assert "too small" in result.message
 
     def test_empty_tile_list(self, tmp_path: Path) -> None:
-        result = eval_e01_tile_file_integrity(tmp_path, [])
-        assert result.status == EvalStatus.PASSED
+        result = check_e01_tile_file_integrity(tmp_path, [])
+        assert result.status == CheckStatus.PASSED
 
 
 # ---------------------------------------------------------------------------
@@ -237,8 +237,8 @@ class TestE08FailureAccounting:
         for t in tiles:
             _write_fake_tiff(tmp_path / tile_filename(t))
 
-        result = eval_e08_failure_accounting(tmp_path, config)
-        assert result.status == EvalStatus.PASSED
+        result = check_e08_failure_accounting(tmp_path, config)
+        assert result.status == CheckStatus.PASSED
         assert "6 tiles accounted for" in result.message
 
     def test_some_failures_accounted(self, tmp_path: Path) -> None:
@@ -254,8 +254,8 @@ class TestE08FailureAccounting:
         failures = [{"row": missing.row, "col": missing.col, "error": "timeout"}]
         (tmp_path / "failures.json").write_text(json.dumps(failures))
 
-        result = eval_e08_failure_accounting(tmp_path, config)
-        assert result.status == EvalStatus.PASSED
+        result = check_e08_failure_accounting(tmp_path, config)
+        assert result.status == CheckStatus.PASSED
 
     def test_unaccounted_tiles(self, tmp_path: Path) -> None:
         tiles = _make_tiles(2, 2)
@@ -265,8 +265,8 @@ class TestE08FailureAccounting:
         for t in tiles[:2]:
             _write_fake_tiff(tmp_path / tile_filename(t))
 
-        result = eval_e08_failure_accounting(tmp_path, config)
-        assert result.status == EvalStatus.FAILED
+        result = check_e08_failure_accounting(tmp_path, config)
+        assert result.status == CheckStatus.FAILED
         assert "missing" in result.message
 
     def test_unexpected_tiles(self, tmp_path: Path) -> None:
@@ -277,8 +277,8 @@ class TestE08FailureAccounting:
         _write_fake_tiff(tmp_path / tile_filename(tiles[0]))
         _write_fake_tiff(tmp_path / "tile_r0099_c0099.tif")
 
-        result = eval_e08_failure_accounting(tmp_path, config)
-        assert result.status == EvalStatus.FAILED
+        result = check_e08_failure_accounting(tmp_path, config)
+        assert result.status == CheckStatus.FAILED
         assert "not in config" in result.message
 
     def test_no_failures_json(self, tmp_path: Path) -> None:
@@ -287,8 +287,8 @@ class TestE08FailureAccounting:
         config = _make_config(tiles, output_path=str(tmp_path))
         _write_fake_tiff(tmp_path / tile_filename(tiles[0]))
 
-        result = eval_e08_failure_accounting(tmp_path, config)
-        assert result.status == EvalStatus.PASSED
+        result = check_e08_failure_accounting(tmp_path, config)
+        assert result.status == CheckStatus.PASSED
 
 
 # ---------------------------------------------------------------------------
@@ -306,8 +306,8 @@ class TestE10SizePlausibility:
         for t in tiles:
             _write_fake_tiff(tmp_path / tile_filename(t), size_bytes=8192)
 
-        result = eval_e10_size_plausibility(tmp_path, config)
-        assert result.status == EvalStatus.PASSED
+        result = check_e10_size_plausibility(tmp_path, config)
+        assert result.status == CheckStatus.PASSED
 
     def test_size_too_small(self, tmp_path: Path) -> None:
         tiles = _make_tiles(2, 2)
@@ -317,8 +317,8 @@ class TestE10SizePlausibility:
         for t in tiles:
             _write_fake_tiff(tmp_path / tile_filename(t), size_bytes=100)
 
-        result = eval_e10_size_plausibility(tmp_path, config)
-        assert result.status == EvalStatus.FAILED
+        result = check_e10_size_plausibility(tmp_path, config)
+        assert result.status == CheckStatus.FAILED
         assert "smaller" in result.message
 
     def test_size_too_large(self, tmp_path: Path) -> None:
@@ -329,8 +329,8 @@ class TestE10SizePlausibility:
         for t in tiles:
             _write_fake_tiff(tmp_path / tile_filename(t), size_bytes=500_000)
 
-        result = eval_e10_size_plausibility(tmp_path, config)
-        assert result.status == EvalStatus.FAILED
+        result = check_e10_size_plausibility(tmp_path, config)
+        assert result.status == CheckStatus.FAILED
         assert "larger" in result.message
 
 
@@ -339,14 +339,14 @@ class TestE10SizePlausibility:
 # ---------------------------------------------------------------------------
 
 
-class TestEvalReport:
+class TestValidationReport:
     def test_all_passed(self) -> None:
         tiles = _make_tiles(1, 1)
         config = _make_config(tiles)
-        report = EvalReport(
+        report = ValidationReport(
             results=[
-                EvalResult(eval_id=EvalID.E01, status=EvalStatus.PASSED),
-                EvalResult(eval_id=EvalID.E08, status=EvalStatus.PASSED),
+                CheckResult(check_id=CheckID.E01, status=CheckStatus.PASSED),
+                CheckResult(check_id=CheckID.E08, status=CheckStatus.PASSED),
             ],
             output_path="/tmp/test",
             config=config,
@@ -358,10 +358,10 @@ class TestEvalReport:
     def test_mixed_results(self) -> None:
         tiles = _make_tiles(1, 1)
         config = _make_config(tiles)
-        report = EvalReport(
+        report = ValidationReport(
             results=[
-                EvalResult(eval_id=EvalID.E01, status=EvalStatus.PASSED),
-                EvalResult(eval_id=EvalID.E08, status=EvalStatus.FAILED, message="bad"),
+                CheckResult(check_id=CheckID.E01, status=CheckStatus.PASSED),
+                CheckResult(check_id=CheckID.E08, status=CheckStatus.FAILED, message="bad"),
             ],
             output_path="/tmp/test",
             config=config,
@@ -373,10 +373,10 @@ class TestEvalReport:
     def test_skipped_counts_as_passed(self) -> None:
         tiles = _make_tiles(1, 1)
         config = _make_config(tiles)
-        report = EvalReport(
+        report = ValidationReport(
             results=[
-                EvalResult(eval_id=EvalID.E01, status=EvalStatus.PASSED),
-                EvalResult(eval_id=EvalID.E03, status=EvalStatus.SKIPPED),
+                CheckResult(check_id=CheckID.E01, status=CheckStatus.PASSED),
+                CheckResult(check_id=CheckID.E03, status=CheckStatus.SKIPPED),
             ],
             output_path="/tmp/test",
             config=config,
@@ -386,24 +386,24 @@ class TestEvalReport:
     def test_to_dict(self) -> None:
         tiles = _make_tiles(1, 1)
         config = _make_config(tiles)
-        report = EvalReport(
+        report = ValidationReport(
             results=[
-                EvalResult(eval_id=EvalID.E01, status=EvalStatus.PASSED, message="ok"),
+                CheckResult(check_id=CheckID.E01, status=CheckStatus.PASSED, message="ok"),
             ],
             output_path="/tmp/test",
             config=config,
         )
         d = report.to_dict()
         assert d["summary"]["passed"] == 1
-        assert d["results"][0]["eval_id"] == "E01"
+        assert d["results"][0]["check_id"] == "E01"
         assert d["results"][0]["status"] == "passed"
 
     def test_render_returns_panel(self) -> None:
         tiles = _make_tiles(1, 1)
         config = _make_config(tiles)
-        report = EvalReport(
+        report = ValidationReport(
             results=[
-                EvalResult(eval_id=EvalID.E01, status=EvalStatus.PASSED),
+                CheckResult(check_id=CheckID.E01, status=CheckStatus.PASSED),
             ],
             output_path="/tmp/test",
             config=config,
@@ -434,7 +434,7 @@ class TestTileFilename:
 
 class TestValidateOutput:
     def test_basic_pass(self, tmp_path: Path) -> None:
-        from datensee.eval import validate_output
+        from datensee.validation import validate_output
 
         tiles = _make_tiles(2, 2)
         config = _make_config(tiles, output_path=str(tmp_path))
@@ -442,22 +442,22 @@ class TestValidateOutput:
         for t in tiles:
             _write_fake_tiff(tmp_path / tile_filename(t), size_bytes=8192)
 
-        report = validate_output(tmp_path, config, evals=[EvalID.E01, EvalID.E08, EvalID.E10])
+        report = validate_output(tmp_path, config, checks=[CheckID.E01, CheckID.E08, CheckID.E10])
         # E01 and E08 should pass; E10 should pass (size is plausible)
         for r in report.results:
-            if r.eval_id in (EvalID.E01, EvalID.E08, EvalID.E10):
-                assert r.status == EvalStatus.PASSED, f"{r.eval_id}: {r.message}"
+            if r.check_id in (CheckID.E01, CheckID.E08, CheckID.E10):
+                assert r.status == CheckStatus.PASSED, f"{r.check_id}: {r.message}"
 
     def test_e07_without_credentials_errors(self, tmp_path: Path) -> None:
-        from datensee.eval import validate_output
+        from datensee.validation import validate_output
 
         tiles = _make_tiles(1, 1)
         config = _make_config(tiles, output_path=str(tmp_path))
         _write_fake_tiff(tmp_path / tile_filename(tiles[0]))
 
         # E07 requires API credentials — without them, it should error gracefully
-        report = validate_output(tmp_path, config, evals=[EvalID.E07])
-        assert report.results[0].status in (EvalStatus.ERROR, EvalStatus.SKIPPED)
+        report = validate_output(tmp_path, config, checks=[CheckID.E07])
+        assert report.results[0].status in (CheckStatus.ERROR, CheckStatus.SKIPPED)
 
 
 # ===========================================================================
@@ -479,7 +479,7 @@ def _make_tiff_info(
     transform: tuple[float, ...] | None = None,
 ):
     """Build a TiffInfo for mocking."""
-    from datensee.eval.tiff import TiffInfo
+    from datensee.validation.tiff import TiffInfo
 
     return TiffInfo(
         width=width,
@@ -498,7 +498,7 @@ def _make_tiff_info(
 
 class TestE03TileGeospatialMetadata:
     def test_correct_metadata(self, tmp_path: Path) -> None:
-        from datensee.eval.spatial import eval_e03_tile_geospatial_metadata
+        from datensee.validation.spatial import check_e03_tile_geospatial_metadata
 
         tiles = _make_tiles(1, 1)
         config = _make_config(tiles)
@@ -510,13 +510,13 @@ class TestE03TileGeospatialMetadata:
             crs="EPSG:4326",
             transform=(0.1 / 64, 0, tile.x_min, 0, -0.1 / 64, tile.y_max),
         )
-        with patch("datensee.eval.spatial.read_tiff_info", return_value=info):
-            result = eval_e03_tile_geospatial_metadata(tmp_path, config, tiles)
+        with patch("datensee.validation.spatial.read_tiff_info", return_value=info):
+            result = check_e03_tile_geospatial_metadata(tmp_path, config, tiles)
 
-        assert result.status == EvalStatus.PASSED
+        assert result.status == CheckStatus.PASSED
 
     def test_wrong_crs(self, tmp_path: Path) -> None:
-        from datensee.eval.spatial import eval_e03_tile_geospatial_metadata
+        from datensee.validation.spatial import check_e03_tile_geospatial_metadata
 
         tiles = _make_tiles(1, 1)
         config = _make_config(tiles)
@@ -527,14 +527,14 @@ class TestE03TileGeospatialMetadata:
             crs="EPSG:32610",
             transform=(0.1 / 64, 0, tile.x_min, 0, -0.1 / 64, tile.y_max),
         )
-        with patch("datensee.eval.spatial.read_tiff_info", return_value=info):
-            result = eval_e03_tile_geospatial_metadata(tmp_path, config, tiles)
+        with patch("datensee.validation.spatial.read_tiff_info", return_value=info):
+            result = check_e03_tile_geospatial_metadata(tmp_path, config, tiles)
 
-        assert result.status == EvalStatus.FAILED
+        assert result.status == CheckStatus.FAILED
         assert "CRS" in result.message or "metadata" in result.message
 
     def test_wrong_origin(self, tmp_path: Path) -> None:
-        from datensee.eval.spatial import eval_e03_tile_geospatial_metadata
+        from datensee.validation.spatial import check_e03_tile_geospatial_metadata
 
         tiles = _make_tiles(1, 1)
         config = _make_config(tiles)
@@ -546,19 +546,19 @@ class TestE03TileGeospatialMetadata:
             crs="EPSG:4326",
             transform=(0.1 / 64, 0, tile.x_min + 1.0, 0, -0.1 / 64, tile.y_max),
         )
-        with patch("datensee.eval.spatial.read_tiff_info", return_value=info):
-            result = eval_e03_tile_geospatial_metadata(tmp_path, config, tiles)
+        with patch("datensee.validation.spatial.read_tiff_info", return_value=info):
+            result = check_e03_tile_geospatial_metadata(tmp_path, config, tiles)
 
-        assert result.status == EvalStatus.FAILED
+        assert result.status == CheckStatus.FAILED
 
     def test_missing_file_skipped(self, tmp_path: Path) -> None:
-        from datensee.eval.spatial import eval_e03_tile_geospatial_metadata
+        from datensee.validation.spatial import check_e03_tile_geospatial_metadata
 
         tiles = _make_tiles(1, 1)
         config = _make_config(tiles)
         # Don't create the file — should pass with 0 checked
-        result = eval_e03_tile_geospatial_metadata(tmp_path, config, tiles)
-        assert result.status == EvalStatus.PASSED  # 0 failures out of 0 checked
+        result = check_e03_tile_geospatial_metadata(tmp_path, config, tiles)
+        assert result.status == CheckStatus.PASSED  # 0 failures out of 0 checked
 
 
 # ---------------------------------------------------------------------------
@@ -568,7 +568,7 @@ class TestE03TileGeospatialMetadata:
 
 class TestE04BoundaryContinuity:
     def test_continuous_boundaries(self, tmp_path: Path) -> None:
-        from datensee.eval.spatial import eval_e04_boundary_continuity
+        from datensee.validation.spatial import check_e04_boundary_continuity
 
         tiles = _make_tiles(1, 2)  # Two side-by-side tiles
         config = _make_config(tiles)
@@ -579,13 +579,13 @@ class TestE04BoundaryContinuity:
         # Mock pixels: left tile's right edge == right tile's left edge
         pixels = np.ones((64, 64), dtype=np.float32) * 100.0
 
-        with patch("datensee.eval.spatial.read_tiff_pixels", return_value=pixels):
-            result = eval_e04_boundary_continuity(tmp_path, config, tiles)
+        with patch("datensee.validation.spatial.read_tiff_pixels", return_value=pixels):
+            result = check_e04_boundary_continuity(tmp_path, config, tiles)
 
-        assert result.status == EvalStatus.PASSED
+        assert result.status == CheckStatus.PASSED
 
     def test_discontinuous_boundary(self, tmp_path: Path) -> None:
-        from datensee.eval.spatial import eval_e04_boundary_continuity
+        from datensee.validation.spatial import check_e04_boundary_continuity
 
         tiles = _make_tiles(1, 2)
         config = _make_config(tiles)
@@ -602,20 +602,20 @@ class TestE04BoundaryContinuity:
                 return np.zeros((64, 64), dtype=np.float32)
             return np.full((64, 64), 1000.0, dtype=np.float32)
 
-        with patch("datensee.eval.spatial.read_tiff_pixels", side_effect=mock_read):
-            result = eval_e04_boundary_continuity(tmp_path, config, tiles, threshold=50.0)
+        with patch("datensee.validation.spatial.read_tiff_pixels", side_effect=mock_read):
+            result = check_e04_boundary_continuity(tmp_path, config, tiles, threshold=50.0)
 
-        assert result.status == EvalStatus.FAILED
+        assert result.status == CheckStatus.FAILED
 
     def test_no_neighbors_skipped(self, tmp_path: Path) -> None:
-        from datensee.eval.spatial import eval_e04_boundary_continuity
+        from datensee.validation.spatial import check_e04_boundary_continuity
 
         tiles = _make_tiles(1, 1)  # Single tile, no neighbors
         config = _make_config(tiles)
         _write_fake_tiff(tmp_path / tile_filename(tiles[0]))
 
-        result = eval_e04_boundary_continuity(tmp_path, config, tiles)
-        assert result.status == EvalStatus.SKIPPED
+        result = check_e04_boundary_continuity(tmp_path, config, tiles)
+        assert result.status == CheckStatus.SKIPPED
 
 
 # ---------------------------------------------------------------------------
@@ -677,16 +677,16 @@ class TestE05VrtCompleteness:
         config = _make_config(tiles)
         _write_vrt(tmp_path, tiles)
 
-        result = eval_e05_vrt_completeness(tmp_path, config)
-        assert result.status == EvalStatus.PASSED
+        result = check_e05_vrt_completeness(tmp_path, config)
+        assert result.status == CheckStatus.PASSED
 
     def test_missing_tile_in_vrt(self, tmp_path: Path) -> None:
         tiles = _make_tiles(2, 2)
         config = _make_config(tiles)
         _write_vrt(tmp_path, tiles, omit_tiles={tile_filename(tiles[0])})
 
-        result = eval_e05_vrt_completeness(tmp_path, config)
-        assert result.status == EvalStatus.FAILED
+        result = check_e05_vrt_completeness(tmp_path, config)
+        assert result.status == CheckStatus.FAILED
         assert "not referenced" in result.message
 
     def test_wrong_band_count(self, tmp_path: Path) -> None:
@@ -694,8 +694,8 @@ class TestE05VrtCompleteness:
         config = _make_config(tiles, band_count=3)
         _write_vrt(tmp_path, tiles, band_count=1)  # VRT has 1 band, config says 3
 
-        result = eval_e05_vrt_completeness(tmp_path, config)
-        assert result.status == EvalStatus.FAILED
+        result = check_e05_vrt_completeness(tmp_path, config)
+        assert result.status == CheckStatus.FAILED
         assert "bands" in result.message
 
     def test_wrong_data_type(self, tmp_path: Path) -> None:
@@ -703,8 +703,8 @@ class TestE05VrtCompleteness:
         config = _make_config(tiles, data_type="int16")
         _write_vrt(tmp_path, tiles, data_type="Float32")
 
-        result = eval_e05_vrt_completeness(tmp_path, config)
-        assert result.status == EvalStatus.FAILED
+        result = check_e05_vrt_completeness(tmp_path, config)
+        assert result.status == CheckStatus.FAILED
         assert "dataType" in result.message
 
     def test_wrong_dimensions(self, tmp_path: Path) -> None:
@@ -713,16 +713,16 @@ class TestE05VrtCompleteness:
         # Write VRT with wrong tile size (32 instead of 64)
         _write_vrt(tmp_path, tiles, tile_px=32)
 
-        result = eval_e05_vrt_completeness(tmp_path, config)
-        assert result.status == EvalStatus.FAILED
+        result = check_e05_vrt_completeness(tmp_path, config)
+        assert result.status == CheckStatus.FAILED
         assert "dimensions" in result.message
 
     def test_no_vrt_file(self, tmp_path: Path) -> None:
         tiles = _make_tiles(1, 1)
         config = _make_config(tiles)
 
-        result = eval_e05_vrt_completeness(tmp_path, config)
-        assert result.status == EvalStatus.FAILED
+        result = check_e05_vrt_completeness(tmp_path, config)
+        assert result.status == CheckStatus.FAILED
         assert "not found" in result.message
 
     def test_multiband_vrt(self, tmp_path: Path) -> None:
@@ -730,8 +730,8 @@ class TestE05VrtCompleteness:
         config = _make_config(tiles, band_count=3)
         _write_vrt(tmp_path, tiles, band_count=3)
 
-        result = eval_e05_vrt_completeness(tmp_path, config)
-        assert result.status == EvalStatus.PASSED
+        result = check_e05_vrt_completeness(tmp_path, config)
+        assert result.status == CheckStatus.PASSED
 
 
 # ---------------------------------------------------------------------------
@@ -741,23 +741,23 @@ class TestE05VrtCompleteness:
 
 class TestE06VrtSpatialCorrectness:
     def test_correct_bbox(self, tmp_path: Path) -> None:
-        from datensee.eval.spatial import eval_e06_vrt_spatial_correctness
+        from datensee.validation.spatial import check_e06_vrt_spatial_correctness
 
         tiles = _make_tiles(2, 2)
         config = _make_config(tiles)
         _write_vrt(tmp_path, tiles)
 
-        result = eval_e06_vrt_spatial_correctness(tmp_path, config)
-        assert result.status == EvalStatus.PASSED
+        result = check_e06_vrt_spatial_correctness(tmp_path, config)
+        assert result.status == CheckStatus.PASSED
 
     def test_no_vrt(self, tmp_path: Path) -> None:
-        from datensee.eval.spatial import eval_e06_vrt_spatial_correctness
+        from datensee.validation.spatial import check_e06_vrt_spatial_correctness
 
         tiles = _make_tiles(1, 1)
         config = _make_config(tiles)
 
-        result = eval_e06_vrt_spatial_correctness(tmp_path, config)
-        assert result.status == EvalStatus.FAILED
+        result = check_e06_vrt_spatial_correctness(tmp_path, config)
+        assert result.status == CheckStatus.FAILED
         assert "not found" in result.message
 
 
@@ -768,7 +768,7 @@ class TestE06VrtSpatialCorrectness:
 
 class TestE09PixelRangeSanity:
     def test_values_in_range(self, tmp_path: Path) -> None:
-        from datensee.eval.tile_integrity import eval_e09_pixel_range_sanity
+        from datensee.validation.tile_integrity import check_e09_pixel_range_sanity
 
         tiles = _make_tiles(1, 2)
         config = _make_config(tiles)
@@ -778,28 +778,28 @@ class TestE09PixelRangeSanity:
 
         # Normal float32 values
         pixels = np.random.default_rng(42).uniform(-100, 100, (64, 64)).astype(np.float32)
-        with patch("datensee.eval.tile_integrity.read_tiff_pixels", return_value=pixels):
-            result = eval_e09_pixel_range_sanity(tmp_path, config, tiles)
+        with patch("datensee.validation.tile_integrity.read_tiff_pixels", return_value=pixels):
+            result = check_e09_pixel_range_sanity(tmp_path, config, tiles)
 
-        assert result.status == EvalStatus.PASSED
+        assert result.status == CheckStatus.PASSED
 
     def test_all_nan_tiles_fail(self, tmp_path: Path) -> None:
-        from datensee.eval.tile_integrity import eval_e09_pixel_range_sanity
+        from datensee.validation.tile_integrity import check_e09_pixel_range_sanity
 
         tiles = _make_tiles(1, 1)
         config = _make_config(tiles)
         _write_fake_tiff(tmp_path / tile_filename(tiles[0]))
 
         nan_pixels = np.full((64, 64), np.nan, dtype=np.float32)
-        with patch("datensee.eval.tile_integrity.read_tiff_pixels", return_value=nan_pixels):
-            result = eval_e09_pixel_range_sanity(tmp_path, config, tiles)
+        with patch("datensee.validation.tile_integrity.read_tiff_pixels", return_value=nan_pixels):
+            result = check_e09_pixel_range_sanity(tmp_path, config, tiles)
 
         # 1/1 = 100% all-NaN → should fail (>5% threshold)
-        assert result.status == EvalStatus.FAILED
+        assert result.status == CheckStatus.FAILED
         assert "all-NaN" in result.message
 
     def test_out_of_range_values(self, tmp_path: Path) -> None:
-        from datensee.eval.tile_integrity import eval_e09_pixel_range_sanity
+        from datensee.validation.tile_integrity import check_e09_pixel_range_sanity
 
         tiles = _make_tiles(1, 1)
         config = _make_config(tiles, data_type="uint8")
@@ -807,21 +807,21 @@ class TestE09PixelRangeSanity:
 
         # Values outside uint8 range [0, 255]
         pixels = np.full((64, 64), 999.0, dtype=np.float64)
-        with patch("datensee.eval.tile_integrity.read_tiff_pixels", return_value=pixels):
-            result = eval_e09_pixel_range_sanity(tmp_path, config, tiles)
+        with patch("datensee.validation.tile_integrity.read_tiff_pixels", return_value=pixels):
+            result = check_e09_pixel_range_sanity(tmp_path, config, tiles)
 
-        assert result.status == EvalStatus.FAILED
+        assert result.status == CheckStatus.FAILED
         assert "in range" in result.message
 
     def test_no_readable_tiles_skipped(self, tmp_path: Path) -> None:
-        from datensee.eval.tile_integrity import eval_e09_pixel_range_sanity
+        from datensee.validation.tile_integrity import check_e09_pixel_range_sanity
 
         tiles = _make_tiles(1, 1)
         config = _make_config(tiles)
         # No files on disk
 
-        result = eval_e09_pixel_range_sanity(tmp_path, config, tiles)
-        assert result.status == EvalStatus.SKIPPED
+        result = check_e09_pixel_range_sanity(tmp_path, config, tiles)
+        assert result.status == CheckStatus.SKIPPED
 
 
 # ---------------------------------------------------------------------------
@@ -831,7 +831,7 @@ class TestE09PixelRangeSanity:
 
 class TestE07PixelValueAccuracy:
     def test_matching_pixels(self, tmp_path: Path) -> None:
-        from datensee.eval.reference import eval_e07_pixel_value_accuracy
+        from datensee.validation.reference import check_e07_pixel_value_accuracy
 
         tiles = _make_tiles(1, 2)
         config = _make_config(tiles)
@@ -842,10 +842,10 @@ class TestE07PixelValueAccuracy:
         pixels = np.random.default_rng(42).uniform(0, 100, (64, 64)).astype(np.float32)
 
         with (
-            patch("datensee.eval.reference.read_tiff_pixels", return_value=pixels),
-            patch("datensee.eval.reference._fetch_tile_as_numpy", return_value=pixels),
+            patch("datensee.validation.reference.read_tiff_pixels", return_value=pixels),
+            patch("datensee.validation.reference._fetch_tile_as_numpy", return_value=pixels),
         ):
-            result = eval_e07_pixel_value_accuracy(
+            result = check_e07_pixel_value_accuracy(
                 tmp_path,
                 config,
                 tiles,
@@ -853,10 +853,10 @@ class TestE07PixelValueAccuracy:
                 access_token="fake-token",
             )
 
-        assert result.status == EvalStatus.PASSED
+        assert result.status == CheckStatus.PASSED
 
     def test_mismatched_pixels(self, tmp_path: Path) -> None:
-        from datensee.eval.reference import eval_e07_pixel_value_accuracy
+        from datensee.validation.reference import check_e07_pixel_value_accuracy
 
         tiles = _make_tiles(1, 1)
         config = _make_config(tiles)
@@ -866,10 +866,10 @@ class TestE07PixelValueAccuracy:
         ref_pixels = np.ones((64, 64), dtype=np.float32)
 
         with (
-            patch("datensee.eval.reference.read_tiff_pixels", return_value=disk_pixels),
-            patch("datensee.eval.reference._fetch_tile_as_numpy", return_value=ref_pixels),
+            patch("datensee.validation.reference.read_tiff_pixels", return_value=disk_pixels),
+            patch("datensee.validation.reference._fetch_tile_as_numpy", return_value=ref_pixels),
         ):
-            result = eval_e07_pixel_value_accuracy(
+            result = check_e07_pixel_value_accuracy(
                 tmp_path,
                 config,
                 tiles,
@@ -877,28 +877,28 @@ class TestE07PixelValueAccuracy:
                 access_token="fake-token",
             )
 
-        assert result.status == EvalStatus.FAILED
+        assert result.status == CheckStatus.FAILED
         assert "differ" in result.message
 
     def test_no_tiles_skipped(self, tmp_path: Path) -> None:
-        from datensee.eval.reference import eval_e07_pixel_value_accuracy
+        from datensee.validation.reference import check_e07_pixel_value_accuracy
 
         tiles = _make_tiles(1, 1)
         config = _make_config(tiles)
         # No files on disk
 
-        result = eval_e07_pixel_value_accuracy(
+        result = check_e07_pixel_value_accuracy(
             tmp_path,
             config,
             tiles,
             gee_project="test",
             access_token="fake-token",
         )
-        assert result.status == EvalStatus.SKIPPED
+        assert result.status == CheckStatus.SKIPPED
 
     def test_3d_reference_array(self, tmp_path: Path) -> None:
         """NPY from EE can be (bands, height, width) — E07 normalizes to 2D."""
-        from datensee.eval.reference import eval_e07_pixel_value_accuracy
+        from datensee.validation.reference import check_e07_pixel_value_accuracy
 
         tiles = _make_tiles(1, 1)
         config = _make_config(tiles)
@@ -908,10 +908,10 @@ class TestE07PixelValueAccuracy:
         pixels_3d = np.ones((1, 64, 64), dtype=np.float32) * 42.0
 
         with (
-            patch("datensee.eval.reference.read_tiff_pixels", return_value=pixels_2d),
-            patch("datensee.eval.reference._fetch_tile_as_numpy", return_value=pixels_3d),
+            patch("datensee.validation.reference.read_tiff_pixels", return_value=pixels_2d),
+            patch("datensee.validation.reference._fetch_tile_as_numpy", return_value=pixels_3d),
         ):
-            result = eval_e07_pixel_value_accuracy(
+            result = check_e07_pixel_value_accuracy(
                 tmp_path,
                 config,
                 tiles,
@@ -919,4 +919,4 @@ class TestE07PixelValueAccuracy:
                 access_token="fake-token",
             )
 
-        assert result.status == EvalStatus.PASSED
+        assert result.status == CheckStatus.PASSED

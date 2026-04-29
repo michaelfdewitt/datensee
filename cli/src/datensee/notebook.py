@@ -354,7 +354,7 @@ def preview_tiles(
     """Download and display N sample tiles as matplotlib images.
 
     For GCS paths, downloads tile bytes via google-cloud-storage. For local
-    paths, reads directly. Requires rasterio (datensee[eval] extra).
+    paths, reads directly. Requires rasterio (datensee[validation] extra).
 
     Args:
         output: Output path (GCS URI or local directory).

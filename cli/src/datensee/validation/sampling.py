@@ -1,6 +1,6 @@
-"""Tile sampling strategies for evals.
+"""Tile sampling strategies for validation checks.
 
-Most evals don't need every tile. This module provides strategies to select
+Most checks don't need every tile. This module provides strategies to select
 a representative subset for cost and speed.
 """
 
@@ -13,7 +13,7 @@ from datensee.config import TileCoordinate
 
 
 class SamplingStrategy(StrEnum):
-    """How to select tiles for sampling-based evals."""
+    """How to select tiles for sampling-based checks."""
 
     ALL = "all"
     STRATIFIED = "stratified"

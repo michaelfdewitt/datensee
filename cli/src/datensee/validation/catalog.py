@@ -1,8 +1,8 @@
-"""Eval catalog — definitions and registry for all DatensEE evals.
+"""Eval catalog — definitions and registry for all DatensEE checks.
 
-Each eval has an ID, name, description, cost tier, and pass criteria.
+Each check has an ID, name, description, cost tier, and pass criteria.
 The catalog is the single source of truth used by CLI help, docs generation,
-and the eval runner.
+and the check runner.
 """
 
 from __future__ import annotations
@@ -12,8 +12,8 @@ from enum import StrEnum
 from pydantic import BaseModel
 
 
-class EvalID(StrEnum):
-    """Stable identifiers for each eval."""
+class CheckID(StrEnum):
+    """Stable identifiers for each check."""
 
     E01 = "E01"
     E02 = "E02"
@@ -28,16 +28,16 @@ class EvalID(StrEnum):
 
 
 class CostTier(StrEnum):
-    """Whether an eval requires EE API calls."""
+    """Whether an check requires EE API calls."""
 
     ZERO_COST = "zero_cost"
     API_COST = "api_cost"
 
 
-class EvalDefinition(BaseModel):
-    """Metadata for a single eval."""
+class CheckDefinition(BaseModel):
+    """Metadata for a single check."""
 
-    id: EvalID
+    id: CheckID
     name: str
     description: str
     pass_criteria: str
@@ -45,9 +45,9 @@ class EvalDefinition(BaseModel):
     runs_on_all_tiles: bool = False
 
 
-_CATALOG: dict[EvalID, EvalDefinition] = {
-    EvalID.E01: EvalDefinition(
-        id=EvalID.E01,
+_CATALOG: dict[CheckID, CheckDefinition] = {
+    CheckID.E01: CheckDefinition(
+        id=CheckID.E01,
         name="Tile File Integrity",
         description=(
             "Every expected tile file exists, has TIFF magic bytes, and is larger than 1 KB."
@@ -56,8 +56,8 @@ _CATALOG: dict[EvalID, EvalDefinition] = {
         cost_tier=CostTier.ZERO_COST,
         runs_on_all_tiles=True,
     ),
-    EvalID.E02: EvalDefinition(
-        id=EvalID.E02,
+    CheckID.E02: CheckDefinition(
+        id=CheckID.E02,
         name="Tile Dimensions",
         description=(
             "Tile pixel dimensions match tile_size_pixels from config. "
@@ -66,22 +66,22 @@ _CATALOG: dict[EvalID, EvalDefinition] = {
         pass_criteria="Exact match for all sampled tiles",
         cost_tier=CostTier.ZERO_COST,
     ),
-    EvalID.E03: EvalDefinition(
-        id=EvalID.E03,
+    CheckID.E03: CheckDefinition(
+        id=CheckID.E03,
         name="Tile Geospatial Metadata",
         description="CRS matches config, affine transform origin matches tile coordinates.",
         pass_criteria="CRS match, origin within 1e-6",
         cost_tier=CostTier.ZERO_COST,
     ),
-    EvalID.E04: EvalDefinition(
-        id=EvalID.E04,
+    CheckID.E04: CheckDefinition(
+        id=CheckID.E04,
         name="Boundary Continuity",
         description="Adjacent tiles' shared edge pixels form a smooth continuation.",
         pass_criteria="Mean absolute difference < threshold",
         cost_tier=CostTier.ZERO_COST,
     ),
-    EvalID.E05: EvalDefinition(
-        id=EvalID.E05,
+    CheckID.E05: CheckDefinition(
+        id=CheckID.E05,
         name="VRT Completeness",
         description=(
             "mosaic.vrt references every tile with correct band count/type "
@@ -91,15 +91,15 @@ _CATALOG: dict[EvalID, EvalDefinition] = {
         cost_tier=CostTier.ZERO_COST,
         runs_on_all_tiles=True,
     ),
-    EvalID.E06: EvalDefinition(
-        id=EvalID.E06,
+    CheckID.E06: CheckDefinition(
+        id=CheckID.E06,
         name="VRT Spatial Correctness",
         description="VRT bounding box covers the entire export region.",
         pass_criteria="BBox covers input geometry",
         cost_tier=CostTier.ZERO_COST,
     ),
-    EvalID.E07: EvalDefinition(
-        id=EvalID.E07,
+    CheckID.E07: CheckDefinition(
+        id=CheckID.E07,
         name="Pixel Value Accuracy",
         description=(
             "For sampled tiles, re-fetch from EE HV API in NPY format and "
@@ -108,8 +108,8 @@ _CATALOG: dict[EvalID, EvalDefinition] = {
         pass_criteria="Max absolute difference < epsilon",
         cost_tier=CostTier.API_COST,
     ),
-    EvalID.E08: EvalDefinition(
-        id=EvalID.E08,
+    CheckID.E08: CheckDefinition(
+        id=CheckID.E08,
         name="Failure Accounting",
         description=(
             "tiles_on_disk + tiles_in_failures == tiles_in_config. No tiles unaccounted for."
@@ -118,8 +118,8 @@ _CATALOG: dict[EvalID, EvalDefinition] = {
         cost_tier=CostTier.ZERO_COST,
         runs_on_all_tiles=True,
     ),
-    EvalID.E09: EvalDefinition(
-        id=EvalID.E09,
+    CheckID.E09: CheckDefinition(
+        id=CheckID.E09,
         name="Pixel Range Sanity",
         description=(
             "Sampled pixel values fall within expected range for the data type and expression."
@@ -127,8 +127,8 @@ _CATALOG: dict[EvalID, EvalDefinition] = {
         pass_criteria=">95% in range, <5% all-NaN tiles",
         cost_tier=CostTier.ZERO_COST,
     ),
-    EvalID.E10: EvalDefinition(
-        id=EvalID.E10,
+    CheckID.E10: CheckDefinition(
+        id=CheckID.E10,
         name="Output Size Plausibility",
         description=("Total output size is within 0.2x–5x of the cost estimator's prediction."),
         pass_criteria="Within bounds",
@@ -138,16 +138,16 @@ _CATALOG: dict[EvalID, EvalDefinition] = {
 }
 
 
-def get_eval(eval_id: EvalID) -> EvalDefinition:
-    """Look up an eval definition by ID."""
-    return _CATALOG[eval_id]
+def get_check(check_id: CheckID) -> CheckDefinition:
+    """Look up an check definition by ID."""
+    return _CATALOG[check_id]
 
 
-def list_evals() -> list[EvalDefinition]:
-    """Return all eval definitions in ID order."""
-    return [_CATALOG[eid] for eid in EvalID]
+def list_checks() -> list[CheckDefinition]:
+    """Return all check definitions in ID order."""
+    return [_CATALOG[eid] for eid in CheckID]
 
 
-def zero_cost_evals() -> list[EvalID]:
-    """Return IDs of all zero-cost evals."""
+def zero_cost_checks() -> list[CheckID]:
+    """Return IDs of all zero-cost checks."""
     return [eid for eid, defn in _CATALOG.items() if defn.cost_tier == CostTier.ZERO_COST]

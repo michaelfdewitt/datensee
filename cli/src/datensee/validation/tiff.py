@@ -1,6 +1,6 @@
 """Minimal GeoTIFF reader — rasterio wrapper with graceful fallback.
 
-If rasterio is installed (via `datensee[eval]`), it provides CRS, affine,
+If rasterio is installed (via `datensee[validation]`), it provides CRS, affine,
 dimensions, band count, dtype, and pixel data. Without rasterio, basic
 TIFF validation (magic bytes, file size) still works.
 """
@@ -42,7 +42,7 @@ def read_tiff_info(path: Path) -> TiffInfo:
     if not _has_rasterio():
         raise ImportError(
             "rasterio is required for GeoTIFF metadata reading. "
-            "Install it with: pip install datensee[eval]"
+            "Install it with: pip install datensee[validation]"
         )
 
     import rasterio
@@ -71,7 +71,8 @@ def read_tiff_pixels(path: Path, band: int = 1) -> np.ndarray:
     """
     if not _has_rasterio():
         raise ImportError(
-            "rasterio is required for pixel reading. Install it with: pip install datensee[eval]"
+            "rasterio is required for pixel reading. "
+            "Install it with: pip install datensee[validation]"
         )
 
     import rasterio

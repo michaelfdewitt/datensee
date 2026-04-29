@@ -1,4 +1,4 @@
-"""Reference comparison eval — E07.
+"""Reference comparison check — E07.
 
 The crown jewel: re-fetch sampled tiles from the EE HV API in NPY format
 and compare pixel values against the pipeline output on disk. If they match,
@@ -18,10 +18,10 @@ import httpx
 import numpy as np
 
 from datensee.config import PipelineConfig, TileCoordinate
-from datensee.eval.catalog import EvalID
-from datensee.eval.report import EvalResult, EvalStatus
-from datensee.eval.tiff import read_tiff_pixels
-from datensee.eval.tile_integrity import tile_filename
+from datensee.validation.catalog import CheckID
+from datensee.validation.report import CheckResult, CheckStatus
+from datensee.validation.tiff import read_tiff_pixels
+from datensee.validation.tile_integrity import tile_filename
 
 HV_ENDPOINT = (
     "https://earthengine-highvolume.googleapis.com/v1/projects/{project}/image:computePixels"
@@ -89,7 +89,7 @@ def _fetch_tile_as_numpy(
     return np.load(io.BytesIO(resp.content))
 
 
-def eval_e07_pixel_value_accuracy(
+def check_e07_pixel_value_accuracy(
     output_dir: Path,
     config: PipelineConfig,
     sampled_tiles: list[TileCoordinate],
@@ -97,7 +97,7 @@ def eval_e07_pixel_value_accuracy(
     gee_project: str,
     access_token: str,
     epsilon: float = _DEFAULT_EPSILON,
-) -> EvalResult:
+) -> CheckResult:
     """E07: Compare pipeline output pixels against fresh EE HV API fetches.
 
     For each sampled tile:
@@ -114,7 +114,7 @@ def eval_e07_pixel_value_accuracy(
         epsilon: Maximum allowed absolute difference per pixel.
 
     Returns:
-        EvalResult with pass/fail and per-tile details.
+        CheckResult with pass/fail and per-tile details.
     """
     grid = config.tile_grid
     tile_size = grid.tile_size_pixels
@@ -201,23 +201,23 @@ def eval_e07_pixel_value_accuracy(
                 )
 
     if checked == 0:
-        return EvalResult(
-            eval_id=EvalID.E07,
-            status=EvalStatus.SKIPPED,
+        return CheckResult(
+            check_id=CheckID.E07,
+            status=CheckStatus.SKIPPED,
             message="No tiles could be compared (missing files or API errors)",
             details={"errors": mismatches[:10]} if mismatches else {},
         )
 
     if not mismatches:
-        return EvalResult(
-            eval_id=EvalID.E07,
-            status=EvalStatus.PASSED,
+        return CheckResult(
+            check_id=CheckID.E07,
+            status=CheckStatus.PASSED,
             message=f"All {checked} sampled tiles match EE reference (epsilon={epsilon})",
         )
 
-    return EvalResult(
-        eval_id=EvalID.E07,
-        status=EvalStatus.FAILED,
+    return CheckResult(
+        check_id=CheckID.E07,
+        status=CheckStatus.FAILED,
         message=f"{len(mismatches)}/{checked} tiles differ from EE reference (epsilon={epsilon})",
         details={"mismatches": mismatches[:10]},
     )

@@ -1,7 +1,7 @@
-"""Eval result models and Rich rendering.
+"""Validation result models and Rich rendering.
 
-EvalResult captures per-eval pass/fail/skip with details.
-EvalReport aggregates results and renders a summary table.
+CheckResult captures per-check pass/fail/skip with details.
+ValidationReport aggregates results and renders a summary table.
 """
 
 from __future__ import annotations
@@ -14,11 +14,11 @@ from rich.panel import Panel
 from rich.table import Table
 
 from datensee.config import PipelineConfig
-from datensee.eval.catalog import EvalID, get_eval
+from datensee.validation.catalog import CheckID, get_check
 
 
-class EvalStatus(StrEnum):
-    """Outcome of a single eval."""
+class CheckStatus(StrEnum):
+    """Outcome of a single check."""
 
     PASSED = "passed"
     FAILED = "failed"
@@ -26,33 +26,33 @@ class EvalStatus(StrEnum):
     ERROR = "error"
 
 
-class EvalResult(BaseModel):
-    """Result of running one eval."""
+class CheckResult(BaseModel):
+    """Result of running one check."""
 
-    eval_id: EvalID
-    status: EvalStatus
+    check_id: CheckID
+    status: CheckStatus
     message: str = ""
     details: dict[str, Any] = {}
 
 
-class EvalReport(BaseModel):
+class ValidationReport(BaseModel):
     """Aggregated results from validate_output()."""
 
-    results: list[EvalResult]
+    results: list[CheckResult]
     output_path: str
     config: PipelineConfig
 
     @property
     def passed(self) -> int:
-        return sum(1 for r in self.results if r.status == EvalStatus.PASSED)
+        return sum(1 for r in self.results if r.status == CheckStatus.PASSED)
 
     @property
     def failed(self) -> int:
-        return sum(1 for r in self.results if r.status == EvalStatus.FAILED)
+        return sum(1 for r in self.results if r.status == CheckStatus.FAILED)
 
     @property
     def all_passed(self) -> bool:
-        return all(r.status in (EvalStatus.PASSED, EvalStatus.SKIPPED) for r in self.results)
+        return all(r.status in (CheckStatus.PASSED, CheckStatus.SKIPPED) for r in self.results)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize report to a JSON-compatible dict."""
@@ -65,7 +65,7 @@ class EvalReport(BaseModel):
             },
             "results": [
                 {
-                    "eval_id": r.eval_id.value,
+                    "check_id": r.check_id.value,
                     "status": r.status.value,
                     "message": r.message,
                     "details": r.details,
@@ -75,24 +75,24 @@ class EvalReport(BaseModel):
         }
 
     def render(self) -> Panel:
-        """Render a Rich panel summarizing eval results."""
+        """Render a Rich panel summarizing check results."""
         table = Table(show_edge=False, pad_edge=False)
-        table.add_column("Eval", style="bold", min_width=6)
+        table.add_column("Check", style="bold", min_width=6)
         table.add_column("Name", min_width=24)
         table.add_column("Status", min_width=8)
         table.add_column("Message")
 
         _status_style = {
-            EvalStatus.PASSED: "[green]PASS[/green]",
-            EvalStatus.FAILED: "[red]FAIL[/red]",
-            EvalStatus.SKIPPED: "[dim]SKIP[/dim]",
-            EvalStatus.ERROR: "[yellow]ERR[/yellow]",
+            CheckStatus.PASSED: "[green]PASS[/green]",
+            CheckStatus.FAILED: "[red]FAIL[/red]",
+            CheckStatus.SKIPPED: "[dim]SKIP[/dim]",
+            CheckStatus.ERROR: "[yellow]ERR[/yellow]",
         }
 
         for result in self.results:
-            defn = get_eval(result.eval_id)
+            defn = get_check(result.check_id)
             table.add_row(
-                result.eval_id.value,
+                result.check_id.value,
                 defn.name,
                 _status_style[result.status],
                 result.message,
@@ -100,6 +100,6 @@ class EvalReport(BaseModel):
 
         n_total = len(self.results)
         style = "green" if self.all_passed else "red"
-        title = f"Eval Results — {self.passed}/{n_total} passed"
+        title = f"Validation results — {self.passed}/{n_total} passed"
 
         return Panel(table, title=title, border_style=style)

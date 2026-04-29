@@ -23,31 +23,6 @@ datensee export expression.json region.geojson \
   --crs EPSG:32610
 ```
 
-## Collaborator quick start (private beta)
-
-The repo is private, so running the demo notebook requires a GitHub token and a GCP project. Three steps:
-
-**1. Create a GitHub token**
-
-Go to [github.com/settings/tokens](https://github.com/settings/tokens) → *Generate new token (classic)* → tick **`repo`** → set an expiry → copy it.
-
-**2. Add it as a Colab Secret**
-
-Open the notebook in Colab → click the key icon (🔑) in the left sidebar → *Add new secret* → name it **`GITHUB_TOKEN`**, paste the token, enable notebook access.
-
-**3. Set your GCP project and run**
-
-In the notebook's setup cell, change `PROJECT` and `GCS_BUCKET` to your own GCP project and bucket, then run all cells.
-
-Your GCP project needs:
-- [Earth Engine API](https://console.cloud.google.com/apis/library/earthengine.googleapis.com) enabled
-- A GCS bucket to write output to
-- The account you auth with in Colab registered for [non-commercial EE use](https://earthengine.google.com/noncommercial) (or a commercial license)
-
-**To open the notebook:** in Colab, go to **File → Open notebook → GitHub**, connect your GitHub account, search for `michaelfdewitt/datensee`, and select `notebooks/datensee_demo_gcs.ipynb`. The badge-style link doesn't work for private repos.
-
----
-
 ## Why
 
 Earth Engine is great at computing things, but the built-in `Export.image.*` functions were designed in an era that predates the Cambrian explosion of easy and affordable cloud processing tools.
@@ -92,10 +67,9 @@ and stitch the results together.
 
 ### Prerequisites
 
-- Python 3.12+, [uv](https://docs.astral.sh/uv/)
-- Java 25+, Gradle 9+
-- `gcloud auth application-default login` (ADC configured)
+- Python 3.12+
 - A GCP project with the [Earth Engine API](https://console.cloud.google.com/apis/library/earthengine.googleapis.com) enabled
+- `gcloud auth application-default login` (only needed for the local CLI; Colab handles auth automatically)
 
 ### Install
 
@@ -103,29 +77,11 @@ and stitch the results together.
 pip install datensee
 ```
 
-Or from source:
+That's it. No `earthengine-api` dependency, no Java toolchain, no Gradle. The package ships with a small set of pure-Python deps (Typer, Pydantic, httpx, Rich, pyproj, shapely, google-auth, google-cloud-storage). The Java pipeline JAR is fetched on first use by `datensee jar download` (auto-invoked on first `export`), so users never see Gradle.
 
-```bash
-cd cli && uv sync
-```
+### Where it lives
 
-### Pipeline JAR
-
-The Java pipeline JAR is required to run exports. Install it with:
-
-```bash
-# Download a prebuilt JAR from GitHub Releases
-datensee jar download
-
-# Or build from source (requires Java 25+ and Gradle)
-datensee jar build
-```
-
-The CLI searches for the JAR in this order:
-1. `--jar <path>` flag (explicit)
-2. `DATENSEE_JAR` environment variable
-3. `~/.datensee/jars/datensee-pipeline.jar` (from `datensee jar download`)
-4. Development repo path (`pipelines/build/libs/datensee-pipeline.jar`)
+DatensEE is published to PyPI as `datensee` and lives in the `earthengine` repo under `tools/datensee/`. It is **deliberately separate** from the `earthengine` package itself — installing `datensee` does **not** pull in `earthengine-api` or any other heavy GIS toolchain. Users who want to author EE expressions can `pip install earthengine-api` independently.
 
 ### Demo: Landsat 9 NDVI over SF Bay Area
 
@@ -257,8 +213,8 @@ datensee/
 │   │   ├── tiling.py    Region → globally-aligned tile grid
 │   │   ├── assemble.py  VRT mosaic assembly (multi-band, any data type)
 │   │   ├── submit.py    Dataflow job submission
-│   │   └── eval/        Output validation: 10 evals (structural, spatial, pixel-level)
-│   └── tests/           Unit + EE HV API integration + eval tests
+│   │   └── validation/  Output validation: 10 checks (structural, spatial, pixel-level)
+│   └── tests/           Unit + EE HV API integration + output-validation tests
 ├── pipelines/           Java Beam pipeline (Gradle)
 │   └── src/main/java/com/datensee/
 │       ├── DatensEEPipeline.java
@@ -268,6 +224,27 @@ datensee/
 ├── contract/            JSON schema + examples
 └── CLAUDE.md            Development guide
 ```
+
+## Development setup
+
+Most users should `pip install datensee` and stop reading. This section is for contributors working on DatensEE itself.
+
+```bash
+# Python side
+cd cli && uv sync
+
+# Java side (only needed if you're modifying the pipeline)
+cd pipelines && ./gradlew shadowJar
+```
+
+The CLI looks for the pipeline JAR in this order:
+
+1. `--jar <path>` flag
+2. `DATENSEE_JAR` environment variable
+3. `~/.datensee/jars/datensee-pipeline.jar` (downloaded by `datensee jar download`)
+4. Repo development path (`pipelines/build/libs/datensee-pipeline.jar`)
+
+End users never need step 2–4: `datensee` auto-downloads the prebuilt JAR on first use. `datensee jar download` and `datensee jar build` are exposed as escape hatches.
 
 ## Testing
 

@@ -1,11 +1,11 @@
-"""Integration tests for the eval system — runs evals against real EE output.
+"""Output validation integration tests — runs checks against a real EE export.
 
 These tests require:
     - Application Default Credentials configured
     - The --integration flag and --gee-project option
 
 Run with:
-    cd cli && uv run pytest tests/test_eval_integration.py \
+    cd cli && uv run pytest tests/test_validation_output_integration.py \
         --integration --gee-project=datensee-testing -v
 """
 
@@ -20,9 +20,9 @@ import pytest
 
 from datensee.auth import get_access_token
 from datensee.config import OutputConfig, PipelineConfig, RunnerConfig
-from datensee.eval import EvalID, EvalStatus, validate_output
-from datensee.eval.reference import _build_hv_request
 from datensee.tiling import decompose_region
+from datensee.validation import CheckID, CheckStatus, validate_output
+from datensee.validation.reference import _build_hv_request
 
 # ---------------------------------------------------------------------------
 # SRTM expression (reuse from test_integration_ee.py pattern)
@@ -83,7 +83,7 @@ def access_token() -> str:
 def real_output(gee_project: str, access_token: str) -> tuple[Path, PipelineConfig]:
     """Fetch a small set of real tiles from EE and write them as GeoTIFFs.
 
-    Returns (output_dir, config) for eval testing.
+    Returns (output_dir, config) for the validation check suite.
     """
     grid = decompose_region(
         _SF_BAY_SMALL,
@@ -96,11 +96,11 @@ def real_output(gee_project: str, access_token: str) -> tuple[Path, PipelineConf
         ee_expression=_srtm_elevation_expression(),
         gee_project=gee_project,
         tile_grid=grid,
-        output=OutputConfig(output_path="/tmp/eval-test", band_count=1, data_type="float32"),
+        output=OutputConfig(output_path="/tmp/validation-test", band_count=1, data_type="float32"),
         runner=RunnerConfig(mode="local"),
     )
 
-    output_dir = Path(tempfile.mkdtemp(prefix="datensee-eval-test-"))
+    output_dir = Path(tempfile.mkdtemp(prefix="datensee-validation-test-"))
 
     with httpx.Client(timeout=120.0) as client:
         for tile in grid.tiles:
@@ -140,19 +140,19 @@ def real_output(gee_project: str, access_token: str) -> tuple[Path, PipelineConf
 
 @pytest.mark.integration
 class TestEvalWithRealOutput:
-    """Run evals against real EE tiles fetched in the fixture."""
+    """Run validation checks against real EE tiles fetched in the fixture."""
 
     def test_zero_cost_evals_pass(self, real_output: tuple[Path, PipelineConfig]) -> None:
-        """All zero-cost evals should pass on correctly-fetched tiles."""
+        """All zero-cost checks should pass on correctly-fetched tiles."""
         output_dir, config = real_output
         report = validate_output(
             output_dir,
             config,
-            evals=[EvalID.E01, EvalID.E05, EvalID.E06, EvalID.E08, EvalID.E10],
+            checks=[CheckID.E01, CheckID.E05, CheckID.E06, CheckID.E08, CheckID.E10],
         )
         for r in report.results:
-            assert r.status in (EvalStatus.PASSED, EvalStatus.SKIPPED), (
-                f"{r.eval_id}: {r.status} — {r.message}"
+            assert r.status in (CheckStatus.PASSED, CheckStatus.SKIPPED), (
+                f"{r.check_id}: {r.status} — {r.message}"
             )
 
     def test_e07_pixel_accuracy(
@@ -167,10 +167,10 @@ class TestEvalWithRealOutput:
         report = validate_output(
             output_dir,
             config,
-            evals=[EvalID.E07],
+            checks=[CheckID.E07],
             sample_size=4,
             gee_project=gee_project,
             access_token=access_token,
         )
         e07 = report.results[0]
-        assert e07.status == EvalStatus.PASSED, f"E07: {e07.message}\n{e07.details}"
+        assert e07.status == CheckStatus.PASSED, f"E07: {e07.message}\n{e07.details}"
