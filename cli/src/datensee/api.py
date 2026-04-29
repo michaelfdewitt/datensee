@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -439,4 +440,186 @@ def poll(
         access_token=access_token,
         poll_interval_seconds=poll_interval,
         status_callback=callback,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Adaptive retry — quadtree splitter against a failures journal
+# ---------------------------------------------------------------------------
+
+
+class RetryResult(BaseModel):
+    """Outcome of a `datensee retry` run.
+
+    ``next_tiles_count`` is the number of TileCoordinates fed back into
+    the pipeline (split children + same-bbox retries). ``stats`` is the
+    breakdown by action (split / retry_same / depth_cap / terminal /
+    unknown_kind). ``carryover_count`` is how many original journal
+    entries did not make progress this round.
+    """
+
+    job_id: str | None = None
+    duration_seconds: float = 0.0
+    next_tiles_count: int = 0
+    carryover_count: int = 0
+    stats: dict[str, int] = {}
+
+
+def retry(
+    *,
+    journal: Path | str,
+    ee_expression: str,
+    project: str,
+    output: str,
+    scale: float = 30.0,
+    crs: str = "EPSG:4326",
+    tile_size: int = 512,
+    output_tile_size: int | None = None,
+    runner: Literal["local", "dataflow"] = "local",
+    region_gcp: str = "us-central1",
+    temp_location: str | None = None,
+    max_qps: int = 100,
+    labels: dict[str, str] | None = None,
+    jar: Path | str | None = None,
+    max_depth: int = 2,
+    dry_run: bool = False,
+    progress_callback: Callable[[int, int], None] | None = None,
+    credentials: Credentials | None = None,
+) -> RetryResult:
+    """Re-submit failed tiles from a journal, splitting where appropriate.
+
+    Reads ``journal`` (an NDJSON ``_failures.json`` written by a prior
+    pipeline run), classifies each entry by ``error_kind``, and for
+    split-eligible kinds emits 4 quadtree children — for retry-same kinds,
+    re-emits the same bbox. The resulting tile set is written to a
+    temporary NDJSON file and submitted to the same pipeline via
+    ``tile_grid.tiles_file``.
+
+    The pipeline-config arguments (``ee_expression``, ``scale``, ``crs``,
+    ``tile_size``, ``output_tile_size``, etc.) must match the original
+    export — children inherit the output tile keys their parents had
+    and need to land in the same M6 output COG.
+
+    Args:
+        journal: Path to the failures journal (NDJSON of FailedTileRecord).
+        ee_expression: Same EE expression as the original export.
+        project: Same GCP project.
+        output: Same output path. The retry round writes its own
+            successes here and a fresh ``_failures.json`` for any new
+            permanent failures.
+        scale, crs, tile_size, output_tile_size: Must match the original
+            export so split children align with the output grid.
+        max_depth: Max quadtree depth. Records already at this depth
+            are not split — they remain in the next round's failures.
+            Default 2 (one root → 16 sub-tiles max).
+        dry_run: If True, plan the retry but don't submit.
+        Other args are forwarded to ``submit_job`` as in :func:`export`.
+
+    Returns:
+        RetryResult with the submitted job id (if any) plus stats.
+    """
+    from datensee.notebook import ensure_auth, ensure_jar
+    from datensee.retry import plan_retry, read_journal, write_tiles_file
+    from datensee.submit import submit_job
+
+    if credentials is None:
+        ensure_auth()
+
+    journal_path = Path(journal) if isinstance(journal, str) else journal
+    records = read_journal(journal_path)
+    plan = plan_retry(records, max_depth=max_depth)
+
+    if not plan.next_tiles:
+        return RetryResult(
+            next_tiles_count=0,
+            carryover_count=len(plan.carryover),
+            stats=plan.stats,
+        )
+
+    # Stage the next-round tiles file. We anchor it under the output
+    # directory so a rerun is reproducible from the journal alone.
+    if output.startswith("gs://"):
+        # GCS: the tiles_file path can be a GCS URI; the Java side reads
+        # via TextIO which supports gs://. Stage it as a sibling object.
+        tiles_file_path = output.rstrip("/") + "/_retry_tiles.json"
+        # Write locally first, then upload.
+        local_staging = Path(tempfile.mkdtemp()) / "_retry_tiles.json"
+        write_tiles_file(plan.next_tiles, local_staging)
+        from google.cloud import storage as _gcs
+
+        client = _gcs.Client(credentials=credentials, project=project)
+        gs_uri = tiles_file_path[len("gs://"):]
+        bucket_name, _, blob_path = gs_uri.partition("/")
+        bucket = client.bucket(bucket_name)
+        bucket.blob(blob_path).upload_from_filename(str(local_staging))
+    else:
+        out_dir = Path(output)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        local_path = out_dir / "_retry_tiles.json"
+        write_tiles_file(plan.next_tiles, local_path)
+        tiles_file_path = str(local_path)
+
+    # Build pipeline config with tiles_file (no inline tiles).
+    if runner == "dataflow":
+        runner_config = RunnerConfig(
+            mode="dataflow",
+            dataflow=DataflowRunnerConfig(
+                project=project,
+                region=region_gcp,
+                temp_location=temp_location or (output.rstrip("/") + "/_tmp"),
+                staging_location=(temp_location or output.rstrip("/") + "/_tmp").rstrip("/")
+                + "/staging",
+                labels=labels,
+            ),
+        )
+    else:
+        runner_config = RunnerConfig(mode="local")
+
+    pipeline_config = PipelineConfig(
+        ee_expression=ee_expression,
+        gee_project=project,
+        tile_grid=TileGrid(
+            crs=crs,
+            scale_meters=scale,
+            tile_size_pixels=tile_size,
+            tiles_file=tiles_file_path,
+        ),
+        output=OutputConfig(
+            output_path=output,
+            output_tile_size_pixels=output_tile_size,
+        ),
+        runner=runner_config,
+        rate_limit=RateLimitConfig(max_qps=max_qps),
+    )
+
+    if dry_run:
+        return RetryResult(
+            next_tiles_count=len(plan.next_tiles),
+            carryover_count=len(plan.carryover),
+            stats=plan.stats,
+        )
+
+    if jar is not None:
+        from datensee.jar import find_jar
+
+        jar_path = find_jar(Path(jar) if isinstance(jar, str) else jar)
+    else:
+        jar_path = ensure_jar()
+
+    t0 = time.monotonic()
+    job_id = submit_job(
+        pipeline_config,
+        jar_path=jar_path,
+        dry_run=False,
+        progress_callback=progress_callback,
+        credentials=credentials,
+    )
+    duration = time.monotonic() - t0
+
+    return RetryResult(
+        job_id=job_id,
+        duration_seconds=duration,
+        next_tiles_count=len(plan.next_tiles),
+        carryover_count=len(plan.carryover),
+        stats=plan.stats,
     )

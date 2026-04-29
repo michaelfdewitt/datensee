@@ -1,7 +1,6 @@
 package com.datensee.io;
 
 import com.datensee.FailedTileRecord;
-import com.datensee.TileCoordinate;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.apache.beam.sdk.transforms.DoFn;
@@ -9,22 +8,22 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Converts a failed {@link TileCoordinate} to a JSON line for the failures journal.
+ * Serializes a {@link FailedTileRecord} as one NDJSON line for the failures
+ * journal.
  *
- * <p>Output lines are NDJSON, one per tile, written via {@code TextIO.write()}
- * to {@code {outputPath}/_failures.json}. The schema is
- * {@link FailedTileRecord}, a superset of {@link TileCoordinate} that
- * carries error classification and retry metadata. The journal is
- * intentionally consumable as a {@code tiles_file} input: a future
- * {@code datensee retry --journal} command can feed failures back in
- * directly because {@code TileCoordinate} ignores the extra fields.
+ * <p>Output is written via {@code TextIO.write()} to
+ * {@code {outputPath}/_failures.json}. The schema is a strict superset of
+ * {@code TileCoordinate}: a future {@code datensee retry --journal} command
+ * can feed the journal back through the existing {@code tiles_file} input
+ * path because {@code TileCoordinate} ignores the extra fields.
  *
- * <p>Sketch only at present — the dead-letter side output upstream still
- * emits raw {@code TileCoordinate}, so {@code error_kind}, {@code attempts},
- * and the timestamps are placeholders. Wiring the classifier is a
- * follow-up. The on-disk format is stable now.
+ * <p>{@link com.datensee.fetch.TileFetchDoFn} populates the {@code error_kind},
+ * {@code http_status}, and {@code error_message} fields from the underlying
+ * {@code EeApiException} when one is available; otherwise the kind defaults
+ * to {@code UNKNOWN}. The retry CLI uses {@code error_kind} to decide whether
+ * to split the tile into quadrants or retry it as-is.
  */
-public final class FailedTileWriter extends DoFn<TileCoordinate, String> {
+public final class FailedTileWriter extends DoFn<FailedTileRecord, String> {
 
     private static final Logger LOG = LoggerFactory.getLogger(FailedTileWriter.class);
     private static final ObjectMapper MAPPER = new ObjectMapper()
@@ -32,12 +31,11 @@ public final class FailedTileWriter extends DoFn<TileCoordinate, String> {
 
     @ProcessElement
     public void processElement(
-        @Element TileCoordinate tile,
+        @Element FailedTileRecord record,
         OutputReceiver<String> out
     ) throws com.fasterxml.jackson.core.JsonProcessingException {
-        FailedTileRecord record = FailedTileRecord.fromTile(tile);
         String json = MAPPER.writeValueAsString(record);
-        LOG.warn("Tile failed permanently: {}", json);
+        LOG.warn("Tile failed permanently ({}): {}", record.errorKind(), json);
         out.output(json);
     }
 }

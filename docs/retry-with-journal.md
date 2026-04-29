@@ -120,16 +120,22 @@ Each round produces a new failures journal. The driver loops until either the jo
 
 ## What's actually in the tree right now
 
-Today (this commit), only the **wire contract** is in place:
+The full path is implemented:
 
-- `TileCoordinate.lineage` (default empty) — Python + Java.
-- `FailedTileRecord` Java record with all the journal fields.
-- `EeErrorKind` enum with the full set of kinds.
-- `FailedTileWriter` emits the new format with `error_kind=UNKNOWN` and timestamps. The classifier isn't wired up — the dead-letter side output upstream still emits raw `TileCoordinate` and the kind can't be inferred without changing that signal.
-- `TileCoordinate` ignores unknown JSON fields, so any journal record is valid `tiles_file` input today.
+- **Wire contract** — `TileCoordinate.lineage` (Python + Java), `FailedTileRecord` (Java record covering all journal fields), `EeErrorKind` enum with the full set of kinds, `TileCoordinate` Jackson-tolerant of unknown fields so journals feed back as `tiles_file`.
+- **Classifier** — `EeErrorKind.classify(httpStatus, body)` matches "memory limit"/"timed out" substrings against (status, body), with stable fallbacks for unmatched cases. `TileFetchDoFn.classifyFailure` walks the cause chain to find the original `EeApiException` and stamps the dead-letter record with the proper kind, status, and truncated body.
+- **Dead-letter side output** — `TileFetchDoFn.FAILED_TAG` is typed `FailedTileRecord`. `FailedTileWriter` serializes it directly. `_failures.json` now carries real `error_kind` values, not placeholders.
+- **Python splitter** — `datensee.retry.decide(record, max_depth, allowlists)` returns one of `split` (4 quadrant children), `retry_same` (1 child, same bbox), `depth_cap` (no children, carried over), `terminal` (no children), `unknown_kind` (no children). `split_tile(parent)` does pure-geometry quadrant bisection in bbox coordinates (axis-order-independent). `plan_retry(records)` aggregates a stream into a `RetryPlan` with `next_tiles`, `carryover`, and per-action `stats`.
+- **`datensee retry` CLI** — reads a journal, runs `plan_retry`, writes the next-round tiles to `{output}/_retry_tiles.json` (or stages to GCS), and submits a fresh pipeline run with `tile_grid.tiles_file` set. Same export-style flags so the user keeps full control of pipeline parameters; `--max-depth` defaults to 2, capped at 6.
 
-Follow-ups:
-1. Plumb the EE response classifier through `TileFetchDoFn`'s dead-letter side output (typed as `FailedTileRecord`, not `TileCoordinate`).
-2. Implement the `datensee retry` CLI command.
-3. Implement the splitter (with depth cap + opt-in flag).
-4. Add a regression test using a synthesized "memory limit exceeded" response that gets split correctly through one round.
+### Tests pinned
+
+- 11 classifier tests (`EeErrorKindTest`) — every (status, body) → kind decision, including case-insensitive matching and the conservative split allowlist.
+- 2 `classifyFailure` tests in `TileFetchDoFnTest` — unwraps `EeApiException` from a wrapped IOException, falls back to `UNKNOWN` for non-EE exceptions.
+- 21 Python tests in `test_retry.py` — `split_tile` quadrant geometry, `decide` branches for every kind, depth cap behavior, custom allowlist override, journal I/O round-trip, and a mixed-stream `plan_retry` test.
+
+### Known limitations
+
+- **No automatic retry loop yet.** The user re-runs `datensee retry` themselves until the journal is empty. A wrapper that loops with backoff is a small follow-up but would change the UX surface, so it's left as a separate task.
+- **Carryover stats are reported but not journaled.** The `_failures.json` written by the next pipeline run only contains failures from that run, not the depth-capped/terminal records from previous rounds. If you want a unified history you'd need to merge journals manually. Tracking would land cleanly as a sidecar file (`_carryover.json`) but adds another contract.
+- **Retry assumes pipeline-config parity with the original export.** Children inherit `(out_row, out_col)` from their parents, so they need to land in the same M6 output COG; the assembler relies on the same `output_tile_size_pixels` setting. The CLI takes the same flags as `export`; the user is responsible for keeping them aligned.

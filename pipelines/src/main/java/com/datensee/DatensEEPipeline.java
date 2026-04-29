@@ -115,7 +115,7 @@ public final class DatensEEPipeline {
         );
 
         PCollection<FetchedTile> fetched = fetchResult.get(TileFetchDoFn.SUCCESS_TAG);
-        PCollection<TileCoordinate> failed = fetchResult.get(TileFetchDoFn.FAILED_TAG);
+        PCollection<FailedTileRecord> failed = fetchResult.get(TileFetchDoFn.FAILED_TAG);
 
         // --- Write successful tiles as COGs ---
         // Default: deflate (zlib). Our hand-rolled LZW encoder in

@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.datensee.FailedTileRecord;
 import com.datensee.TileCoordinate;
+import com.datensee.fetch.EeErrorKind;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
@@ -19,24 +20,28 @@ import org.junit.jupiter.api.Test;
  * back via the existing {@code tiles_file} input path. If the schema
  * changes, change it here on purpose.
  *
- * <p>{@link FailedTileWriter} is a thin wrapper that calls
- * {@code MAPPER.writeValueAsString(FailedTileRecord.fromTile(tile))}; we
- * exercise the same code without going through Beam's DoFn harness so
- * the test stays fast and self-contained.
+ * <p>{@link FailedTileWriter} is a thin wrapper around
+ * {@code MAPPER.writeValueAsString(record)}; we exercise that by
+ * constructing a {@link FailedTileRecord} and round-tripping it
+ * through Jackson.
  */
 class FailedTileWriterTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper()
         .registerModule(new JavaTimeModule());
 
-    private static String emit(TileCoordinate tile) throws Exception {
-        return MAPPER.writeValueAsString(FailedTileRecord.fromTile(tile));
+    private static String emit(FailedTileRecord record) throws Exception {
+        return MAPPER.writeValueAsString(record);
     }
 
     @Test
     void emitsRichSchemaWithBboxOutTileLineageAndErrorMetadata() throws Exception {
         TileCoordinate tile = new TileCoordinate(10.0, 20.0, 11.0, 21.0, 3, 5);
-        String json = emit(tile);
+        FailedTileRecord record = FailedTileRecord.fromTileWithError(
+            tile, EeErrorKind.MEMORY_EXCEEDED,
+            "User memory limit exceeded.", 400, 5
+        );
+        String json = emit(record);
         JsonNode parsed = MAPPER.readTree(json);
 
         // Bounding box + indices (read by tiles_file consumer).
@@ -52,9 +57,11 @@ class FailedTileWriterTest {
         // Lineage: empty list for a root compute tile.
         assertTrue(parsed.get("lineage").isArray(), "lineage must be array");
         assertEquals(0, parsed.get("lineage").size(), "root tile has empty lineage");
-        // Error metadata (placeholder values until the classifier is wired).
-        assertEquals("UNKNOWN", parsed.get("error_kind").asText());
-        assertEquals(0, parsed.get("attempts").asInt());
+        // Error metadata.
+        assertEquals("MEMORY_EXCEEDED", parsed.get("error_kind").asText());
+        assertEquals("User memory limit exceeded.", parsed.get("error_message").asText());
+        assertEquals(400, parsed.get("http_status").asInt());
+        assertEquals(5, parsed.get("attempts").asInt());
         assertNotNull(parsed.get("first_seen"), "first_seen must be present");
         assertNotNull(parsed.get("last_seen"), "last_seen must be present");
     }
@@ -62,7 +69,7 @@ class FailedTileWriterTest {
     @Test
     void emittedJsonIsSingleLineNdjson() throws Exception {
         TileCoordinate tile = new TileCoordinate(0.5, 1.5, 2.5, 3.5, 0, 0);
-        String json = emit(tile);
+        String json = emit(FailedTileRecord.fromTile(tile));
         assertEquals(-1, json.indexOf('\n'), "no embedded newlines: " + json);
     }
 
@@ -73,7 +80,10 @@ class FailedTileWriterTest {
         // TileCoordinate's @JsonIgnoreProperties(ignoreUnknown=true) plus
         // its @JsonCreator default-defending constructor handle the extras.
         TileCoordinate tile = new TileCoordinate(-122.5, 37.5, -122.0, 38.0, 7, 11);
-        String json = emit(tile);
+        FailedTileRecord record = FailedTileRecord.fromTileWithError(
+            tile, EeErrorKind.COMPUTATION_TIMEOUT, "Computation timed out.", 400, 5
+        );
+        String json = emit(record);
 
         TileCoordinate parsed = MAPPER.readValue(json, TileCoordinate.class);
         assertEquals(tile.xMin(), parsed.xMin());
@@ -85,5 +95,14 @@ class FailedTileWriterTest {
         assertEquals(tile.row(), parsed.outRow());
         assertEquals(tile.col(), parsed.outCol());
         assertEquals(0, parsed.lineage().size());
+    }
+
+    @Test
+    void unknownKindWhenNoErrorContext() throws Exception {
+        TileCoordinate tile = new TileCoordinate(0, 0, 1, 1, 0, 0);
+        String json = emit(FailedTileRecord.fromTile(tile));
+        JsonNode parsed = MAPPER.readTree(json);
+        assertEquals("UNKNOWN", parsed.get("error_kind").asText());
+        assertEquals(0, parsed.get("attempts").asInt());
     }
 }

@@ -213,6 +213,7 @@ These are the areas where the real complexity lives:
 5. **M5: Distribution** ✅ — `pip install datensee`, smart JAR discovery, `datensee jar` subcommands (download/build/path), Apache 2.0 license, full PyPI metadata.
 6. **Notebook Integration** ✅ — Public Python API (`api.py`), Colab/Jupyter auto-auth, HTML display adapters (job progress, cost estimate, tile grid, tile preview), quickstart notebook, `notebook`/`all` optional dependency groups.
 7. **M6: Two-Tier Tiling** ✅ — Compute tiles (small, for EE HV API) and output tiles (large, for practical file counts) are separated. Compute tiles are fetched in parallel, then grouped by output tile via Beam `GroupByKey`, assembled by `AssembledCogWriter` into a contiguous pixel buffer, and written as multi-block COGs whose internal block size equals the compute tile size. Opt-in via `output.output_tile_size_pixels` (must be a multiple of `tile_grid.tile_size_pixels`); the default behavior is one COG per compute tile. See [`docs/handoff.md`](docs/handoff.md) for the wiring summary.
+8. **Adaptive Retry (Quadtree)** ✅ — `datensee retry --journal _failures.json` reads a structured failures journal, classifies each entry by `error_kind` (populated by `EeErrorKind.classify` against the EE HV response), and either splits the tile into 4 quadrant children (for `MEMORY_EXCEEDED` / `COMPUTATION_TIMEOUT`) or retries the same bbox (for transient infra). Default max depth 2; conservative split allowlist (only EE complexity signals). See [`docs/retry-with-journal.md`](docs/retry-with-journal.md).
 
 ## Testing
 

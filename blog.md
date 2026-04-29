@@ -109,6 +109,31 @@ loop. You can export, post-process locally, and feed the result back
 into Earth Engine for a follow-up analysis without ever materializing
 the data into a different format.
 
+## Costs and quotas
+
+Earth Engine itself stays on the same terms it always has. Non-commercial
+users (research, education, nonprofit, journalism) keep their free
+access — and that includes calls made through the High Volume API.
+DatensEE doesn't change anything about how EE bills compute; it just
+calls the public HV endpoint on your behalf.
+
+What does cost money is **Dataflow**. To run an export at scale you'll
+need a GCP project with billing enabled, and the Dataflow workers,
+shuffle, and GCS storage are charged at standard rates. For
+non-commercial EE users this is usually the only new bill — your EE
+usage stays free, but the workers fetching tiles are real VMs. For
+commercial users with billing already set up, it's another line item on
+the same invoice. DatensEE prints a cost estimate before submitting any
+job above a threshold so there are no surprises.
+
+On **quotas**: the HV API has per-project request budgets, and a
+realistic continental-scale export will saturate the default very
+quickly. Quota uplifts go through the same channel they always have —
+see the [Earth Engine usage and quota docs](https://developers.google.com/earth-engine/guides/usage)
+for the current process. DatensEE's per-worker rate limiter is designed
+to live within whatever budget you have, so you can run conservatively
+on default quotas and scale up after a quota review.
+
 ## Gotchas (the honest part)
 
 This is the section you skip in most marketing posts. You shouldn't.

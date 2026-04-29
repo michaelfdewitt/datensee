@@ -124,11 +124,15 @@ Uncommitted on disk (April 2026):
 
 ---
 
-## Adaptive retry — wire contract is in tree, splitter is not
+## Adaptive retry — implemented
 
-The failures journal (`{output}/_failures.json`) is now a structured NDJSON of `FailedTileRecord`: a superset of `TileCoordinate` with `error_kind`, `attempts`, timestamps, and `lineage` (a quadtree path from the root compute tile, encoded as a list of integers `0–3` to stay CRS-axis-order-independent). Today it's emitted with placeholder values (`error_kind=UNKNOWN`); a future `datensee retry --journal` command will read it back through the existing `tiles_file` path. The full design — error classification, conservative split allowlist, depth cap, retry semantics — is in [`docs/retry-with-journal.md`](retry-with-journal.md). **The wire format is the contract; please don't change it casually.**
+The failures journal (`{output}/_failures.json`) is structured NDJSON of `FailedTileRecord` (superset of `TileCoordinate` with `error_kind`, `attempts`, timestamps, `lineage`). `EeErrorKind.classify(httpStatus, body)` (Java) populates the kind from the EE HV response; the dead-letter side output is typed `FailedTileRecord`. `datensee retry --journal _failures.json` reads it back, splits split-eligible failures into 4 quadrant children (lineage extended with quadrant index 0–3, CRS-axis-order-independent), retries transient failures with the same bbox, and submits a fresh pipeline run via `tile_grid.tiles_file`. Default max depth is 2 (one root → 16 sub-tiles max).
 
-`TileCoordinate.lineage` defaults to `[]` and is informational on the success path: the assembler keys on bounding-box geometry, not lineage. Lineage is for the failure-journal and the (future) retry-decision logic.
+**Conservative split allowlist:** only `MEMORY_EXCEEDED` and `COMPUTATION_TIMEOUT`. Generic 5xx, rate-limit, auth errors never trigger splitting — that's intentional and pinned in tests. Adding a kind is a one-line config change later; removing one that's already triggering production cascades is a fire.
+
+`TileCoordinate.lineage` defaults to `[]` and is informational on the success path — the assembler keys on bbox geometry, not lineage. Lineage is consumed by the retry-decision logic and shows up in the journal for human triage.
+
+Full design + retry semantics in [`docs/retry-with-journal.md`](retry-with-journal.md).
 
 ---
 
@@ -152,7 +156,7 @@ When `output_tile_size_pixels` is unset (the default), routing falls through to 
 ## Known limitations / TODOs in priority order
 
 1. **LZW encoder is broken.** Either fix against a TIFF-LZW canonical vector or rip it out. Default is deflate; LZW only routes if user explicitly sets `compress: "lzw"`.
-2. **Adaptive-retry splitter not implemented.** Wire contract is in tree (see [`docs/retry-with-journal.md`](retry-with-journal.md)) — error classification + the `datensee retry --journal` CLI + the splitter logic itself are follow-ups.
+2. **No automatic retry-loop driver.** `datensee retry` does one round per invocation. A wrapper that loops with backoff until the journal is empty is a small follow-up — not done because it would change the CLI UX surface and we want a clean checkpoint first.
 3. **`/proc/self/fd/<N>` is Linux-only.** Service-driven auth path won't work on macOS or Windows. Standalone CLI on those OSes uses ADC and is fine.
 4. **Predictor is only applied for LZW.** Deflate would also benefit from horizontal differencing for integer types — pure compression-ratio win, no correctness issue.
 5. **`extractPixelData` for tile-layout inputs concatenates tile bytes in tile order**, not pixel-row order. Safe today because EE HV always returns strip layout; would silently produce wrong pixels for a multi-tile input.

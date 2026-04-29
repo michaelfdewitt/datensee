@@ -42,7 +42,7 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
     public static final TupleTag<FetchedTile> SUCCESS_TAG = new TupleTag<>() { };
 
     /** Tag for tiles that failed all retries (dead-letter). */
-    public static final TupleTag<TileCoordinate> FAILED_TAG = new TupleTag<>() { };
+    public static final TupleTag<com.datensee.FailedTileRecord> FAILED_TAG = new TupleTag<>() { };
 
     private static final Logger LOG = LoggerFactory.getLogger(TileFetchDoFn.class);
     private static final String HV_ENDPOINT =
@@ -115,8 +115,44 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
             );
         } catch (IOException | InterruptedException e) {
             LOG.error("{}: dead-lettered after all retries: {}", tile.id(), e.getMessage());
-            out.get(FAILED_TAG).output(tile);
+            out.get(FAILED_TAG).output(classifyFailure(tile, e));
         }
+    }
+
+    /**
+     * Build a {@link com.datensee.FailedTileRecord} for the dead-letter
+     * stream. Walks the cause chain to find the underlying
+     * {@link EeApiException} (the retry loop wraps it in a generic
+     * {@code IOException}), classifies its (status, body) pair into an
+     * {@link EeErrorKind}, and stamps the record with {@code attempts =
+     * MAX_RETRIES}. When the failure isn't an {@code EeApiException}
+     * (network error, interrupt, etc.) we record kind=UNKNOWN with the
+     * exception message.
+     */
+    static com.datensee.FailedTileRecord classifyFailure(
+        TileCoordinate tile,
+        Exception e
+    ) {
+        Throwable cause = e;
+        while (cause != null && !(cause instanceof EeApiException)) {
+            cause = cause.getCause();
+        }
+        if (cause instanceof EeApiException ee) {
+            return com.datensee.FailedTileRecord.fromTileWithError(
+                tile,
+                EeErrorKind.classify(ee.httpStatus(), ee.truncatedBody()),
+                ee.truncatedBody(),
+                ee.httpStatus(),
+                MAX_RETRIES
+            );
+        }
+        return com.datensee.FailedTileRecord.fromTileWithError(
+            tile,
+            EeErrorKind.UNKNOWN,
+            e.getMessage(),
+            null,
+            MAX_RETRIES
+        );
     }
 
     private byte[] fetchWithRetry(TileCoordinate tile)

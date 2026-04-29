@@ -130,4 +130,36 @@ class TileFetchDoFnTest {
         assertTrue(ex.truncatedBody().length() <= 500);
         assertTrue(ex.getMessage().length() < longBody.length());
     }
+
+    @Test
+    void classifyFailureUnwrapsEeApiExceptionAndPopulatesKind() {
+        TileCoordinate tile = new TileCoordinate(0, 0, 1, 1, 0, 0);
+        // Simulate the retry loop's wrapper: IOException(EeApiException(...)).
+        EeApiException root = new EeApiException(
+            400, tile.id(), "User memory limit exceeded."
+        );
+        java.io.IOException wrapper = new java.io.IOException(
+            "Failed after 5 retries: " + root.getMessage(), root
+        );
+
+        com.datensee.FailedTileRecord r = TileFetchDoFn.classifyFailure(tile, wrapper);
+        assertEquals(EeErrorKind.MEMORY_EXCEEDED, r.errorKind());
+        assertEquals(400, r.httpStatus());
+        assertTrue(r.errorMessage().contains("memory limit"));
+        assertEquals(5, r.attempts());
+        // Bbox + indices preserved from the failed TileCoordinate.
+        assertEquals(0.0, r.xMin());
+        assertEquals(0, r.row());
+    }
+
+    @Test
+    void classifyFailureFallsBackToUnknownForNonEeException() {
+        TileCoordinate tile = new TileCoordinate(0, 0, 1, 1, 0, 0);
+        java.io.IOException ioe = new java.io.IOException("connection reset");
+
+        com.datensee.FailedTileRecord r = TileFetchDoFn.classifyFailure(tile, ioe);
+        assertEquals(EeErrorKind.UNKNOWN, r.errorKind());
+        assertEquals(null, r.httpStatus());
+        assertTrue(r.errorMessage().contains("connection reset"));
+    }
 }

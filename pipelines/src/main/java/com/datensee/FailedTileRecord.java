@@ -55,16 +55,31 @@ public record FailedTileRecord(
 
     /** Build a record from a TileCoordinate with placeholder error metadata. */
     public static FailedTileRecord fromTile(TileCoordinate tile) {
+        return fromTileWithError(tile, EeErrorKind.UNKNOWN, null, null, 0);
+    }
+
+    /**
+     * Build a record from a TileCoordinate plus classified error context.
+     * Used by {@code TileFetchDoFn}'s dead-letter side output after a
+     * tile exhausts its retry budget.
+     */
+    public static FailedTileRecord fromTileWithError(
+        TileCoordinate tile,
+        EeErrorKind errorKind,
+        String errorMessage,
+        Integer httpStatus,
+        int attempts
+    ) {
         Instant now = Instant.now();
         return new FailedTileRecord(
             tile.xMin(), tile.yMin(), tile.xMax(), tile.yMax(),
             tile.row(), tile.col(),
             tile.outRow(), tile.outCol(),
             tile.lineage() != null ? tile.lineage() : java.util.List.of(),
-            EeErrorKind.UNKNOWN,
-            null,
-            null,
-            0,
+            errorKind,
+            errorMessage,
+            httpStatus,
+            attempts,
             now,
             now
         );

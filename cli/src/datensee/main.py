@@ -511,3 +511,152 @@ def validate_cmd(
 
     if not report.all_passed:
         raise typer.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# retry command — adaptive quadtree retry against a failures journal
+# ---------------------------------------------------------------------------
+
+
+@app.command("retry")
+def retry_cmd(
+    expression_file: Annotated[
+        Path,
+        typer.Argument(
+            help="JSON file containing the serialized EE computation expression "
+            "(must match the original export).",
+            exists=True,
+            readable=True,
+        ),
+    ],
+    journal: Annotated[
+        Path,
+        typer.Option(
+            "--journal",
+            "-j",
+            help="Path to the failures journal (NDJSON, e.g. {output}/_failures.json).",
+            exists=True,
+            readable=True,
+        ),
+    ],
+    project: Annotated[
+        str,
+        typer.Option("--project", "-p", help="GCP project ID with EE API enabled."),
+    ],
+    output: Annotated[
+        str,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Output path: must match the original export so split children "
+            "land in the same output COGs.",
+        ),
+    ],
+    scale: Annotated[
+        float,
+        typer.Option("--scale", "-s", help="Pixel size in meters.", min=0.1),
+    ] = 30.0,
+    crs: Annotated[
+        str,
+        typer.Option("--crs", help="Target CRS (must match original export)."),
+    ] = "EPSG:4326",
+    tile_size: Annotated[
+        int,
+        typer.Option("--tile-size", help="Compute tile edge size in pixels."),
+    ] = 512,
+    output_tile_size: Annotated[
+        int | None,
+        typer.Option(
+            "--output-tile-size",
+            help="M6 output tile size — must match original export.",
+        ),
+    ] = None,
+    runner: Annotated[
+        str,
+        typer.Option("--runner", help="Runner mode: 'local' or 'dataflow'."),
+    ] = "local",
+    region_gcp: Annotated[
+        str,
+        typer.Option("--region-gcp", help="Dataflow region."),
+    ] = "us-central1",
+    temp_location: Annotated[
+        str | None,
+        typer.Option("--temp-location", help="GCS URI for Dataflow temp files."),
+    ] = None,
+    max_qps: Annotated[
+        int,
+        typer.Option("--max-qps", help="Max QPS to the EE HV API.", min=1),
+    ] = 100,
+    max_depth: Annotated[
+        int,
+        typer.Option(
+            "--max-depth",
+            help="Maximum quadtree depth. Tiles already at this depth in their "
+            "lineage are not split (they remain in the next round's failures).",
+            min=0,
+            max=6,
+        ),
+    ] = 2,
+    jar: Annotated[
+        Path | None,
+        typer.Option("--jar", help="Path to the pipeline JAR (auto-detected if omitted)."),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Plan the retry but don't submit."),
+    ] = False,
+) -> None:
+    """Re-submit failed tiles from a journal, splitting where appropriate.
+
+    Reads ``--journal`` (an NDJSON failures journal written by a prior
+    pipeline run), classifies each entry by ``error_kind``, and for
+    EE-specific complexity errors (``MEMORY_EXCEEDED``,
+    ``COMPUTATION_TIMEOUT``) emits 4 quadtree children. Transient
+    infrastructure errors (rate-limit, generic 5xx, unknown) retry the
+    same bbox. Auth and fatal errors are dropped from the retry stream
+    and surfaced to the user.
+
+    The pipeline-config arguments must match the original export so
+    split children land in the same M6 output COGs as their parents.
+    """
+    from datensee.api import retry as run_retry
+
+    ee_expression = expression_file.read_text().strip()
+
+    result = run_retry(
+        journal=journal,
+        ee_expression=ee_expression,
+        project=project,
+        output=output,
+        scale=scale,
+        crs=crs,
+        tile_size=tile_size,
+        output_tile_size=output_tile_size,
+        runner=runner,  # type: ignore[arg-type]
+        region_gcp=region_gcp,
+        temp_location=temp_location,
+        max_qps=max_qps,
+        jar=jar,
+        max_depth=max_depth,
+        dry_run=dry_run,
+    )
+
+    console.print("[bold]Retry plan[/bold]")
+    for action, count in sorted(result.stats.items()):
+        console.print(f"  {action}: {count}")
+    console.print(f"  → {result.next_tiles_count} tiles to fetch")
+    console.print(f"  → {result.carryover_count} carried over (depth-capped or terminal)")
+
+    if dry_run:
+        console.print("[dim]Dry-run; no job submitted.[/dim]")
+        return
+
+    if result.next_tiles_count == 0:
+        console.print(
+            "[yellow]Nothing to retry — journal is empty or all entries "
+            "are terminal.[/yellow]"
+        )
+        return
+
+    if result.job_id:
+        console.print(f"[green]Job submitted:[/green] {result.job_id}")
