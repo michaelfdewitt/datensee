@@ -64,6 +64,14 @@ class FailedTileWriterTest {
         assertEquals(5, parsed.get("attempts").asInt());
         assertNotNull(parsed.get("first_seen"), "first_seen must be present");
         assertNotNull(parsed.get("last_seen"), "last_seen must be present");
+        // Pipeline-emitted records always start with journal_reason="failed".
+        // The retry CLI re-stamps to depth_cap/terminal/unknown_kind for
+        // carryover. Pinned because downstream readers (jq, the next
+        // retry round) rely on this string being stable.
+        assertEquals(
+            FailedTileRecord.JOURNAL_REASON_FAILED,
+            parsed.get("journal_reason").asText()
+        );
     }
 
     @Test

@@ -58,6 +58,27 @@ TERMINAL_KINDS: frozenset[str] = frozenset({"AUTH_ERROR", "FATAL_REQUEST"})
 DEFAULT_MAX_DEPTH: int = 2
 
 
+# Canonical journal_reason values — must stay in sync with
+# FailedTileRecord.JOURNAL_REASON_* constants on the Java side. These
+# describe *why a record is sitting in _failures.json* (the latest
+# retry-policy verdict), distinct from `error_kind` (the EE-side
+# classification of what went wrong on EE's end).
+JOURNAL_REASON_FAILED: str = "failed"
+JOURNAL_REASON_DEPTH_CAP: str = "depth_cap"
+JOURNAL_REASON_TERMINAL: str = "terminal"
+JOURNAL_REASON_UNKNOWN_KIND: str = "unknown_kind"
+
+# Maps the action returned by `decide()` to the canonical journal_reason
+# stamped on a carryover record. Only carryover actions appear here —
+# `split` and `retry_same` records don't go to the journal; they go
+# back into the fetch pipeline.
+_ACTION_TO_JOURNAL_REASON: dict[str, str] = {
+    "depth_cap": JOURNAL_REASON_DEPTH_CAP,
+    "terminal": JOURNAL_REASON_TERMINAL,
+    "unknown_kind": JOURNAL_REASON_UNKNOWN_KIND,
+}
+
+
 class JournalParseError(ValueError):
     """Raised when a journal line is malformed or missing required fields."""
 
@@ -204,7 +225,14 @@ def plan_retry(
     split_allowlist: frozenset[str] = SPLIT_ELIGIBLE_KINDS,
     retry_allowlist: frozenset[str] = RETRY_SAME_KINDS,
 ) -> RetryPlan:
-    """Apply :func:`decide` to every record in a journal, return the plan."""
+    """Apply :func:`decide` to every record in a journal, return the plan.
+
+    Carryover records are stamped (in place, on a shallow copy) with the
+    appropriate ``journal_reason`` — ``depth_cap`` / ``terminal`` /
+    ``unknown_kind`` — so that when the retry CLI appends them onto
+    ``_failures.json``, a downstream reader can tell at a glance why
+    each entry is sitting in the journal.
+    """
     next_tiles: list[TileCoordinate] = []
     carryover: list[dict] = []
     stats: dict[str, int] = {}
@@ -219,7 +247,11 @@ def plan_retry(
         if d.children:
             next_tiles.extend(d.children)
         else:
-            carryover.append(record)
+            stamped = dict(record)
+            stamped["journal_reason"] = _ACTION_TO_JOURNAL_REASON.get(
+                d.action, JOURNAL_REASON_FAILED
+            )
+            carryover.append(stamped)
     return RetryPlan(next_tiles=next_tiles, carryover=carryover, stats=stats)
 
 

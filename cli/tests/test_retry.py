@@ -16,6 +16,9 @@ import pytest
 from datensee.config import TileCoordinate
 from datensee.retry import (
     DEFAULT_MAX_DEPTH,
+    JOURNAL_REASON_DEPTH_CAP,
+    JOURNAL_REASON_TERMINAL,
+    JOURNAL_REASON_UNKNOWN_KIND,
     JournalParseError,
     decide,
     plan_retry,
@@ -202,6 +205,28 @@ class TestPlanRetry:
         assert len(plan.next_tiles) == 5  # 4 from split + 1 from retry
         assert len(plan.carryover) == 2   # terminal + depth_cap
 
+    def test_carryover_records_get_stamped_with_journal_reason(self) -> None:
+        records = [
+            _record(error_kind="AUTH_ERROR"),                        # terminal
+            _record(error_kind="MEMORY_EXCEEDED", lineage=[0, 1]),   # depth_cap
+            _record(error_kind="SOMETHING_NEW"),                     # unknown_kind
+        ]
+        plan = plan_retry(records)
+        # Carryover order matches input order; map by error_kind for clarity.
+        by_kind = {r["error_kind"]: r for r in plan.carryover}
+        assert by_kind["AUTH_ERROR"]["journal_reason"] == JOURNAL_REASON_TERMINAL
+        assert by_kind["MEMORY_EXCEEDED"]["journal_reason"] == JOURNAL_REASON_DEPTH_CAP
+        assert by_kind["SOMETHING_NEW"]["journal_reason"] == JOURNAL_REASON_UNKNOWN_KIND
+
+    def test_carryover_does_not_mutate_input_records(self) -> None:
+        # plan_retry stamps a *copy*; the original journal records the
+        # caller passed in stay untouched (important if the caller
+        # re-uses them for downstream reporting).
+        original = _record(error_kind="AUTH_ERROR")
+        before = dict(original)  # snapshot
+        plan_retry([original])
+        assert original == before
+
 
 # ---------------------------------------------------------------------------
 # Journal I/O
@@ -348,6 +373,10 @@ class TestApiRetryCarryoverMerge:
             f"Expected the new pipeline failure plus the carried-over "
             f"AUTH_ERROR, got {kinds}"
         )
+        # The carried-over AUTH_ERROR carries journal_reason="terminal"
+        # so a downstream reader can tell at a glance why it's stuck.
+        by_kind = {r["error_kind"]: r for r in merged}
+        assert by_kind["AUTH_ERROR"]["journal_reason"] == JOURNAL_REASON_TERMINAL
 
     def test_depth_capped_records_appear_in_failures_json(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -397,6 +426,9 @@ class TestApiRetryCarryoverMerge:
         assert len(merged) == 1
         assert merged[0]["error_kind"] == "MEMORY_EXCEEDED"
         assert merged[0]["lineage"] == [0, 1]
+        # Stamped reason captures *why* it's stuck — not the EE-side error
+        # (which is MEMORY_EXCEEDED) but the retry-policy verdict.
+        assert merged[0]["journal_reason"] == JOURNAL_REASON_DEPTH_CAP
 
     # NB: Dataflow / GCS merge path is not unit-tested — exercising it
     # requires stubbing google.cloud.storage's upload + the GCS-side

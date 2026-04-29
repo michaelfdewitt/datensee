@@ -34,7 +34,8 @@ This is genuinely differentiating. The built-in `Export.image.toCloudStorage` do
   "http_status": 400,
   "attempts": 4,
   "first_seen": "2026-04-29T13:00:00Z",
-  "last_seen": "2026-04-29T13:02:11Z"
+  "last_seen": "2026-04-29T13:02:11Z",
+  "journal_reason": "depth_cap"
 }
 ```
 
@@ -51,6 +52,26 @@ This is genuinely differentiating. The built-in `Export.image.toCloudStorage` do
 | `http_status` | int? | HTTP status (when applicable). |
 | `attempts` | int | Total fetch attempts across journal cycles, for depth budgeting. |
 | `first_seen` / `last_seen` | ISO8601 | Useful when triaging journals manually. |
+| `journal_reason` | string | Latest retry-policy verdict — *why* the record is in the journal. See below. |
+
+### `journal_reason` — why the record is sitting in the journal
+
+`error_kind` says what EE told us went wrong. `journal_reason` says what the system decided to do (or not do) about it the last time the journal was touched. The two are distinct:
+
+| `journal_reason` | When written | Meaning |
+|---|---|---|
+| `"failed"` | Pipeline-emitted dead-letter. Always the value out of `TileFetchDoFn`. | Fresh failure, retry-eligible. The next `datensee retry` run will try to do something with this record. |
+| `"depth_cap"` | Re-stamped by `datensee retry` when an entry was split-eligible (`MEMORY_EXCEEDED` / `COMPUTATION_TIMEOUT`) but `len(lineage) >= max_depth`. | Stuck under the current depth budget. Bumping `--max-depth` rescues these. |
+| `"terminal"` | Re-stamped by `datensee retry` when `error_kind` is in the terminal set (`AUTH_ERROR`, `FATAL_REQUEST`). | Stuck permanently — the retry policy never touches these regardless of config. |
+| `"unknown_kind"` | Re-stamped by `datensee retry` when `error_kind` isn't recognized by the current policy (e.g. EE adds a new error type). | Held in the journal deliberately so a new failure mode never silently disappears. |
+
+The field is **mutable across rounds**: a tile that's `"failed"` after the first export may become `"depth_cap"` after a few retry rounds once it's exhausted the split budget. The journal reflects the latest verdict, not history. A user can `jq '.[] | select(.journal_reason != "failed")'` to find tiles that won't make further progress without manual intervention.
+
+The canonical strings are constants on both sides:
+- Java: `FailedTileRecord.JOURNAL_REASON_FAILED` etc.
+- Python: `datensee.retry.JOURNAL_REASON_FAILED` etc.
+
+Schema is backward-compatible — older journals without the field will deserialize cleanly (Jackson's `@JsonIgnoreProperties(ignoreUnknown=true)` on `TileCoordinate` covers this; consumers that read `FailedTileRecord` should treat missing values as `"failed"`).
 
 ### Lineage — quadtree path representation
 

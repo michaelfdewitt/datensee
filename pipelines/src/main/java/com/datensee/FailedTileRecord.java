@@ -23,16 +23,17 @@ import java.time.Instant;
  * split; the rest should retry the tile unchanged. See
  * {@link EeErrorKind} for the full table.
  *
+ * <p>The {@code journalReason} field is the latest retry-policy verdict
+ * for this entry — what the system decided to do (or not do) about it
+ * the last time the journal was touched. Distinct from {@code errorKind}
+ * (which says what EE told us went wrong); this field says why the
+ * record is still in the journal. Mutates across retry rounds — a tile
+ * that's {@link #JOURNAL_REASON_FAILED} in round 1 may become
+ * {@link #JOURNAL_REASON_DEPTH_CAP} after round 3 once it's exhausted
+ * the split budget. The journal reflects the latest verdict, not history.
+ *
  * <p>{@code attempts} counts retry rounds *across* journal cycles so
  * we can enforce a depth budget (e.g. give up after N adaptive splits).
- *
- * <p>Sketch only at present — the dead-letter side output in
- * {@link com.datensee.fetch.TileFetchDoFn} still emits raw
- * {@code TileCoordinate}; classifying and populating these fields is a
- * follow-up. Today {@link com.datensee.io.FailedTileWriter} emits
- * placeholder values (errorKind=UNKNOWN, attempts=0) so the on-disk
- * format is stable now and the only thing left to wire is the
- * classifier.
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 public record FailedTileRecord(
@@ -50,8 +51,37 @@ public record FailedTileRecord(
     @JsonProperty("http_status") Integer httpStatus,
     int attempts,
     @JsonProperty("first_seen") Instant firstSeen,
-    @JsonProperty("last_seen") Instant lastSeen
+    @JsonProperty("last_seen") Instant lastSeen,
+    @JsonProperty("journal_reason") String journalReason
 ) implements Serializable {
+
+    // Canonical journal_reason values. Strings (not an enum) so the wire
+    // format stays human-readable in `jq` and stable across language
+    // boundaries — the Python retry CLI uses identical literals.
+
+    /** Fresh failure from the pipeline's fetch path. Retry-eligible. */
+    public static final String JOURNAL_REASON_FAILED = "failed";
+
+    /**
+     * Was split-eligible ({@code MEMORY_EXCEEDED} / {@code COMPUTATION_TIMEOUT})
+     * but the lineage already reached {@code max_depth}. Bumping the
+     * depth cap on a future {@code datensee retry} run can rescue these.
+     */
+    public static final String JOURNAL_REASON_DEPTH_CAP = "depth_cap";
+
+    /**
+     * {@code error_kind} is in the terminal set
+     * ({@code AUTH_ERROR} / {@code FATAL_REQUEST}). Never retried regardless
+     * of config — surface to the user.
+     */
+    public static final String JOURNAL_REASON_TERMINAL = "terminal";
+
+    /**
+     * {@code error_kind} isn't recognized by the current retry policy
+     * (e.g. EE added a new error mode). Held in the journal deliberately
+     * so a new failure mode never silently disappears.
+     */
+    public static final String JOURNAL_REASON_UNKNOWN_KIND = "unknown_kind";
 
     /** Build a record from a TileCoordinate with placeholder error metadata. */
     public static FailedTileRecord fromTile(TileCoordinate tile) {
@@ -61,7 +91,11 @@ public record FailedTileRecord(
     /**
      * Build a record from a TileCoordinate plus classified error context.
      * Used by {@code TileFetchDoFn}'s dead-letter side output after a
-     * tile exhausts its retry budget.
+     * tile exhausts its retry budget. Always stamps
+     * {@code journal_reason = "failed"} since the pipeline only sees
+     * fresh failures; the retry CLI is responsible for re-stamping
+     * carried-over records with {@code "depth_cap"} / {@code "terminal"} /
+     * {@code "unknown_kind"} as appropriate.
      */
     public static FailedTileRecord fromTileWithError(
         TileCoordinate tile,
@@ -81,7 +115,8 @@ public record FailedTileRecord(
             httpStatus,
             attempts,
             now,
-            now
+            now,
+            JOURNAL_REASON_FAILED
         );
     }
 }
