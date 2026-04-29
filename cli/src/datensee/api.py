@@ -42,12 +42,12 @@ def _load_data(name: str) -> str:
     return (Path(__file__).parent / "data" / name).read_text()
 
 
-def _demo_expression() -> str:
+def demo_expression() -> str:
     """Return the serialized EE expression for the built-in NDVI demo."""
     return _load_data("demo_expression.json").strip()
 
 
-def _demo_region() -> dict[str, Any]:
+def demo_region() -> dict[str, Any]:
     """Return the GeoJSON region for the built-in NDVI demo."""
     return json.loads(_load_data("demo_region.json"))
 
@@ -77,7 +77,7 @@ _VALID_GEOJSON_TYPES = {"Polygon", "MultiPolygon"}
 _GCS_URI_PATTERN = "gs://"
 
 
-def _validate_inputs(
+def validate_inputs(
     ee_expression: str,
     geojson_geometry: dict[str, Any],
     crs: str,
@@ -193,6 +193,7 @@ def export(
     jar: Path | str | None = None,
     dry_run: bool = False,
     progress_callback: Callable[[int, int], None] | None = None,
+    confirm_callback: Callable[[PipelineConfig], None] | None = None,
     credentials: Credentials | None = None,
 ) -> ExportResult:
     """Submit an Earth Engine export job.
@@ -229,6 +230,11 @@ def export(
         dry_run: If True, validate but don't submit.
         progress_callback: Optional callback(completed, total) for local
             mode progress. Ignored for Dataflow mode.
+        confirm_callback: Optional callback(PipelineConfig) invoked after
+            the config is built but before submission. Use this to render
+            an export summary and gate large jobs behind a prompt — raise
+            an exception (e.g. ``typer.Abort``) to abort. Ignored when
+            ``dry_run=True``.
         credentials: Optional caller-supplied Google credentials. When set,
             DatensEE skips its normal ADC bootstrap (`ensure_auth()`) and
             uses these credentials for every Google API call — GCS uploads
@@ -253,10 +259,10 @@ def export(
     if credentials is None:
         ensure_auth()
 
-    geojson_geometry = region.copy()
+    geojson_geometry = region
 
     # Validate
-    validation_errors = _validate_inputs(ee_expression, geojson_geometry, crs, output, runner)
+    validation_errors = validate_inputs(ee_expression, geojson_geometry, crs, output, runner)
     if runner == "dataflow" and not temp_location:
         validation_errors.append(
             "--temp-location is required for Dataflow mode. "
@@ -311,6 +317,9 @@ def export(
     if dry_run:
         return ExportResult(config=pipeline_config)
 
+    if confirm_callback is not None:
+        confirm_callback(pipeline_config)
+
     # Resolve JAR
     if jar is not None:
         from datensee.jar import find_jar
@@ -344,7 +353,7 @@ def export(
         vrt = write_vrt(pipeline_config, output_dir)
         vrt_path = str(vrt)
         tiles_ok = len(list(output_dir.glob("tile_*.tif")))
-        tiles_failed = max(0, pipeline_config.tile_count - tiles_ok)
+        tiles_failed = max(0, pipeline_config.expected_output_tile_count - tiles_ok)
 
     return ExportResult(
         config=pipeline_config,
@@ -368,6 +377,7 @@ def demo(
     jar: Path | str | None = None,
     dry_run: bool = False,
     progress_callback: Callable[[int, int], None] | None = None,
+    confirm_callback: Callable[[PipelineConfig], None] | None = None,
 ) -> ExportResult:
     """Run the built-in NDVI demo over SF Bay Area.
 
@@ -380,13 +390,14 @@ def demo(
         jar: Path to the pipeline JAR (auto-detected if None).
         dry_run: If True, validate but don't submit.
         progress_callback: Optional callback(completed, total) for progress.
+        confirm_callback: See :func:`export`.
 
     Returns:
         ExportResult with config and job details.
     """
     return export(
-        ee_expression=_demo_expression(),
-        region=_demo_region(),
+        ee_expression=demo_expression(),
+        region=demo_region(),
         project=project,
         output=output,
         scale=30.0,
@@ -396,6 +407,7 @@ def demo(
         jar=jar,
         dry_run=dry_run,
         progress_callback=progress_callback,
+        confirm_callback=confirm_callback,
     )
 
 
@@ -615,6 +627,37 @@ def retry(
         credentials=credentials,
     )
     duration = time.monotonic() - t0
+
+    # Merge carryover into _failures.json so the journal stays the
+    # canonical view of "what's still stuck." The pipeline writes its
+    # own _failures.json with this round's new failures; we append
+    # records that didn't make progress this round (terminal kinds plus
+    # depth-capped split-eligible records) so they're not silently lost
+    # between rounds.
+    #
+    # Local mode only — by the time we return from submit_job, the
+    # pipeline has finished and the file is on disk. Dataflow mode is
+    # async: the pipeline writes _failures.json after submit_job returns,
+    # so we'd be appending to a file that doesn't exist yet (or worse,
+    # racing with the pipeline writer). Tracked as a TODO; for now we
+    # log + skip in Dataflow mode.
+    if plan.carryover:
+        if runner == "local" and not output.startswith("gs://"):
+            failures_path = Path(output) / "_failures.json"
+            with failures_path.open("a", encoding="utf-8") as f:
+                for record in plan.carryover:
+                    f.write(json.dumps(record))
+                    f.write("\n")
+        else:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "datensee retry: %d carryover records (terminal/depth-cap) not "
+                "merged into _failures.json — Dataflow / GCS merge isn't "
+                "wired up yet. Re-feeding the original journal will surface "
+                "them again next round.",
+                len(plan.carryover),
+            )
 
     return RetryResult(
         job_id=job_id,

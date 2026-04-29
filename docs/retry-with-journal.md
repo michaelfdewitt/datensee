@@ -134,8 +134,17 @@ The full path is implemented:
 - 2 `classifyFailure` tests in `TileFetchDoFnTest` — unwraps `EeApiException` from a wrapped IOException, falls back to `UNKNOWN` for non-EE exceptions.
 - 21 Python tests in `test_retry.py` — `split_tile` quadrant geometry, `decide` branches for every kind, depth cap behavior, custom allowlist override, journal I/O round-trip, and a mixed-stream `plan_retry` test.
 
+### `_failures.json` is the canonical view of stuck tiles
+
+After each retry round, `api.retry` appends carryover records (terminal kinds + depth-capped split-eligible records) into the new `_failures.json` that the pipeline just wrote. The journal is therefore always the complete current view: new failures from this round + everything from previous rounds that's still stuck. Re-running `datensee retry --journal _failures.json` against it is idempotent — terminal records get re-classified as terminal next round, land back in carryover, get re-merged. No accumulation past steady state.
+
+This means:
+- An empty `_failures.json` is the unambiguous "everything succeeded" signal.
+- Bumping `--max-depth` on a later retry round can rescue previously-capped tiles, because they're still in the journal.
+- A user looking at `_failures.json` sees auth errors and depth-capped tiles, not just whatever happened to fail in the most recent pipeline run.
+
 ### Known limitations
 
 - **No automatic retry loop yet.** The user re-runs `datensee retry` themselves until the journal is empty. A wrapper that loops with backoff is a small follow-up but would change the UX surface, so it's left as a separate task.
-- **Carryover stats are reported but not journaled.** The `_failures.json` written by the next pipeline run only contains failures from that run, not the depth-capped/terminal records from previous rounds. If you want a unified history you'd need to merge journals manually. Tracking would land cleanly as a sidecar file (`_carryover.json`) but adds another contract.
+- **Dataflow / GCS carryover merge isn't wired.** `_failures.json` lives in GCS for Dataflow runs, and the pipeline writes it asynchronously (after `submit_job` returns). We log a warning and skip the merge in that mode; the carryover from each round is lost between rounds when running on Dataflow. Local-mode retries are the supported path. Fixing this properly means either a `datensee retry-finalize` post-step that runs once the Dataflow job is done, or moving the merge into the pipeline itself (so the pipeline's TextIO write includes the carryover from a sibling input). Either is a real piece of work.
 - **Retry assumes pipeline-config parity with the original export.** Children inherit `(out_row, out_col)` from their parents, so they need to land in the same M6 output COG; the assembler relies on the same `output_tile_size_pixels` setting. The CLI takes the same flags as `export`; the user is responsible for keeping them aligned.

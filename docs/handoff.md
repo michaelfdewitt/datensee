@@ -157,6 +157,7 @@ When `output_tile_size_pixels` is unset (the default), routing falls through to 
 
 1. **LZW encoder is broken.** Either fix against a TIFF-LZW canonical vector or rip it out. Default is deflate; LZW only routes if user explicitly sets `compress: "lzw"`.
 2. **No automatic retry-loop driver.** `datensee retry` does one round per invocation. A wrapper that loops with backoff until the journal is empty is a small follow-up — not done because it would change the CLI UX surface and we want a clean checkpoint first.
+3. **Dataflow / GCS carryover merge isn't wired.** Local-mode retry is the supported path; in Dataflow mode the carryover (terminal + depth-capped records) is logged + dropped between rounds rather than appended to `_failures.json`. See `docs/retry-with-journal.md` for the design discussion. Fixing it cleanly is either a `retry-finalize` post-step or moving the merge into the pipeline.
 3. **`/proc/self/fd/<N>` is Linux-only.** Service-driven auth path won't work on macOS or Windows. Standalone CLI on those OSes uses ADC and is fine.
 4. **Predictor is only applied for LZW.** Deflate would also benefit from horizontal differencing for integer types — pure compression-ratio win, no correctness issue.
 5. **`extractPixelData` for tile-layout inputs concatenates tile bytes in tile order**, not pixel-row order. Safe today because EE HV always returns strip layout; would silently produce wrong pixels for a multi-tile input.

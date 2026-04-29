@@ -251,3 +251,156 @@ class TestJournalIO:
             parsed = TileCoordinate.model_validate_json(line)
             assert parsed.x_min == original.x_min
             assert parsed.lineage == original.lineage
+
+
+# ---------------------------------------------------------------------------
+# api.retry — carryover merge into _failures.json
+# ---------------------------------------------------------------------------
+
+
+class TestApiRetryCarryoverMerge:
+    """End-to-end: api.retry() must append carryover (terminal + depth-cap)
+    records back into _failures.json so the journal stays the canonical
+    view of "what's still stuck" between retry rounds.
+    """
+
+    def _stub_submit(self) -> None:
+        # No-op submit_job stub — pretend the pipeline ran and wrote
+        # its own _failures.json with this round's new failures.
+        # The merge code should append carryover on top.
+        pass
+
+    def test_terminal_kinds_appear_in_failures_json(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from datensee import api
+
+        # Stage a journal with one MEMORY_EXCEEDED (will split) and one
+        # AUTH_ERROR (terminal — must end up in _failures.json).
+        journal = tmp_path / "_failures.json"
+        terminal_record = _record(
+            error_kind="AUTH_ERROR",
+            bbox=(0.0, 0.0, 100.0, 100.0),
+            row=0,
+            col=0,
+        )
+        memory_record = _record(
+            error_kind="MEMORY_EXCEEDED",
+            bbox=(0.0, 0.0, 100.0, 100.0),
+            row=0,
+            col=0,
+        )
+        journal.write_text(
+            json.dumps(memory_record) + "\n" + json.dumps(terminal_record) + "\n"
+        )
+
+        # Output dir doubles as both the input journal location and the
+        # post-pipeline _failures.json location. Simulate the pipeline
+        # by having the stubbed submit_job pre-write the file as the
+        # real pipeline would (one new failure from this round).
+        new_pipeline_failure = _record(
+            error_kind="RATE_LIMITED",
+            bbox=(0.0, 0.0, 50.0, 50.0),
+            row=0,
+            col=0,
+            lineage=[0],
+        )
+
+        def fake_submit(*_args, **_kwargs):
+            # Overwrite _failures.json with this round's "new" failures.
+            (tmp_path / "_failures.json").write_text(
+                json.dumps(new_pipeline_failure) + "\n"
+            )
+            return None
+
+        # api.retry() imports submit_job, ensure_jar, ensure_auth lazily
+        # from their source modules — patch there, not on the api module.
+        from datensee import notebook
+        from datensee import submit as submit_mod
+
+        monkeypatch.setattr(submit_mod, "submit_job", fake_submit)
+        monkeypatch.setattr(notebook, "ensure_jar", lambda: tmp_path / "stub.jar")
+        monkeypatch.setattr(notebook, "ensure_auth", lambda: None)
+
+        result = api.retry(
+            journal=journal,
+            ee_expression='{"result":"0","values":{"0":{"constantValue":1}}}',
+            project="test-project",
+            output=str(tmp_path),
+            runner="local",
+            max_depth=2,
+        )
+
+        # Sanity: the plan classified one record as split, one as terminal.
+        assert result.stats.get("split") == 1
+        assert result.stats.get("terminal") == 1
+        assert result.next_tiles_count == 4  # 4 quadrant children
+        assert result.carryover_count == 1   # the AUTH_ERROR
+
+        # The journal now contains: the new pipeline failure (RATE_LIMITED)
+        # plus the carried-over AUTH_ERROR. The MEMORY_EXCEEDED record is
+        # NOT here directly — it was split into children that the pipeline
+        # is now responsible for.
+        merged_lines = (tmp_path / "_failures.json").read_text().strip().splitlines()
+        merged = [json.loads(line) for line in merged_lines]
+        kinds = sorted(r["error_kind"] for r in merged)
+        assert kinds == ["AUTH_ERROR", "RATE_LIMITED"], (
+            f"Expected the new pipeline failure plus the carried-over "
+            f"AUTH_ERROR, got {kinds}"
+        )
+
+    def test_depth_capped_records_appear_in_failures_json(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from datensee import api
+
+        # MEMORY_EXCEEDED record already at depth 2 — won't split, must
+        # end up carried over into the next _failures.json.
+        capped_record = _record(error_kind="MEMORY_EXCEEDED", lineage=[0, 1])
+        # Plus one progressable record so we don't short-circuit on
+        # "nothing to retry".
+        progressing_record = _record(error_kind="RATE_LIMITED")
+
+        journal = tmp_path / "_failures.json"
+        journal.write_text(
+            json.dumps(capped_record) + "\n" + json.dumps(progressing_record) + "\n"
+        )
+
+        def fake_submit(*_args, **_kwargs):
+            # Pipeline produced no new failures this round.
+            (tmp_path / "_failures.json").write_text("")
+            return None
+
+        # api.retry() imports submit_job, ensure_jar, ensure_auth lazily
+        # from their source modules — patch there, not on the api module.
+        from datensee import notebook
+        from datensee import submit as submit_mod
+
+        monkeypatch.setattr(submit_mod, "submit_job", fake_submit)
+        monkeypatch.setattr(notebook, "ensure_jar", lambda: tmp_path / "stub.jar")
+        monkeypatch.setattr(notebook, "ensure_auth", lambda: None)
+
+        result = api.retry(
+            journal=journal,
+            ee_expression='{"result":"0","values":{"0":{"constantValue":1}}}',
+            project="test-project",
+            output=str(tmp_path),
+            runner="local",
+            max_depth=2,
+        )
+
+        assert result.stats.get("depth_cap") == 1
+        assert result.carryover_count == 1
+
+        merged_lines = (tmp_path / "_failures.json").read_text().strip().splitlines()
+        merged = [json.loads(line) for line in merged_lines]
+        assert len(merged) == 1
+        assert merged[0]["error_kind"] == "MEMORY_EXCEEDED"
+        assert merged[0]["lineage"] == [0, 1]
+
+    # NB: Dataflow / GCS merge path is not unit-tested — exercising it
+    # requires stubbing google.cloud.storage's upload + the GCS-side
+    # _failures.json layout, which isn't worth the test scaffolding for
+    # what amounts to a logged warning + early return. The skip branch
+    # is small enough to verify by code inspection. Tracked under the
+    # "Dataflow merge isn't wired" caveat in docs/retry-with-journal.md.
