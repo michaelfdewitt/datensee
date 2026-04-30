@@ -107,35 +107,20 @@ def _export_adc_for_java() -> None:
 
 
 # ---------------------------------------------------------------------------
-# JAR auto-download
+# JAR resolution (local mode only)
 # ---------------------------------------------------------------------------
 
 
 def ensure_jar() -> Path:
-    """Find or auto-download the pipeline JAR.
+    """Locate the pipeline JAR for local-mode submission.
 
-    For private repos, reads a GitHub PAT from the ``GITHUB_TOKEN`` Colab
-    Secret (or the ``GITHUB_TOKEN`` environment variable) to authenticate
-    the GitHub Releases download.
-
-    Returns the path to a usable JAR, downloading from GitHub Releases
-    if none is found locally.
+    Cloud submission (Dataflow Flex Template) does not need a local JAR
+    and never calls this. Raises :class:`FileNotFoundError` with build
+    instructions when no JAR is on disk.
     """
-    from datensee import __version__
-    from datensee.jar import download_jar, find_jar
+    from datensee.jar import find_jar
 
-    try:
-        return find_jar(None)
-    except FileNotFoundError:
-        github_token: str | None = None
-        if is_colab():
-            try:
-                from google.colab import userdata  # type: ignore[import-untyped]
-
-                github_token = userdata.get("GITHUB_TOKEN")
-            except Exception:
-                pass
-        return download_jar(__version__, github_token=github_token)
+    return find_jar(None)
 
 
 # ---------------------------------------------------------------------------

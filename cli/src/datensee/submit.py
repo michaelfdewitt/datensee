@@ -1,11 +1,26 @@
-"""Dataflow job submission.
+"""Pipeline submission — local Direct runner and Dataflow Flex Template.
 
-Writes the pipeline config to a temp file and invokes the compiled Beam
-JAR via subprocess. For local mode, runs the Direct runner in-process
-with a Rich progress bar driven by output file polling.
+Two paths share the same ``submit_job`` entrypoint, dispatched on
+``config.runner.mode``:
 
-For large tile counts (>5000), uploads tile coordinates as NDJSON to the
-output path and references the file in the config instead of inlining.
+* ``local`` — shells out to ``java -jar <pipeline.jar>`` with the
+  Direct runner. The JAR runs in-process on the user's machine; output
+  is either a local directory or GCS. A Rich progress bar (or
+  ``progress_callback``) tracks tile arrival. The caller's OAuth access
+  token, if any, is handed to the JVM via an inheritable pipe FD so it
+  never appears on argv or in the environment.
+
+* ``dataflow`` — POSTs to the Dataflow Flex Templates ``launch``
+  endpoint. The pipeline JAR lives inside a launcher container in
+  Artifact Registry; the user's machine never sees it. Pipeline config
+  is staged to GCS as ``{output}/_pipeline-config.json`` and the launch
+  payload references that URI. Auth is ADC (or caller-supplied
+  credentials) for the REST call; the Dataflow worker SA handles
+  everything else (GCS writes, EE HV API).
+
+For large tile counts (>5000), tile coordinates are written as NDJSON
+to the output path and the config references the file path instead of
+inlining the list.
 """
 
 from __future__ import annotations
@@ -24,7 +39,7 @@ from typing import TYPE_CHECKING
 from rich.console import Console
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
-from datensee.config import PipelineConfig, TileGrid
+from datensee.config import DataflowRunnerConfig, PipelineConfig, TileGrid
 
 if TYPE_CHECKING:
     from google.auth.credentials import Credentials
@@ -41,38 +56,68 @@ def _count_completed_tiles(output_dir: Path) -> int:
 
 def submit_job(
     config: PipelineConfig,
-    jar_path: Path,
+    jar_path: Path | None = None,
     *,
     dry_run: bool = False,
     progress_callback: Callable[[int, int], None] | None = None,
     credentials: Credentials | None = None,
+    template_spec: str | None = None,
 ) -> str | None:
-    """Submit the pipeline to Dataflow (or run locally via Direct runner).
+    """Submit the pipeline to Dataflow (Flex Template) or run locally.
 
     Args:
         config: Validated pipeline configuration.
-        jar_path: Path to the compiled Beam fat-JAR.
-        dry_run: If True, print the command without executing it.
+        jar_path: Path to the compiled Beam fat-JAR. Required for
+            ``mode == "local"``; ignored for ``mode == "dataflow"``.
+        dry_run: If True, print the planned action without executing.
         progress_callback: Optional callback(completed, total) for local mode
             progress updates. When provided, Rich progress bar is suppressed.
-            When None, Rich progress bar is used (backwards-compatible).
-        credentials: Optional caller-supplied Google credentials. When set,
-            the access token is handed to the Java subprocess via an
-            inheritable pipe FD (`--userTokenFd=<N>`) so the token never
-            appears on argv or in the subprocess environment. Also used for
-            driver-side GCS uploads.
+            Ignored for Dataflow.
+        credentials: Optional caller-supplied Google credentials. Local
+            mode forwards the access token to the JVM via an inheritable
+            pipe FD; Dataflow mode uses them for the Flex Template launch
+            REST call (and falls back to ADC when None).
+        template_spec: Override for the Flex Template spec GCS URI.
+            Defaults via ``template.resolve_template_spec()``.
 
     Returns:
         Dataflow job ID string, or None for local runs / dry runs.
-
-    Raises:
-        FileNotFoundError: If jar_path does not exist.
-        subprocess.CalledProcessError: If the pipeline invocation fails.
     """
+    if config.runner.mode == "dataflow":
+        return _submit_dataflow(
+            config,
+            dry_run=dry_run,
+            credentials=credentials,
+            template_spec=template_spec,
+        )
+
+    if jar_path is None:
+        raise ValueError(
+            "submit_job(mode='local') requires jar_path. "
+            "Run `datensee jar build` to compile the pipeline JAR."
+        )
+    return _submit_local(
+        config,
+        jar_path=jar_path,
+        dry_run=dry_run,
+        progress_callback=progress_callback,
+        credentials=credentials,
+    )
+
+
+def _submit_local(
+    config: PipelineConfig,
+    *,
+    jar_path: Path,
+    dry_run: bool,
+    progress_callback: Callable[[int, int], None] | None,
+    credentials: Credentials | None,
+) -> str | None:
+    """Run the pipeline locally via the Direct runner (one JVM, in-process)."""
     if not dry_run and not jar_path.exists():
         raise FileNotFoundError(
             f"Pipeline JAR not found: {jar_path}\n"
-            "Run `./gradlew shadowJar` in the pipelines/ directory first."
+            "Run `datensee jar build` to compile the pipeline JAR."
         )
 
     config = _maybe_externalize_tiles(config, dry_run=dry_run, credentials=credentials)
@@ -81,7 +126,7 @@ def submit_job(
         tmp_path = Path(tmp.name)
         config.write_json(tmp_path)
 
-    cmd = _build_command(config, jar_path, tmp_path)
+    cmd = _build_local_command(jar_path, tmp_path)
 
     if dry_run:
         console.print("[bold cyan]Dry run — would execute:[/bold cyan]")
@@ -90,7 +135,7 @@ def submit_job(
             console.print(f"[dim]Tiles would be uploaded to: {config.tile_grid.tiles_file}[/dim]")
         return None
 
-    console.print(f"[bold]Submitting pipeline[/bold] (mode={config.runner.mode})")
+    console.print("[bold]Submitting pipeline[/bold] (mode=local)")
     console.print(f"Config written to: {tmp_path}")
 
     token_fd = _prepare_user_token_fd(credentials)
@@ -99,7 +144,7 @@ def submit_job(
             cmd = cmd + [f"--userTokenFd={token_fd}"]
         pass_fds = (token_fd,) if token_fd is not None else ()
 
-        if config.runner.mode == "local" and not config.output.output_path.startswith("gs://"):
+        if not config.output.output_path.startswith("gs://"):
             _run_local_with_progress(
                 cmd,
                 Path(config.output.output_path),
@@ -109,11 +154,9 @@ def submit_job(
             )
             return None
 
-        # Stream the child's merged stdout/stderr live to our own stderr so
-        # it lands in Cloud Run / CLI logs in real time, and simultaneously
-        # keep a bounded tail buffer for the RuntimeError message on
-        # non-zero exit. capture_output=True would have swallowed the
-        # success path entirely.
+        # GCS output, local runner: no progress bar (we can't cheaply poll
+        # GCS for tile arrival). Stream stderr live and surface a tail on
+        # failure.
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -123,14 +166,10 @@ def submit_job(
             bufsize=1,
         )
         tail_lines: deque[str] = deque(maxlen=200)
-        job_id: str | None = None
         assert proc.stdout is not None
         for line in proc.stdout:
             sys.stderr.write(line)
-            stripped = line.rstrip("\n")
-            tail_lines.append(stripped)
-            if stripped.startswith("DATENSEE_JOB_ID="):
-                job_id = stripped.removeprefix("DATENSEE_JOB_ID=")
+            tail_lines.append(line.rstrip("\n"))
         sys.stderr.flush()
         returncode = proc.wait()
         if returncode != 0:
@@ -146,9 +185,75 @@ def submit_job(
             except OSError:
                 pass
 
-    if config.runner.mode == "local":
+    return None
+
+
+def _submit_dataflow(
+    config: PipelineConfig,
+    *,
+    dry_run: bool,
+    credentials: Credentials | None,
+    template_spec: str | None,
+) -> str | None:
+    """Launch the pipeline via the Dataflow Flex Template REST endpoint.
+
+    Stages the pipeline config to GCS, builds the launch payload, and
+    POSTs to ``flexTemplates:launch``. Returns the job ID extracted from
+    the response.
+    """
+    from datensee.template import resolve_template_spec
+
+    if config.runner.dataflow is None:
+        raise ValueError("Dataflow mode requires runner.dataflow config.")
+    if not config.output.output_path.startswith("gs://"):
+        raise ValueError(
+            f"Dataflow mode requires a GCS output path, got "
+            f"{config.output.output_path!r}."
+        )
+
+    df = config.runner.dataflow
+    spec_uri = resolve_template_spec(template_spec)
+
+    config = _maybe_externalize_tiles(config, dry_run=dry_run, credentials=credentials)
+
+    config_uri = config.output.output_path.rstrip("/") + "/_pipeline-config.json"
+    config_json = config.model_dump_json(indent=2, exclude_none=True)
+
+    job_name = _job_name()
+    payload = _build_flex_payload(
+        job_name=job_name,
+        spec_uri=spec_uri,
+        config_uri=config_uri,
+        df=df,
+    )
+
+    if dry_run:
+        console.print("[bold cyan]Dry run — would launch Flex Template:[/bold cyan]")
+        console.print(f"  spec    = {spec_uri}")
+        console.print(f"  config  = {config_uri}")
+        console.print(f"  project = {df.project}")
+        console.print(f"  region  = {df.region}")
+        console.print(f"  jobName = {job_name}")
         return None
 
+    _upload_to_gcs(
+        config_uri,
+        config_json.encode("utf-8"),
+        credentials=credentials,
+        content_type="application/json",
+    )
+
+    console.print("[bold]Submitting pipeline[/bold] (mode=dataflow, flex-template)")
+    console.print(f"  spec   = {spec_uri}")
+    console.print(f"  config = {config_uri}")
+
+    job_id = _launch_flex_template(
+        project=df.project,
+        region=df.region,
+        payload=payload,
+        credentials=credentials,
+    )
+    console.print(f"DATENSEE_JOB_ID={job_id}")
     return job_id
 
 
@@ -196,8 +301,9 @@ def _materialize_access_token(credentials: Credentials) -> str:
     """Return a live access token from a Credentials object.
 
     Refreshes the credential if it is missing a token or has expired.
-    Raises RuntimeError with an actionable message if refresh fails —
-    the caller (FoundrEE bridge) re-emits this as an export-failed event.
+    Raises RuntimeError with an actionable message if refresh fails so
+    callers can surface it instead of inheriting an opaque transport
+    error from the JVM child.
     """
     token = getattr(credentials, "token", None)
     expired = getattr(credentials, "expired", False)
@@ -345,6 +451,7 @@ def _upload_to_gcs(
     data: bytes,
     *,
     credentials: Credentials | None = None,
+    content_type: str = "application/x-ndjson",
 ) -> None:
     """Upload bytes to a GCS URI using caller-supplied credentials, if any."""
     from google.cloud import storage
@@ -356,38 +463,114 @@ def _upload_to_gcs(
     client = storage.Client(credentials=credentials) if credentials else storage.Client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
-    blob.upload_from_string(data, content_type="application/x-ndjson")
+    blob.upload_from_string(data, content_type=content_type)
 
 
-def _build_command(
-    config: PipelineConfig,
-    jar_path: Path,
-    config_path: Path,
-) -> list[str]:
-    """Build the java invocation for the Beam pipeline."""
-    cmd = [
+def _build_local_command(jar_path: Path, config_path: Path) -> list[str]:
+    """Build the java invocation for the Direct runner."""
+    return [
         "java",
         "-jar",
         str(jar_path),
         f"--configFile={config_path}",
-        f"--runner={'DataflowRunner' if config.runner.mode == 'dataflow' else 'DirectRunner'}",
+        "--runner=DirectRunner",
     ]
 
-    if config.runner.mode == "dataflow" and config.runner.dataflow is not None:
-        df = config.runner.dataflow
-        cmd += [
-            f"--project={df.project}",
-            f"--region={df.region}",
-            f"--tempLocation={df.temp_location}",
-            f"--stagingLocation={df.staging_location}",
-            f"--workerMachineType={df.machine_type}",
-            f"--maxNumWorkers={df.max_workers}",
-        ]
-        if df.service_account_email:
-            cmd.append(f"--serviceAccount={df.service_account_email}")
-        if df.labels:
-            # Beam's PipelineOptionsFactory parses --labels as a JSON map
-            # onto DataflowPipelineWorkerPoolOptions.setLabels(Map<String,String>).
-            cmd.append(f"--labels={json.dumps(df.labels, separators=(',', ':'))}")
 
-    return cmd
+def _job_name() -> str:
+    """Generate a Dataflow job name. Lowercase + dashes, ends with epoch ms."""
+    return f"datensee-{int(time.time() * 1000)}"
+
+
+def _build_flex_payload(
+    *,
+    job_name: str,
+    spec_uri: str,
+    config_uri: str,
+    df: DataflowRunnerConfig,
+) -> dict:
+    """Construct the ``flexTemplates:launch`` request body.
+
+    Custom parameters (declared in ``pipelines/metadata.json``) go in
+    ``parameters``; standard Beam runtime knobs go in ``environment``.
+    Anything left null is dropped — Dataflow rejects nulls on optional
+    fields.
+    """
+    environment: dict[str, object] = {
+        "tempLocation": df.temp_location,
+        "stagingLocation": df.staging_location,
+        "machineType": df.machine_type,
+        "maxWorkers": df.max_workers,
+    }
+    if df.service_account_email:
+        environment["serviceAccountEmail"] = df.service_account_email
+    if df.network:
+        environment["network"] = df.network
+    if df.subnetwork:
+        environment["subnetwork"] = df.subnetwork
+    if df.labels:
+        environment["additionalUserLabels"] = df.labels
+
+    return {
+        "launchParameter": {
+            "jobName": job_name,
+            "containerSpecGcsPath": spec_uri,
+            "parameters": {"configFile": config_uri},
+            "environment": environment,
+        }
+    }
+
+
+def _launch_flex_template(
+    *,
+    project: str,
+    region: str,
+    payload: dict,
+    credentials: Credentials | None,
+) -> str:
+    """POST to ``flexTemplates:launch`` and return the launched job ID.
+
+    Auth: caller-supplied credentials > ADC. The credential is refreshed
+    if needed, then the bearer token is attached as an ``Authorization``
+    header on a single httpx call. We don't use ``AuthorizedSession``
+    because we want the existing httpx dependency to handle the
+    transport — one less moving part.
+    """
+    import httpx
+    from google.auth.transport.requests import Request
+
+    if credentials is None:
+        from google.auth import default as google_auth_default
+
+        credentials, _ = google_auth_default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+
+    if not getattr(credentials, "token", None) or getattr(credentials, "expired", False):
+        credentials.refresh(Request())
+
+    url = (
+        f"https://dataflow.googleapis.com/v1b3/projects/{project}"
+        f"/locations/{region}/flexTemplates:launch"
+    )
+    headers = {
+        "Authorization": f"Bearer {credentials.token}",
+        "Content-Type": "application/json",
+        "x-goog-user-project": project,
+    }
+
+    response = httpx.post(url, json=payload, headers=headers, timeout=120.0)
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Flex Template launch failed (HTTP {response.status_code}): "
+            f"{response.text.strip()}"
+        )
+
+    body = response.json()
+    job = body.get("job") or {}
+    job_id = job.get("id")
+    if not job_id:
+        raise RuntimeError(
+            f"Flex Template launch returned no job ID. Response body: {body!r}"
+        )
+    return job_id

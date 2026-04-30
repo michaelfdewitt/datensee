@@ -223,9 +223,9 @@ def export(
         region_gcp: Dataflow region (e.g. 'us-central1').
         temp_location: GCS URI for Dataflow temp files (required for Dataflow).
         max_qps: Max queries per second to the EE HV API.
-        labels: Dataflow job labels, forwarded to the runner as --labels=JSON.
-            Only applied in 'dataflow' mode. Useful for filtering jobs.list
-            responses downstream (e.g. {"foundree": "1"}).
+        labels: Dataflow job labels, forwarded as additionalUserLabels on
+            the Flex Template launch. Only applied in 'dataflow' mode.
+            Useful for filtering jobs.list responses by caller / tag.
         jar: Path to the pipeline JAR (auto-detected if None).
         snapshot_time: Unix nanos to pin every asset reference in
             ``ee_expression`` to. Defaults to wall-clock now at submit
@@ -257,10 +257,9 @@ def export(
     """
     from datensee.notebook import ensure_auth, ensure_jar
 
-    # Caller-supplied credentials bypass the ADC bootstrap entirely so
-    # we never silently fall back to host ADC (see security note in the
-    # FoundrEE bridge — the driver must act as the end user, not as the
-    # host service account).
+    # Caller-supplied credentials bypass the ADC bootstrap so we never
+    # silently fall back to host ADC when a service is acting as a
+    # specific end user.
     if credentials is None:
         ensure_auth()
 
@@ -342,13 +341,17 @@ def export(
     if dry_run:
         return ExportResult(config=pipeline_config)
 
-    # Resolve JAR
-    if jar is not None:
-        from datensee.jar import find_jar
+    # The local Direct runner needs a JAR on disk; the Dataflow Flex
+    # Template path runs the pipeline JAR inside a launcher container, so
+    # the user's machine does not need it.
+    jar_path: Path | None = None
+    if runner == "local":
+        if jar is not None:
+            from datensee.jar import find_jar
 
-        jar_path = find_jar(Path(jar) if isinstance(jar, str) else jar)
-    else:
-        jar_path = ensure_jar()
+            jar_path = find_jar(Path(jar) if isinstance(jar, str) else jar)
+        else:
+            jar_path = ensure_jar()
 
     # Persist the export shape so a later `datensee retry` can verify
     # its args match. Done before submit so the sidecar exists even if
@@ -775,12 +778,14 @@ def retry(
             stats=plan.stats,
         )
 
-    if jar is not None:
-        from datensee.jar import find_jar
+    jar_path: Path | None = None
+    if runner == "local":
+        if jar is not None:
+            from datensee.jar import find_jar
 
-        jar_path = find_jar(Path(jar) if isinstance(jar, str) else jar)
-    else:
-        jar_path = ensure_jar()
+            jar_path = find_jar(Path(jar) if isinstance(jar, str) else jar)
+        else:
+            jar_path = ensure_jar()
 
     t0 = time.monotonic()
     job_id = submit_job(

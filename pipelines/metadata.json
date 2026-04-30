@@ -1,0 +1,13 @@
+{
+  "name": "DatensEE Pipeline",
+  "description": "Parallelize Earth Engine exports across Dataflow workers.",
+  "parameters": [
+    {
+      "name": "configFile",
+      "label": "Pipeline config GCS URI",
+      "helpText": "GCS URI of the pipeline-config.json staged by the datensee CLI.",
+      "regexes": ["^gs://[^/]+/.+\\.json$"],
+      "paramType": "GCS_READ_FILE"
+    }
+  ]
+}

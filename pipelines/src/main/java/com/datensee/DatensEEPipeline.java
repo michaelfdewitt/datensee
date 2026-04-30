@@ -12,7 +12,9 @@ import com.datensee.options.DatensEEOptions;
 import com.google.auth.oauth2.AccessToken;
 import com.google.auth.oauth2.GoogleCredentials;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
+import java.nio.channels.Channels;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -23,7 +25,9 @@ import java.util.List;
 import java.util.Map;
 import org.apache.beam.sdk.Pipeline;
 import org.apache.beam.sdk.extensions.gcp.options.GcpOptions;
+import org.apache.beam.sdk.io.FileSystems;
 import org.apache.beam.sdk.io.TextIO;
+import org.apache.beam.sdk.io.fs.MatchResult;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.transforms.Create;
 import org.apache.beam.sdk.transforms.ParDo;
@@ -66,6 +70,10 @@ public final class DatensEEPipeline {
      */
     static void run(DatensEEOptions options) throws IOException {
         applyUserCredentials(options);
+
+        // Register filesystems so loadConfig can resolve gs:// URIs (Flex
+        // Template launches stage the config to GCS rather than a local path).
+        FileSystems.setDefaultPipelineOptions(options);
 
         PipelineConfig config = loadConfig(options.getConfigFile());
         validateConfig(config);
@@ -221,12 +229,11 @@ public final class DatensEEPipeline {
                 // Attach the target GCP project as the quota project. Without
                 // this, google-api-client sends the API call with no
                 // x-goog-user-project header, and Google attributes quota +
-                // API-enablement checks to the OAuth client's implicit project
-                // (the FoundrEE app project), which doesn't have Dataflow
-                // enabled and should never be billed for user jobs. With it
-                // set, quota lands on the user's own project — which is the
-                // same project the Dataflow job runs in, so enablement and
-                // billing line up.
+                // API-enablement checks to the OAuth client's implicit project,
+                // which may not have Dataflow enabled and should never be
+                // billed for user jobs. With it set, quota lands on the user's
+                // own project — which is the same project the Dataflow job
+                // runs in, so enablement and billing line up.
                 //
                 // We wrap the bare AccessToken credential in a subclass that
                 // forces x-goog-user-project into `getRequestMetadata(URI)`.
@@ -275,8 +282,12 @@ public final class DatensEEPipeline {
     }
 
     private static PipelineConfig loadConfig(String configFile) throws IOException {
-        String json = Files.readString(Path.of(configFile));
-        return MAPPER.readValue(json, PipelineConfig.class);
+        // Resolve through Beam's FileSystems so gs:// and local paths share
+        // a code path. Avoids hard-coding GCS-vs-local branching here.
+        MatchResult.Metadata metadata = FileSystems.matchSingleFileSpec(configFile);
+        try (InputStream in = Channels.newInputStream(FileSystems.open(metadata.resourceId()))) {
+            return MAPPER.readValue(in, PipelineConfig.class);
+        }
     }
 
     private static void validateConfig(PipelineConfig config) {

@@ -1,6 +1,6 @@
 [project]
 name = "datensee"
-version = "0.1.0"
+version = "0.1.0a1"
 description = "DatensEE: Parallelize Google Earth Engine exports via Cloud Dataflow"
 readme = {text = "DatensEE: Parallelize Google Earth Engine exports via Cloud Dataflow", content-type = "text/plain"}
 requires-python = ">=3.12"
@@ -30,11 +30,6 @@ dependencies = [
     "google-cloud-storage>=2.0",
     "requests>=2.32.5",
 ]
-
-[project.urls]
-Homepage = "https://github.com/datensee/datensee"
-Repository = "https://github.com/datensee/datensee"
-Issues = "https://github.com/datensee/datensee/issues"
 
 [project.scripts]
 datensee = "datensee.main:app"

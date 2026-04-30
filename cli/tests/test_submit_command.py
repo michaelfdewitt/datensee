@@ -1,8 +1,7 @@
-"""Tests for `_build_command` — the Dataflow/Direct runner argv builder."""
+"""Tests for submit.py command builders and Flex Template payload."""
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -15,7 +14,11 @@ from datensee.config import (
     TileCoordinate,
     TileGrid,
 )
-from datensee.submit import _build_command, _prepare_user_token_fd
+from datensee.submit import (
+    _build_flex_payload,
+    _build_local_command,
+    _prepare_user_token_fd,
+)
 
 
 def _config(runner: RunnerConfig) -> PipelineConfig:
@@ -33,79 +36,76 @@ def _config(runner: RunnerConfig) -> PipelineConfig:
 
 
 def test_local_runner_command_has_direct_runner() -> None:
-    cmd = _build_command(
-        _config(RunnerConfig(mode="local")),
-        jar_path=Path("/tmp/fake.jar"),
-        config_path=Path("/tmp/cfg.json"),
-    )
+    cmd = _build_local_command(Path("/tmp/fake.jar"), Path("/tmp/cfg.json"))
     assert "--runner=DirectRunner" in cmd
-    assert not any(c.startswith("--labels") for c in cmd)
+    assert "--configFile=/tmp/cfg.json" in cmd
 
 
-def test_dataflow_command_omits_labels_when_none() -> None:
-    cmd = _build_command(
-        _config(
-            RunnerConfig(
-                mode="dataflow",
-                dataflow=DataflowRunnerConfig(
-                    project="p",
-                    region="us-central1",
-                    temp_location="gs://b/tmp",
-                    staging_location="gs://b/staging",
-                ),
-            )
-        ),
-        jar_path=Path("/tmp/fake.jar"),
-        config_path=Path("/tmp/cfg.json"),
+def test_flex_payload_minimal() -> None:
+    df = DataflowRunnerConfig(
+        project="p",
+        region="us-central1",
+        temp_location="gs://b/tmp",
+        staging_location="gs://b/staging",
     )
-    assert "--runner=DataflowRunner" in cmd
-    assert not any(c.startswith("--labels") for c in cmd)
-
-
-def test_dataflow_command_includes_labels_as_json() -> None:
-    cmd = _build_command(
-        _config(
-            RunnerConfig(
-                mode="dataflow",
-                dataflow=DataflowRunnerConfig(
-                    project="p",
-                    region="us-central1",
-                    temp_location="gs://b/tmp",
-                    staging_location="gs://b/staging",
-                    labels={"foundree": "1"},
-                ),
-            )
-        ),
-        jar_path=Path("/tmp/fake.jar"),
-        config_path=Path("/tmp/cfg.json"),
+    payload = _build_flex_payload(
+        job_name="datensee-1234",
+        spec_uri="gs://datensee-templates/v0.1.0a1/datensee.json",
+        config_uri="gs://b/exports/_pipeline-config.json",
+        df=df,
     )
-    label_flags = [c for c in cmd if c.startswith("--labels=")]
-    assert len(label_flags) == 1
-    payload = label_flags[0].removeprefix("--labels=")
-    assert json.loads(payload) == {"foundree": "1"}
+    lp = payload["launchParameter"]
+    assert lp["jobName"] == "datensee-1234"
+    assert lp["containerSpecGcsPath"] == "gs://datensee-templates/v0.1.0a1/datensee.json"
+    assert lp["parameters"] == {"configFile": "gs://b/exports/_pipeline-config.json"}
+    assert lp["environment"]["tempLocation"] == "gs://b/tmp"
+    assert lp["environment"]["stagingLocation"] == "gs://b/staging"
+    assert lp["environment"]["maxWorkers"] == 100
+    # Optional fields stay out of the env map when unset.
+    assert "additionalUserLabels" not in lp["environment"]
+    assert "serviceAccountEmail" not in lp["environment"]
 
 
-def test_dataflow_command_labels_multi_key() -> None:
-    cmd = _build_command(
-        _config(
-            RunnerConfig(
-                mode="dataflow",
-                dataflow=DataflowRunnerConfig(
-                    project="p",
-                    region="us-central1",
-                    temp_location="gs://b/tmp",
-                    staging_location="gs://b/staging",
-                    labels={"foundree": "1", "team": "geo"},
-                ),
-            )
-        ),
-        jar_path=Path("/tmp/fake.jar"),
-        config_path=Path("/tmp/cfg.json"),
+def test_flex_payload_includes_labels_as_additional_user_labels() -> None:
+    df = DataflowRunnerConfig(
+        project="p",
+        region="us-central1",
+        temp_location="gs://b/tmp",
+        staging_location="gs://b/staging",
+        labels={"team": "geo", "stage": "alpha"},
     )
-    label_flags = [c for c in cmd if c.startswith("--labels=")]
-    assert len(label_flags) == 1
-    payload = label_flags[0].removeprefix("--labels=")
-    assert json.loads(payload) == {"foundree": "1", "team": "geo"}
+    payload = _build_flex_payload(
+        job_name="datensee-1",
+        spec_uri="gs://x/y.json",
+        config_uri="gs://b/cfg.json",
+        df=df,
+    )
+    assert payload["launchParameter"]["environment"]["additionalUserLabels"] == {
+        "team": "geo",
+        "stage": "alpha",
+    }
+
+
+def test_flex_payload_includes_service_account_when_set() -> None:
+    df = DataflowRunnerConfig(
+        project="p",
+        region="us-central1",
+        temp_location="gs://b/tmp",
+        staging_location="gs://b/staging",
+        service_account_email="worker@p.iam.gserviceaccount.com",
+        network="my-vpc",
+        subnetwork="regions/us-central1/subnetworks/my-sub",
+    )
+    payload = _build_flex_payload(
+        job_name="datensee-2",
+        spec_uri="gs://x/y.json",
+        config_uri="gs://b/cfg.json",
+        df=df,
+    )
+    env = payload["launchParameter"]["environment"]
+    assert env["serviceAccountEmail"] == "worker@p.iam.gserviceaccount.com"
+    assert env["network"] == "my-vpc"
+    assert env["subnetwork"] == "regions/us-central1/subnetworks/my-sub"
 
 
 def test_prepare_user_token_fd_returns_none_without_credentials() -> None:
@@ -113,13 +113,13 @@ def test_prepare_user_token_fd_returns_none_without_credentials() -> None:
 
 
 def test_prepare_user_token_fd_round_trip() -> None:
-    """Verify the pipe FD carries exactly the token bytes and then EOFs.
+    """Pipe FD carries exactly the token bytes and then EOFs.
 
-    Simulates what the Java driver does on the other side: read from the
-    inherited FD via `/proc/self/fd/<N>` (here we just read the FD directly
-    since we're the same process) and confirm we see the token followed by
-    EOF. Also verifies the FD is inheritable so subprocess.Popen(pass_fds=...)
-    can actually hand it to the child.
+    Mirrors what the JVM does on the other side: read from the inherited
+    FD via /proc/self/fd/<N> (here we just read the FD directly since
+    we're the same process) and confirm we see the token followed by EOF.
+    Also verifies the FD is inheritable so ``subprocess.Popen(pass_fds=…)``
+    can hand it to the child.
     """
     creds = MagicMock()
     creds.token = "ya29.test-token-value"
@@ -128,21 +128,15 @@ def test_prepare_user_token_fd_round_trip() -> None:
     fd = _prepare_user_token_fd(creds)
     assert fd is not None
     try:
-        # subprocess.Popen(pass_fds=...) works because the FD is marked
-        # inheritable. We verify that flag explicitly so a regression in
-        # _prepare_user_token_fd can't silently break the child handoff.
         assert os.get_inheritable(fd)
-        # Read all bytes — must see the token and then EOF immediately,
-        # because the write end was closed inside the helper.
         data = os.read(fd, 4096)
         assert data == b"ya29.test-token-value"
-        assert os.read(fd, 4096) == b""  # EOF
+        assert os.read(fd, 4096) == b""
     finally:
         os.close(fd)
 
 
 def test_prepare_user_token_fd_refreshes_expired() -> None:
-    """An expired credential is refreshed once before the FD handoff."""
     creds = MagicMock()
     creds.token = None
     creds.expired = True
@@ -160,3 +154,47 @@ def test_prepare_user_token_fd_refreshes_expired() -> None:
     finally:
         os.close(fd)
     creds.refresh.assert_called_once()
+
+
+def test_submit_dataflow_dispatches_via_flex(monkeypatch) -> None:
+    """``submit_job(mode='dataflow')`` calls the Flex Template launcher."""
+    from datensee import submit as submit_mod
+
+    captured: dict[str, object] = {}
+
+    def fake_upload(uri: str, data: bytes, **kwargs: object) -> None:
+        captured["upload_uri"] = uri
+        captured["upload_bytes"] = data
+
+    def fake_launch(**kwargs: object) -> str:
+        captured["launch_kwargs"] = kwargs
+        return "2026-04-30_test_job"
+
+    monkeypatch.setattr(submit_mod, "_upload_to_gcs", fake_upload)
+    monkeypatch.setattr(submit_mod, "_launch_flex_template", fake_launch)
+
+    cfg = _config(
+        RunnerConfig(
+            mode="dataflow",
+            dataflow=DataflowRunnerConfig(
+                project="p",
+                region="us-central1",
+                temp_location="gs://b/tmp",
+                staging_location="gs://b/staging",
+            ),
+        )
+    )
+    job_id = submit_mod.submit_job(
+        cfg,
+        jar_path=None,
+        template_spec="gs://override/spec.json",
+    )
+    assert job_id == "2026-04-30_test_job"
+    assert captured["upload_uri"] == "gs://my-bucket/exports/test/_pipeline-config.json"
+    assert captured["launch_kwargs"]["project"] == "p"
+    payload = captured["launch_kwargs"]["payload"]
+    assert payload["launchParameter"]["containerSpecGcsPath"] == "gs://override/spec.json"
+    assert (
+        payload["launchParameter"]["parameters"]["configFile"]
+        == "gs://my-bucket/exports/test/_pipeline-config.json"
+    )

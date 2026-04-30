@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.datensee"
-version = "0.1.0"
+version = "0.1.0a1"
 
 java {
     sourceCompatibility = JavaVersion.VERSION_25

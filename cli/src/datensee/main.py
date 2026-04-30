@@ -18,14 +18,14 @@ from rich.console import Console
 from datensee import __version__, api
 from datensee.config import PipelineConfig
 from datensee.display import render_export_summary, render_post_run_summary
-from datensee.jar import build_jar, download_jar
+from datensee.jar import build_jar
 
 app = typer.Typer(
     name="datensee",
     help="DatensEE: Parallelize Google Earth Engine exports via Cloud Dataflow.",
     no_args_is_help=True,
 )
-jar_app = typer.Typer(help="Manage the pipeline JAR (build, download, locate).")
+jar_app = typer.Typer(help="Manage the local-mode pipeline JAR (build, locate).")
 app.add_typer(jar_app, name="jar")
 console = Console()
 
@@ -355,24 +355,8 @@ def jar_path_cmd() -> None:
         console.print(str(path))
     else:
         console.print("[red]Pipeline JAR not found.[/red]")
-        console.print("Install it with: datensee jar download  or  datensee jar build")
+        console.print("Build it with: datensee jar build")
         raise typer.Exit(code=1)
-
-
-@jar_app.command("download")
-def jar_download_cmd(
-    version: Annotated[
-        str,
-        typer.Option("--version", "-v", help="Release version to download."),
-    ] = __version__,
-) -> None:
-    """Download a prebuilt pipeline JAR from GitHub Releases."""
-    try:
-        path = download_jar(version)
-        console.print(f"[green]JAR ready:[/green] {path}")
-    except FileNotFoundError as exc:
-        console.print(f"[red]Error:[/red] {exc}")
-        raise typer.Exit(code=1) from exc
 
 
 @jar_app.command("build")

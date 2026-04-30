@@ -135,16 +135,18 @@ class TestEnsureJar:
             result = ensure_jar()
             assert result == jar
 
-    def test_downloads_when_not_found(self, tmp_path: object) -> None:
+    def test_propagates_not_found(self) -> None:
+        """No JAR on disk → caller sees the build instructions error.
+
+        The legacy GitHub-Releases auto-download is gone (cloud mode
+        does not need a JAR; local mode requires ``datensee jar build``).
+        """
         from datensee.notebook import ensure_jar
 
-        jar = tmp_path / "downloaded.jar"  # type: ignore[operator]
-        jar.touch()
-
-        with (
-            patch("datensee.jar.find_jar", side_effect=FileNotFoundError),
-            patch("datensee.jar.download_jar", return_value=jar) as mock_dl,
-        ):
-            result = ensure_jar()
-            assert result == jar
-            mock_dl.assert_called_once()
+        with patch("datensee.jar.find_jar", side_effect=FileNotFoundError("nope")):
+            try:
+                ensure_jar()
+            except FileNotFoundError as exc:
+                assert "nope" in str(exc)
+            else:
+                raise AssertionError("expected FileNotFoundError")

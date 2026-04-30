@@ -23,8 +23,7 @@ public interface DatensEEOptions extends PipelineOptions {
      * <p>The FD approach avoids putting bearer tokens on argv (visible in
      * {@code /proc/<pid>/cmdline}) or the environment (visible in
      * {@code /proc/<pid>/environ}) — the FD number itself is fine to expose.
-     * See {@code foundree_datensee_bridge.py} / {@code datensee.submit} for
-     * the parent side of this contract.
+     * See {@code datensee.submit} for the parent side of this contract.
      */
     @Description(
         "Inheritable read-end FD carrying the caller's OAuth access token. "
