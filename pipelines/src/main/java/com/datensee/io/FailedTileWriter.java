@@ -32,14 +32,17 @@ public final class FailedTileWriter extends DoFn<FailedTileRecord, String> {
         .registerModule(new JavaTimeModule());
 
     /**
-     * Failure-count threshold above which the writer logs a per-worker
-     * "catastrophic-rate" warning. The downstream {@code _failures.json}
-     * is written {@code .withoutSharding()} by the pipeline, so a flood
-     * of failures funnels through a single worker and becomes a wall-time
-     * bottleneck — operators want to know the rate is high so they can
-     * decide whether to abort early (e.g. auth credentials revoked).
+     * Per-worker failure threshold above which this worker logs a one-shot
+     * "this single worker is producing a lot of failures" notice. Strictly
+     * a per-worker signal — Beam DoFns can't read pipeline-wide counter
+     * totals at runtime, so we don't pretend to. Operators looking at
+     * pipeline-wide rate should consult the {@code failures_written}
+     * counter (visible in the Dataflow UI / monitoring), not this log.
+     * One worker hitting 1k failures usually means a systemic problem on
+     * its slice (bad credential, region with broken assets) — worth a
+     * glance even when pipeline-wide rate is acceptable.
      */
-    private static final long FAILURE_COUNT_WARN_THRESHOLD = 1000L;
+    private static final long PER_WORKER_FAILURE_WARN_THRESHOLD = 1000L;
 
     private final Counter failuresWritten = Metrics.counter("datensee", "failures_written");
     private long localCount;
@@ -54,13 +57,12 @@ public final class FailedTileWriter extends DoFn<FailedTileRecord, String> {
         out.output(json);
         failuresWritten.inc();
         localCount++;
-        if (localCount == FAILURE_COUNT_WARN_THRESHOLD) {
+        if (localCount == PER_WORKER_FAILURE_WARN_THRESHOLD) {
             LOG.error(
-                "FailedTileWriter: this worker has serialized {} failures so far. "
-                + "_failures.json is written without sharding, so a sustained "
-                + "high failure rate will become the pipeline's long pole. "
-                + "Consider aborting (e.g. credentials revoked, region change) "
-                + "rather than letting the journal grow unbounded.",
+                "FailedTileWriter: THIS WORKER has serialized {} failures. "
+                + "Pipeline-wide rate is in the 'failures_written' Beam counter. "
+                + "A single worker hitting this threshold often means a "
+                + "systemic problem on its slice (credentials, asset access).",
                 localCount
             );
         }

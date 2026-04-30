@@ -29,24 +29,35 @@ def _tiles_on_disk(output_dir: Path) -> set[tuple[int, int]]:
 
 
 def _tiles_in_failures(output_dir: Path) -> set[tuple[int, int]]:
-    """Read _failures.json (NDJSON written by the pipeline) and return (row, col) of failed tiles."""
+    """Read _failures.json (NDJSON) and return (row, col) of failed tiles.
+
+    Skips malformed lines individually rather than dropping the whole
+    journal — the whole point of NDJSON is per-record robustness, and
+    one corrupt record (e.g. a partial flush at the end of a job)
+    shouldn't hide thousands of valid entries above it.
+    """
     failures_path = output_dir / "_failures.json"
     if not failures_path.exists():
         return set()
 
-    failed: set[tuple[int, int]] = set()
     try:
-        for raw_line in failures_path.read_text().splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            entry = json.loads(line)
-            row = entry.get("row")
-            col = entry.get("col")
-            if row is not None and col is not None:
-                failed.add((int(row), int(col)))
-    except (json.JSONDecodeError, OSError):
+        text = failures_path.read_text()
+    except OSError:
         return set()
+
+    failed: set[tuple[int, int]] = set()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        row = entry.get("row")
+        col = entry.get("col")
+        if row is not None and col is not None:
+            failed.add((int(row), int(col)))
     return failed
 
 

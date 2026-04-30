@@ -311,6 +311,25 @@ class TestE08FailureAccounting:
         assert result.status == CheckStatus.PASSED
         assert "4 tiles accounted for" in result.message
 
+    def test_malformed_line_does_not_poison_journal(self, tmp_path: Path) -> None:
+        """A single corrupt line (e.g. partial flush at end of job) must
+        not hide the valid records that precede it — the whole point of
+        NDJSON is per-record robustness."""
+        tiles = _make_tiles(2, 2)
+        config = _make_config(tiles, output_path=str(tmp_path))
+
+        # 3 tiles on disk, 1 valid failure, 1 corrupt trailing line.
+        for t in tiles[:3]:
+            _write_fake_tiff(tmp_path / tile_filename(t))
+        valid = json.dumps(
+            {"row": tiles[3].row, "col": tiles[3].col, "error_kind": "RATE_LIMITED"}
+        )
+        (tmp_path / "_failures.json").write_text(valid + "\n{not valid json\n")
+
+        result = check_e08_failure_accounting(tmp_path, config)
+        assert result.status == CheckStatus.PASSED
+        assert "4 tiles accounted for" in result.message
+
 
 # ---------------------------------------------------------------------------
 # E10: Output Size Plausibility

@@ -6,9 +6,24 @@ no EE API calls required.
 
 Grid alignment: the tile grid is snapped to a global origin (0, 0) in the
 target CRS so that tiles from independent exports at the same scale and
-tile size are always pixel-aligned. Edge tiles extend to full tile size
-(never shrunk) but the EE expression should be clipped to the export
-region so that out-of-bounds pixels are nodata rather than computed.
+tile size are pixel-aligned. Edge tiles extend to full tile size (never
+shrunk) but the EE expression should be clipped to the export region so
+out-of-bounds pixels are nodata rather than computed.
+
+Caveat for geographic CRSs (``EPSG:4326`` and friends): the tile size in
+native units (degrees) is latitude-dependent because meters-per-degree
+of longitude shrinks with ``cos(lat)``. That means the global-origin
+snap only delivers cross-export alignment for two exports whose centroid
+latitudes happen to match. Within a single export — and within a
+``datensee retry`` round against an existing export — alignment is
+fine: every tile in one decomposition shares one centroid latitude.
+The footgun is composing tiles from *separate* exports at different
+latitudes; their grids will share the (0,0) anchor but use different
+native tile sizes and therefore won't compose. The robust fix is to
+project to UTM (or another equal-area / metric CRS) at submit time;
+``# TODO(M11)`` track this as auto-projection. Until then, treat the
+"global grid alignment" property as conditional on a fixed centroid
+latitude when the CRS is geographic.
 """
 
 from __future__ import annotations
