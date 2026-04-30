@@ -66,6 +66,16 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
     private transient GoogleCredentials credentials;
     private transient RateLimiter rateLimiter;
 
+    // Captured once per worker for AUTH_ERROR remediation messaging. Null
+    // when the metadata server is unavailable (e.g. Direct runner).
+    private transient String workerServiceAccount;
+
+    // Limits the multi-line remediation message to one emission per DoFn
+    // instance — subsequent AUTH_ERRORs log a single line. Beam's contract
+    // serializes processElement within an instance, so a plain boolean is
+    // sufficient.
+    private transient boolean firstAuthLogged;
+
     /**
      * @param eeExpression serialized EE computation (opaque JSON)
      * @param geeProject   GCP project ID for HV API
@@ -97,9 +107,11 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
             .connectTimeout(Duration.ofSeconds(30))
             .build();
         rateLimiter = RateLimiter.create(perWorkerQps);
+        workerServiceAccount = EeAuthRemediation.discoverWorkerServiceAccount(httpClient);
+        firstAuthLogged = false;
         LOG.info(
-            "Worker setup: project={}, rate={} qps/worker",
-            geeProject, perWorkerQps
+            "Worker setup: project={}, rate={} qps/worker, workerSa={}",
+            geeProject, perWorkerQps, workerServiceAccount
         );
     }
 
@@ -114,8 +126,20 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
                 new FetchedTile(tile, imageBytes, tileSizePixels, tileSizePixels)
             );
         } catch (IOException | InterruptedException e) {
-            LOG.error("{}: dead-lettered after all retries: {}", tile.id(), e.getMessage());
-            out.get(FAILED_TAG).output(classifyFailure(tile, e));
+            com.datensee.FailedTileRecord record = classifyFailure(
+                tile, e, workerServiceAccount, geeProject
+            );
+            if (record.errorKind() == EeErrorKind.AUTH_ERROR && !firstAuthLogged) {
+                LOG.error(
+                    "{}: AUTH_ERROR on EE HV API.{}",
+                    tile.id(),
+                    EeAuthRemediation.formatLogMessage(workerServiceAccount, geeProject)
+                );
+                firstAuthLogged = true;
+            } else {
+                LOG.error("{}: dead-lettered after all retries: {}", tile.id(), e.getMessage());
+            }
+            out.get(FAILED_TAG).output(record);
         }
     }
 
@@ -128,20 +152,33 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
      * MAX_RETRIES}. When the failure isn't an {@code EeApiException}
      * (network error, interrupt, etc.) we record kind=UNKNOWN with the
      * exception message.
+     *
+     * <p>For {@code AUTH_ERROR} the {@code error_message} field is
+     * rewritten to lead with a remediation hint naming the worker
+     * service account and the gcloud command that fixes it. The original
+     * EE body is preserved at the tail so debuggers don't lose context.
      */
     static com.datensee.FailedTileRecord classifyFailure(
         TileCoordinate tile,
-        Exception e
+        Exception e,
+        String workerServiceAccount,
+        String geeProject
     ) {
         Throwable cause = e;
         while (cause != null && !(cause instanceof EeApiException)) {
             cause = cause.getCause();
         }
         if (cause instanceof EeApiException ee) {
+            EeErrorKind kind = EeErrorKind.classify(ee.httpStatus(), ee.truncatedBody());
+            String message = kind == EeErrorKind.AUTH_ERROR
+                ? EeAuthRemediation.formatJournalMessage(
+                    workerServiceAccount, geeProject, ee.truncatedBody()
+                )
+                : ee.truncatedBody();
             return com.datensee.FailedTileRecord.fromTileWithError(
                 tile,
-                EeErrorKind.classify(ee.httpStatus(), ee.truncatedBody()),
-                ee.truncatedBody(),
+                kind,
+                message,
                 ee.httpStatus(),
                 MAX_RETRIES
             );

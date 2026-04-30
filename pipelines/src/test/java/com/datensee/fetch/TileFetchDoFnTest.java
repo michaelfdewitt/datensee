@@ -142,7 +142,9 @@ class TileFetchDoFnTest {
             "Failed after 5 retries: " + root.getMessage(), root
         );
 
-        com.datensee.FailedTileRecord r = TileFetchDoFn.classifyFailure(tile, wrapper);
+        com.datensee.FailedTileRecord r = TileFetchDoFn.classifyFailure(
+            tile, wrapper, null, "p"
+        );
         assertEquals(EeErrorKind.MEMORY_EXCEEDED, r.errorKind());
         assertEquals(400, r.httpStatus());
         assertTrue(r.errorMessage().contains("memory limit"));
@@ -157,9 +159,62 @@ class TileFetchDoFnTest {
         TileCoordinate tile = new TileCoordinate(0, 0, 1, 1, 0, 0);
         java.io.IOException ioe = new java.io.IOException("connection reset");
 
-        com.datensee.FailedTileRecord r = TileFetchDoFn.classifyFailure(tile, ioe);
+        com.datensee.FailedTileRecord r = TileFetchDoFn.classifyFailure(
+            tile, ioe, null, "p"
+        );
         assertEquals(EeErrorKind.UNKNOWN, r.errorKind());
         assertEquals(null, r.httpStatus());
         assertTrue(r.errorMessage().contains("connection reset"));
+    }
+
+    @Test
+    void classifyFailureRewritesAuthErrorMessageWithRemediation() {
+        TileCoordinate tile = new TileCoordinate(0, 0, 1, 1, 0, 0);
+        EeApiException root = new EeApiException(
+            403, tile.id(), "Permission denied: missing credential."
+        );
+        java.io.IOException wrapper = new java.io.IOException(
+            "Failed after 5 retries: " + root.getMessage(), root
+        );
+
+        com.datensee.FailedTileRecord r = TileFetchDoFn.classifyFailure(
+            tile, wrapper, "worker@p.iam.gserviceaccount.com", "ee-project"
+        );
+        assertEquals(EeErrorKind.AUTH_ERROR, r.errorKind());
+        assertEquals(403, r.httpStatus());
+        assertTrue(
+            r.errorMessage().contains("worker@p.iam.gserviceaccount.com"),
+            "remediation message should name the worker SA, got: " + r.errorMessage()
+        );
+        assertTrue(
+            r.errorMessage().contains("roles/earthengine.viewer"),
+            "remediation message should include the role to grant"
+        );
+        assertTrue(
+            r.errorMessage().contains("ee-project"),
+            "remediation message should name the EE project"
+        );
+        assertTrue(
+            r.errorMessage().contains("Permission denied"),
+            "original EE body should still be preserved at the tail"
+        );
+    }
+
+    @Test
+    void classifyFailureAuthErrorWithoutSaUsesFallbackPhrase() {
+        TileCoordinate tile = new TileCoordinate(0, 0, 1, 1, 0, 0);
+        EeApiException root = new EeApiException(
+            403, tile.id(), "Permission denied: insufficient authentication scopes."
+        );
+        java.io.IOException wrapper = new java.io.IOException("retries exhausted", root);
+
+        com.datensee.FailedTileRecord r = TileFetchDoFn.classifyFailure(
+            tile, wrapper, null, "p"
+        );
+        assertEquals(EeErrorKind.AUTH_ERROR, r.errorKind());
+        assertTrue(
+            r.errorMessage().contains("Dataflow worker service account"),
+            "fallback phrase used when SA isn't discoverable"
+        );
     }
 }
