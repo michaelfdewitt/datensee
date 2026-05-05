@@ -9,8 +9,11 @@ from unittest.mock import patch
 import numpy as np
 
 from datensee.config import (
+    AffineTransform,
+    GridDimensions,
     OutputConfig,
     PipelineConfig,
+    PixelGrid,
     RunnerConfig,
     TileCoordinate,
     TileGrid,
@@ -32,20 +35,46 @@ from datensee.validation.tile_integrity import check_e01_tile_file_integrity, ti
 _DUMMY_EXPRESSION = json.dumps({"result": "0", "values": {"0": {"constantValue": 1}}})
 
 
+_TILE_SIZE = 64
+# Pixel size is 0.1°/64 px so each tile is 0.1° on a side — keeps the
+# legacy values intact while moving to integer-pixel offsets.
+_PIXEL_SIZE = 0.1 / _TILE_SIZE
+
+
+def _make_pixel_grid(rows: int, cols: int) -> PixelGrid:
+    return PixelGrid(
+        crs_code="EPSG:4326",
+        affine_transform=AffineTransform(
+            scale_x=_PIXEL_SIZE,
+            shear_x=0.0,
+            translate_x=0.0,
+            shear_y=0.0,
+            scale_y=-_PIXEL_SIZE,
+            # NW corner: y_max for the largest row index.
+            translate_y=rows * _TILE_SIZE * _PIXEL_SIZE,
+        ),
+        dimensions=GridDimensions(width=cols * _TILE_SIZE, height=rows * _TILE_SIZE),
+    )
+
+
 def _make_config(
     tiles: list[TileCoordinate],
     band_count: int = 1,
     data_type: str = "float32",
     output_path: str = "/tmp/test",
 ) -> PipelineConfig:
-    """Build a minimal PipelineConfig for testing."""
+    """Build a minimal PipelineConfig for testing.
+
+    Parent grid dimensions are inferred from the supplied tiles.
+    """
+    rows = max((t.row for t in tiles), default=0) + 1
+    cols = max((t.col for t in tiles), default=0) + 1
     return PipelineConfig(
         ee_expression=_DUMMY_EXPRESSION,
         gee_project="test-project",
         tile_grid=TileGrid(
-            crs="EPSG:4326",
-            scale_meters=30.0,
-            tile_size_pixels=64,
+            pixel_grid=_make_pixel_grid(rows, cols),
+            tile_size_pixels=_TILE_SIZE,
             tiles=tiles,
         ),
         output=OutputConfig(
@@ -58,16 +87,20 @@ def _make_config(
 
 
 def _make_tiles(rows: int, cols: int) -> list[TileCoordinate]:
-    """Generate a grid of tile coordinates."""
+    """Generate a grid of tile coordinates.
+
+    With NW-corner origin, ``row=0`` is the northernmost tile (smallest
+    ``row_px``) and tiles are laid out row-by-row going south.
+    """
     tiles = []
     for r in range(rows):
         for c in range(cols):
             tiles.append(
                 TileCoordinate(
-                    x_min=c * 0.1,
-                    y_min=r * 0.1,
-                    x_max=(c + 1) * 0.1,
-                    y_max=(r + 1) * 0.1,
+                    col_px=c * _TILE_SIZE,
+                    row_px=r * _TILE_SIZE,
+                    width_px=_TILE_SIZE,
+                    height_px=_TILE_SIZE,
                     row=r,
                     col=c,
                 )
@@ -79,6 +112,17 @@ def _write_fake_tiff(path: Path, size_bytes: int = 2048) -> None:
     """Write a file with TIFF magic bytes (little-endian) and padding."""
     data = b"II" + b"\x2a\x00" + b"\x00" * (size_bytes - 4)
     path.write_bytes(data)
+
+
+def _transform_for(
+    config: PipelineConfig, tile: TileCoordinate
+) -> tuple[float, float, float, float, float, float]:
+    """Build a (scaleX, shearX, txX, shearY, scaleY, txY) transform that
+    matches the tile's expected NW-corner CRS coordinates."""
+    from datensee.tiling import tile_bbox
+
+    x_min, _, _, y_max = tile_bbox(config.tile_grid.pixel_grid, tile)
+    return (_PIXEL_SIZE, 0.0, x_min, 0.0, -_PIXEL_SIZE, y_max)
 
 
 # ---------------------------------------------------------------------------
@@ -301,10 +345,13 @@ class TestE08FailureAccounting:
         for t in tiles[:2]:
             _write_fake_tiff(tmp_path / tile_filename(t))
 
-        ndjson = "\n".join(
-            json.dumps({"row": t.row, "col": t.col, "error_kind": "RATE_LIMITED"})
-            for t in tiles[2:]
-        ) + "\n"
+        ndjson = (
+            "\n".join(
+                json.dumps({"row": t.row, "col": t.col, "error_kind": "RATE_LIMITED"})
+                for t in tiles[2:]
+            )
+            + "\n"
+        )
         (tmp_path / "_failures.json").write_text(ndjson)
 
         result = check_e08_failure_accounting(tmp_path, config)
@@ -321,9 +368,7 @@ class TestE08FailureAccounting:
         # 3 tiles on disk, 1 valid failure, 1 corrupt trailing line.
         for t in tiles[:3]:
             _write_fake_tiff(tmp_path / tile_filename(t))
-        valid = json.dumps(
-            {"row": tiles[3].row, "col": tiles[3].col, "error_kind": "RATE_LIMITED"}
-        )
+        valid = json.dumps({"row": tiles[3].row, "col": tiles[3].col, "error_kind": "RATE_LIMITED"})
         (tmp_path / "_failures.json").write_text(valid + "\n{not valid json\n")
 
         result = check_e08_failure_accounting(tmp_path, config)
@@ -459,11 +504,11 @@ class TestValidationReport:
 
 class TestTileFilename:
     def test_format(self) -> None:
-        tile = TileCoordinate(x_min=0, y_min=0, x_max=1, y_max=1, row=3, col=12)
+        tile = TileCoordinate(col_px=0, row_px=0, width_px=1, height_px=1, row=3, col=12)
         assert tile_filename(tile) == "tile_r0003_c0012.tif"
 
     def test_zero_padded(self) -> None:
-        tile = TileCoordinate(x_min=0, y_min=0, x_max=1, y_max=1, row=0, col=0)
+        tile = TileCoordinate(col_px=0, row_px=0, width_px=1, height_px=1, row=0, col=0)
         assert tile_filename(tile) == "tile_r0000_c0000.tif"
 
 
@@ -548,7 +593,7 @@ class TestE03TileGeospatialMetadata:
         # Mock read_tiff_info to return matching metadata
         info = _make_tiff_info(
             crs="EPSG:4326",
-            transform=(0.1 / 64, 0, tile.x_min, 0, -0.1 / 64, tile.y_max),
+            transform=_transform_for(config, tile),
         )
         with patch("datensee.validation.spatial.read_tiff_info", return_value=info):
             result = check_e03_tile_geospatial_metadata(tmp_path, config, tiles)
@@ -565,7 +610,7 @@ class TestE03TileGeospatialMetadata:
 
         info = _make_tiff_info(
             crs="EPSG:32610",
-            transform=(0.1 / 64, 0, tile.x_min, 0, -0.1 / 64, tile.y_max),
+            transform=_transform_for(config, tile),
         )
         with patch("datensee.validation.spatial.read_tiff_info", return_value=info):
             result = check_e03_tile_geospatial_metadata(tmp_path, config, tiles)
@@ -581,10 +626,11 @@ class TestE03TileGeospatialMetadata:
         tile = tiles[0]
         _write_fake_tiff(tmp_path / tile_filename(tile))
 
-        # Origin is offset by 1.0 — clearly wrong
+        # Origin is offset by 1.0 in X — clearly wrong
+        sx, shx, tx, shy, sy, ty = _transform_for(config, tile)
         info = _make_tiff_info(
             crs="EPSG:4326",
-            transform=(0.1 / 64, 0, tile.x_min + 1.0, 0, -0.1 / 64, tile.y_max),
+            transform=(sx, shx, tx + 1.0, shy, sy, ty),
         )
         with patch("datensee.validation.spatial.read_tiff_info", return_value=info):
             result = check_e03_tile_geospatial_metadata(tmp_path, config, tiles)

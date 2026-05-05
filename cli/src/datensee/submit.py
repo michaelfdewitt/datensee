@@ -175,9 +175,7 @@ def _submit_local(
         if returncode != 0:
             tail = "\n".join(tail_lines).strip()
             summary = tail or f"exit {returncode} with no output"
-            raise RuntimeError(
-                f"datensee pipeline JVM failed (exit {returncode}):\n{summary}"
-            )
+            raise RuntimeError(f"datensee pipeline JVM failed (exit {returncode}):\n{summary}")
     finally:
         if token_fd is not None:
             try:
@@ -207,8 +205,7 @@ def _submit_dataflow(
         raise ValueError("Dataflow mode requires runner.dataflow config.")
     if not config.output.output_path.startswith("gs://"):
         raise ValueError(
-            f"Dataflow mode requires a GCS output path, got "
-            f"{config.output.output_path!r}."
+            f"Dataflow mode requires a GCS output path, got {config.output.output_path!r}."
         )
 
     df = config.runner.dataflow
@@ -319,9 +316,7 @@ def _materialize_access_token(credentials: Credentials) -> str:
             ) from exc
         token = credentials.token
     if not token:
-        raise RuntimeError(
-            "Caller-supplied credentials have no access token after refresh."
-        )
+        raise RuntimeError("Caller-supplied credentials have no access token after refresh.")
     return token
 
 
@@ -410,8 +405,7 @@ def _maybe_externalize_tiles(
         _upload_tiles_ndjson(config.tile_grid.tiles, tiles_file_path, credentials=credentials)
 
     new_grid = TileGrid(
-        crs=config.tile_grid.crs,
-        scale_meters=config.tile_grid.scale_meters,
+        pixel_grid=config.tile_grid.pixel_grid,
         tile_size_pixels=config.tile_grid.tile_size_pixels,
         tiles_file=tiles_file_path,
     )
@@ -562,15 +556,12 @@ def _launch_flex_template(
     response = httpx.post(url, json=payload, headers=headers, timeout=120.0)
     if response.status_code >= 400:
         raise RuntimeError(
-            f"Flex Template launch failed (HTTP {response.status_code}): "
-            f"{response.text.strip()}"
+            f"Flex Template launch failed (HTTP {response.status_code}): {response.text.strip()}"
         )
 
     body = response.json()
     job = body.get("job") or {}
     job_id = job.get("id")
     if not job_id:
-        raise RuntimeError(
-            f"Flex Template launch returned no job ID. Response body: {body!r}"
-        )
+        raise RuntimeError(f"Flex Template launch returned no job ID. Response body: {body!r}")
     return job_id

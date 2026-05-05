@@ -9,9 +9,12 @@ from __future__ import annotations
 from rich.panel import Panel
 
 from datensee.config import (
+    AffineTransform,
     DataflowRunnerConfig,
+    GridDimensions,
     OutputConfig,
     PipelineConfig,
+    PixelGrid,
     RateLimitConfig,
     RunnerConfig,
     TileCoordinate,
@@ -19,16 +22,46 @@ from datensee.config import (
 )
 from datensee.display import render_export_summary, render_post_run_summary
 
+_PIXEL_SIZE = 30.0 / 111_320.0
+_TILE_SIZE = 512
+
+
+def _pixel_grid(n_tiles_wide: int, n_tiles_tall: int = 1) -> PixelGrid:
+    return PixelGrid(
+        crs_code="EPSG:4326",
+        affine_transform=AffineTransform(
+            scale_x=_PIXEL_SIZE,
+            shear_x=0.0,
+            translate_x=0.0,
+            shear_y=0.0,
+            scale_y=-_PIXEL_SIZE,
+            translate_y=n_tiles_tall * _TILE_SIZE * _PIXEL_SIZE,
+        ),
+        dimensions=GridDimensions(
+            width=n_tiles_wide * _TILE_SIZE, height=n_tiles_tall * _TILE_SIZE
+        ),
+    )
+
 
 def _make_tiles(n: int) -> list[TileCoordinate]:
-    return [TileCoordinate(x_min=i, y_min=0, x_max=i + 1, y_max=1, row=0, col=i) for i in range(n)]
+    return [
+        TileCoordinate(
+            col_px=i * _TILE_SIZE,
+            row_px=0,
+            width_px=_TILE_SIZE,
+            height_px=_TILE_SIZE,
+            row=0,
+            col=i,
+        )
+        for i in range(n)
+    ]
 
 
 def _make_local_config() -> PipelineConfig:
     return PipelineConfig(
         ee_expression='{"result":"0","values":{"0":{"constantValue":1}}}',
         gee_project="test",
-        tile_grid=TileGrid(crs="EPSG:4326", scale_meters=30.0, tiles=_make_tiles(100)),
+        tile_grid=TileGrid(pixel_grid=_pixel_grid(100), tiles=_make_tiles(100)),
         output=OutputConfig(output_path="/tmp/output"),
         runner=RunnerConfig(mode="local"),
     )
@@ -38,7 +71,7 @@ def _make_dataflow_config() -> PipelineConfig:
     return PipelineConfig(
         ee_expression='{"result":"0","values":{"0":{"constantValue":1}}}',
         gee_project="test",
-        tile_grid=TileGrid(crs="EPSG:4326", scale_meters=30.0, tiles=_make_tiles(1000)),
+        tile_grid=TileGrid(pixel_grid=_pixel_grid(1000), tiles=_make_tiles(1000)),
         output=OutputConfig(output_path="gs://bucket/output"),
         runner=RunnerConfig(
             mode="dataflow",

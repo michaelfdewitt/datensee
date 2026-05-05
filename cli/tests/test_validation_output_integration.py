@@ -20,7 +20,7 @@ import pytest
 
 from datensee.auth import get_access_token
 from datensee.config import OutputConfig, PipelineConfig, RunnerConfig
-from datensee.tiling import decompose_region
+from datensee.tiling import decompose_region, tile_bbox
 from datensee.validation import CheckID, CheckStatus, validate_output
 from datensee.validation.reference import _build_hv_request
 
@@ -106,7 +106,7 @@ def real_output(gee_project: str, access_token: str) -> tuple[Path, PipelineConf
         for tile in grid.tiles:
             body = _build_hv_request(
                 config.ee_expression,
-                (tile.x_min, tile.y_min, tile.x_max, tile.y_max),
+                tile_bbox(grid.pixel_grid, tile),
                 grid.tile_size_pixels,
                 grid.crs,
                 file_format="GEO_TIFF",
@@ -124,11 +124,6 @@ def real_output(gee_project: str, access_token: str) -> tuple[Path, PipelineConf
 
             tile_path = output_dir / f"tile_r{tile.row:04d}_c{tile.col:04d}.tif"
             tile_path.write_bytes(resp.content)
-
-    # Also write VRT
-    from datensee.assemble import write_vrt
-
-    write_vrt(config, output_dir)
 
     return output_dir, config
 

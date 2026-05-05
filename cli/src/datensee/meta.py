@@ -8,14 +8,16 @@ old code didn't actually verify this. A user who ran an export at
 different output grid than the COGs already on disk.
 
 To close that gap we persist the immutable shape of every export to
-``{output}/_export_meta.json``: CRS, scale, tile sizes, project, and
-the full EE expression. ``api.retry()`` reads this sidecar before
-submitting and refuses to proceed if the user passes args that disagree
-with it. With the sidecar present, retry needs no shape args at all —
-the user can run ``datensee retry --output PATH`` and the meta supplies
-everything else. The sidecar is informational-only: deleting it
-bypasses the check, for the rare case where a caller knows they're
-doing something the schema doesn't capture.
+``{output}/_export_meta.json``: CRS, scale, tile sizes, project, the full
+EE expression, and the parent :class:`PixelGrid`. ``api.retry()`` reads
+this sidecar before submitting and refuses to proceed if the user passes
+args that disagree with it. With the sidecar present, retry needs no
+shape args at all — the user can run ``datensee retry --output PATH`` and
+the meta supplies everything else (including the parent grid that
+``col_px``/``row_px`` in the journal records are anchored to). The
+sidecar is informational-only: deleting it bypasses the check, for the
+rare case where a caller knows they're doing something the schema
+doesn't capture.
 """
 
 from __future__ import annotations
@@ -25,6 +27,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
+
+from datensee.config import PixelGrid
 
 if TYPE_CHECKING:
     from google.auth.credentials import Credentials
@@ -40,6 +44,14 @@ class ExportMeta(BaseModel):
     user re-supplying it. The expression is stored as the user
     originally provided it (pre-clip), since that's what the retry CLI
     receives — see ``api.export()`` for the snapshot point.
+
+    ``pixel_grid`` carries the parent grid produced by the original
+    export's ``decompose_region`` call. Retry needs it because tile
+    ``col_px``/``row_px`` in the failures journal are *local* offsets
+    into this grid; without it we can't reconstruct CRS coordinates.
+    Legacy meta written before M11 has ``pixel_grid=None``; retry falls
+    back to a translate=0 grid in that case (best-effort — only correct
+    for exports whose snapped bbox happened to start at the origin).
     """
 
     schema_version: int = 1
@@ -50,6 +62,7 @@ class ExportMeta(BaseModel):
     gee_project: str
     ee_expression: str
     snapshot_time: int | None = None
+    pixel_grid: PixelGrid | None = None
 
     @property
     def ee_expression_sha256(self) -> str:
@@ -74,6 +87,7 @@ def build_meta(
     gee_project: str,
     ee_expression: str,
     snapshot_time: int | None = None,
+    pixel_grid: PixelGrid | None = None,
 ) -> ExportMeta:
     return ExportMeta(
         crs=crs,
@@ -83,6 +97,7 @@ def build_meta(
         gee_project=gee_project,
         ee_expression=ee_expression,
         snapshot_time=snapshot_time,
+        pixel_grid=pixel_grid,
     )
 
 
@@ -94,9 +109,7 @@ def _gcs_blob(output_path: str, credentials: Credentials | None):
     gs_uri = output_path[len("gs://") :]
     bucket_name, _, prefix = gs_uri.partition("/")
     prefix = prefix.rstrip("/")
-    blob_name = (
-        f"{prefix}/{EXPORT_META_FILENAME}" if prefix else EXPORT_META_FILENAME
-    )
+    blob_name = f"{prefix}/{EXPORT_META_FILENAME}" if prefix else EXPORT_META_FILENAME
     return client.bucket(bucket_name).blob(blob_name)
 
 
@@ -155,13 +168,10 @@ def verify_retry_compatibility(
     if meta.crs != crs:
         mismatches.append(f"crs: original={meta.crs!r}, retry={crs!r}")
     if meta.scale_meters != scale_meters:
-        mismatches.append(
-            f"scale_meters: original={meta.scale_meters}, retry={scale_meters}"
-        )
+        mismatches.append(f"scale_meters: original={meta.scale_meters}, retry={scale_meters}")
     if meta.tile_size_pixels != tile_size_pixels:
         mismatches.append(
-            f"tile_size_pixels: original={meta.tile_size_pixels}, "
-            f"retry={tile_size_pixels}"
+            f"tile_size_pixels: original={meta.tile_size_pixels}, retry={tile_size_pixels}"
         )
     if meta.output_tile_size_pixels != output_tile_size_pixels:
         mismatches.append(
@@ -169,15 +179,12 @@ def verify_retry_compatibility(
             f"retry={output_tile_size_pixels}"
         )
     if meta.gee_project != gee_project:
-        mismatches.append(
-            f"gee_project: original={meta.gee_project!r}, retry={gee_project!r}"
-        )
+        mismatches.append(f"gee_project: original={meta.gee_project!r}, retry={gee_project!r}")
     if meta.ee_expression != ee_expression:
         meta_hash = meta.ee_expression_sha256
         retry_hash = _hash_expression(ee_expression)
         mismatches.append(
-            f"ee_expression: original sha256={meta_hash[:16]}…, "
-            f"retry sha256={retry_hash[:16]}…"
+            f"ee_expression: original sha256={meta_hash[:16]}…, retry sha256={retry_hash[:16]}…"
         )
     if mismatches:
         bullets = "\n  - ".join(mismatches)

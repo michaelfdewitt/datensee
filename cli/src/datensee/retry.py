@@ -29,28 +29,26 @@ from datensee.config import TileCoordinate
 
 # Quadrant index → (x_low, y_low) flags.
 # 0=x_low/y_low, 1=x_high/y_low, 2=x_low/y_high, 3=x_high/y_high.
-# Defined in bbox terms (not compass directions) so the encoding is
-# stable across CRS axis orientations.
+# Defined in CRS bbox terms (not compass directions) so the encoding is
+# stable across CRS axis orientations. Note that "y-low" means smaller CRS
+# y, which — given our NW-corner pixel convention with negative scale_y —
+# maps to *larger* row_px in pixel space.
 _QUADRANT_BBOX_FLAGS: dict[int, tuple[bool, bool]] = {
-    0: (True, True),    # x-low / y-low
-    1: (False, True),   # x-high / y-low
-    2: (True, False),   # x-low / y-high
+    0: (True, True),  # x-low / y-low
+    1: (False, True),  # x-high / y-low
+    2: (True, False),  # x-low / y-high
     3: (False, False),  # x-high / y-high
 }
 
 # Kinds that should trigger a quadtree split. Keep this set conservative
 # — adding a kind here can cause cascades on transient infra failures.
-SPLIT_ELIGIBLE_KINDS: frozenset[str] = frozenset(
-    {"MEMORY_EXCEEDED", "COMPUTATION_TIMEOUT"}
-)
+SPLIT_ELIGIBLE_KINDS: frozenset[str] = frozenset({"MEMORY_EXCEEDED", "COMPUTATION_TIMEOUT"})
 
 # Kinds where we retry the same bbox after backoff. The pipeline already
 # does its own per-attempt retry within a single fetch; this set is for
 # tiles that exhausted that internal retry budget, where a fresh round
 # (different worker, possibly different time) might succeed.
-RETRY_SAME_KINDS: frozenset[str] = frozenset(
-    {"RATE_LIMITED", "RETRYABLE_SERVER", "UNKNOWN"}
-)
+RETRY_SAME_KINDS: frozenset[str] = frozenset({"RATE_LIMITED", "RETRYABLE_SERVER", "UNKNOWN"})
 
 # Kinds we never retry — surface them to the user instead.
 TERMINAL_KINDS: frozenset[str] = frozenset({"AUTH_ERROR", "FATAL_REQUEST"})
@@ -110,7 +108,7 @@ def _parse_record(line: str) -> dict:
         record = json.loads(line)
     except json.JSONDecodeError as exc:
         raise JournalParseError(f"invalid JSON: {exc}") from exc
-    for required in ("x_min", "y_min", "x_max", "y_max", "row", "col"):
+    for required in ("col_px", "row_px", "width_px", "height_px", "row", "col"):
         if required not in record:
             raise JournalParseError(f"missing required field {required!r}: {line[:120]}")
     return record
@@ -119,10 +117,10 @@ def _parse_record(line: str) -> dict:
 def _record_to_tile(record: dict) -> TileCoordinate:
     """Reconstruct a TileCoordinate from a journal entry's TileCoordinate-shaped fields."""
     return TileCoordinate(
-        x_min=float(record["x_min"]),
-        y_min=float(record["y_min"]),
-        x_max=float(record["x_max"]),
-        y_max=float(record["y_max"]),
+        col_px=int(record["col_px"]),
+        row_px=int(record["row_px"]),
+        width_px=int(record["width_px"]),
+        height_px=int(record["height_px"]),
         row=int(record["row"]),
         col=int(record["col"]),
         out_row=int(record.get("out_row", record["row"])),
@@ -139,24 +137,35 @@ def split_tile(
     Children inherit ``(row, col, out_row, out_col)`` from the parent —
     they belong to the same output tile and the same root compute tile.
     Each child's lineage extends the parent's by one quadrant index.
-    Bbox math is in CRS units so the encoding is independent of axis
-    orientation: quadrant 0 is the x-low / y-low corner, etc.
+
+    Pixel math is integer; quadrant indexing is in bbox terms (so it's
+    independent of CRS axis orientation). ``row_px`` counts downward
+    (rows increase southward), so ``y-low`` (smaller CRS y) maps to a
+    *larger* ``row_px``. Halving requires even ``width_px``/``height_px``;
+    callers feed root tiles whose dimensions are powers of two.
     """
-    x_mid = (parent.x_min + parent.x_max) / 2.0
-    y_mid = (parent.y_min + parent.y_max) / 2.0
+    if parent.width_px % 2 != 0 or parent.height_px % 2 != 0:
+        raise ValueError(
+            f"split_tile requires even width_px and height_px (got "
+            f"width_px={parent.width_px}, height_px={parent.height_px})."
+        )
+    half_w = parent.width_px // 2
+    half_h = parent.height_px // 2
+    mid_col_px = parent.col_px + half_w
+    mid_row_px = parent.row_px + half_h
+
     children = []
     for q in range(4):
         x_low, y_low = _QUADRANT_BBOX_FLAGS[q]
-        x_min = parent.x_min if x_low else x_mid
-        x_max = x_mid if x_low else parent.x_max
-        y_min = parent.y_min if y_low else y_mid
-        y_max = y_mid if y_low else parent.y_max
+        col_px = parent.col_px if x_low else mid_col_px
+        # y-low = smaller CRS y = larger row_px (rows count downward).
+        row_px = mid_row_px if y_low else parent.row_px
         children.append(
             TileCoordinate(
-                x_min=x_min,
-                y_min=y_min,
-                x_max=x_max,
-                y_max=y_max,
+                col_px=col_px,
+                row_px=row_px,
+                width_px=half_w,
+                height_px=half_h,
                 row=parent.row,
                 col=parent.col,
                 out_row=parent.out_row,

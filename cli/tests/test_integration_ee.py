@@ -27,7 +27,7 @@ import numpy as np
 import pytest
 
 from datensee.auth import get_access_token
-from datensee.tiling import _pixel_sizes_native, decompose_region
+from datensee.tiling import _pixel_size_native, decompose_region, tile_bbox
 
 HV_ENDPOINT = (
     "https://earthengine-highvolume.googleapis.com/v1/projects/{project}/image:computePixels"
@@ -469,7 +469,7 @@ class TestTilingAndFetch:
         for tile in grid.tiles:
             body = _build_hv_request(
                 _srtm_elevation_expression(),
-                tile_bounds=(tile.x_min, tile.y_min, tile.x_max, tile.y_max),
+                tile_bounds=tile_bbox(grid.pixel_grid, tile),
                 tile_size=grid.tile_size_pixels,
                 crs=grid.crs,
             )
@@ -494,7 +494,7 @@ class TestTilingAndFetch:
         for tile in grid.tiles:
             body = _build_hv_request(
                 _srtm_slope_expression(),
-                tile_bounds=(tile.x_min, tile.y_min, tile.x_max, tile.y_max),
+                tile_bounds=tile_bbox(grid.pixel_grid, tile),
                 tile_size=grid.tile_size_pixels,
                 crs=grid.crs,
             )
@@ -514,7 +514,7 @@ class TestTilingAndFetch:
         for tile in grid.tiles:
             body = _build_hv_request(
                 _srtm_multiband_expression(),
-                tile_bounds=(tile.x_min, tile.y_min, tile.x_max, tile.y_max),
+                tile_bounds=tile_bbox(grid.pixel_grid, tile),
                 tile_size=grid.tile_size_pixels,
                 crs=grid.crs,
             )
@@ -541,6 +541,7 @@ class TestHighVolumeBatch:
         token: str,
         expression: str,
         grid_crs: str,
+        parent_pixel_grid: Any,
         tiles: list,
         tile_size: int,
         max_workers: int = 16,
@@ -554,7 +555,7 @@ class TestHighVolumeBatch:
         def fetch_one(tile: Any) -> tuple[int, str]:
             body = _build_hv_request(
                 expression,
-                tile_bounds=(tile.x_min, tile.y_min, tile.x_max, tile.y_max),
+                tile_bounds=tile_bbox(parent_pixel_grid, tile),
                 tile_size=tile_size,
                 crs=grid_crs,
             )
@@ -599,6 +600,7 @@ class TestHighVolumeBatch:
             access_token,
             _srtm_elevation_expression(),
             grid.crs,
+            grid.pixel_grid,
             tiles,
             grid.tile_size_pixels,
             max_workers=16,
@@ -632,6 +634,7 @@ class TestHighVolumeBatch:
             access_token,
             _srtm_multiband_expression(),
             grid.crs,
+            grid.pixel_grid,
             tiles,
             grid.tile_size_pixels,
             max_workers=16,
@@ -665,6 +668,7 @@ class TestHighVolumeBatch:
             access_token,
             _srtm_slope_expression(),
             grid.crs,
+            grid.pixel_grid,
             tiles,
             grid.tile_size_pixels,
             max_workers=16,
@@ -709,7 +713,7 @@ class TestEndToEndConfigRoundtrip:
         for tile in config.tile_grid.tiles:
             body = _build_hv_request(
                 config.ee_expression,
-                tile_bounds=(tile.x_min, tile.y_min, tile.x_max, tile.y_max),
+                tile_bounds=tile_bbox(grid.pixel_grid, tile),
                 tile_size=config.tile_grid.tile_size_pixels,
                 crs=config.tile_grid.crs,
             )
@@ -745,7 +749,7 @@ class TestEndToEndConfigRoundtrip:
         for tile in config.tile_grid.tiles:
             body = _build_hv_request(
                 config.ee_expression,
-                tile_bounds=(tile.x_min, tile.y_min, tile.x_max, tile.y_max),
+                tile_bounds=tile_bbox(grid.pixel_grid, tile),
                 tile_size=config.tile_grid.tile_size_pixels,
                 crs=config.tile_grid.crs,
             )
@@ -790,7 +794,7 @@ class TestEndToEndConfigRoundtrip:
         for tile in restored.tile_grid.tiles:
             body = _build_hv_request(
                 restored.ee_expression,
-                tile_bounds=(tile.x_min, tile.y_min, tile.x_max, tile.y_max),
+                tile_bounds=tile_bbox(restored.tile_grid.pixel_grid, tile),
                 tile_size=restored.tile_grid.tile_size_pixels,
                 crs=restored.tile_grid.crs,
             )
@@ -856,11 +860,10 @@ class TestPixelAlignment:
         `shift_pixels` in the x direction (easting) and compare pixels
         in the overlap area.
         """
-        # Sierra Nevada / SF Bay are both ~37–38° N — close enough that a
-        # single centroid-lat call is fine for the shift-and-compare math
-        # that follows. The X pixel size is the one that matters here
-        # because the shift is applied in the easting direction.
-        pixel_native_x, _ = _pixel_sizes_native(crs, scale_meters, centroid_lat_deg=37.5)
+        # M11: pixel size is single-axis and latitude-independent — for
+        # geographic CRSs we go through the equator constant; for projected
+        # CRSs scale_meters is the literal pixel size in CRS units.
+        pixel_native_x = _pixel_size_native(crs, scale_meters)
         shift_native = shift_pixels * pixel_native_x
 
         # Two overlapping WGS84 regions. The shift is applied in native
@@ -915,25 +918,29 @@ class TestPixelAlignment:
             region_b, scale_meters=scale_meters, crs=crs, tile_size_pixels=tile_size_pixels
         )
 
-        # Find tiles present in both grids (same snapped origin).
-        origins_a = {(round(t.x_min, 6), round(t.y_min, 6)): t for t in grid_a.tiles}
-        origins_b = {(round(t.x_min, 6), round(t.y_min, 6)): t for t in grid_b.tiles}
-        shared_origins = set(origins_a.keys()) & set(origins_b.keys())
-        assert len(shared_origins) > 0, (
+        # Find tiles present in both grids (same snapped CRS origin). Tile
+        # offsets are local to each parent grid, so we have to compose with
+        # the parent's translate to get an absolute identifier.
+        bbox_a = {tile_bbox(grid_a.pixel_grid, t): t for t in grid_a.tiles}
+        bbox_b = {tile_bbox(grid_b.pixel_grid, t): t for t in grid_b.tiles}
+        # Round to 6 decimals so floating-point round-trips don't fail an
+        # otherwise-perfect snap.
+        keys_a = {tuple(round(v, 6) for v in k): t for k, t in bbox_a.items()}
+        keys_b = {tuple(round(v, 6) for v in k): t for k, t in bbox_b.items()}
+        shared = set(keys_a.keys()) & set(keys_b.keys())
+        assert len(shared) > 0, (
             f"No shared tiles between original and shifted grids. "
             f"Grid A has {len(grid_a.tiles)} tiles, grid B has {len(grid_b.tiles)} tiles."
         )
 
         # Pick a shared tile and fetch it from both grids.
-        origin = sorted(shared_origins)[0]
-        tile_a = origins_a[origin]
-        tile_b = origins_b[origin]
-
-        # Verify the tile coordinates are identical.
-        assert abs(tile_a.x_min - tile_b.x_min) < 1e-6
-        assert abs(tile_a.y_min - tile_b.y_min) < 1e-6
-        assert abs(tile_a.x_max - tile_b.x_max) < 1e-6
-        assert abs(tile_a.y_max - tile_b.y_max) < 1e-6
+        key = sorted(shared)[0]
+        tile_a = keys_a[key]
+        tile_b = keys_b[key]
+        bounds_a = tile_bbox(grid_a.pixel_grid, tile_a)
+        bounds_b = tile_bbox(grid_b.pixel_grid, tile_b)
+        for v_a, v_b in zip(bounds_a, bounds_b, strict=True):
+            assert abs(v_a - v_b) < 1e-6
 
         # Fetch the same tile from both grids — should be pixel-identical.
         pixels_a = _fetch_tile_as_numpy(
@@ -941,7 +948,7 @@ class TestPixelAlignment:
             project,
             token,
             expression,
-            (tile_a.x_min, tile_a.y_min, tile_a.x_max, tile_a.y_max),
+            bounds_a,
             tile_size_pixels,
             crs,
         )
@@ -950,7 +957,7 @@ class TestPixelAlignment:
             project,
             token,
             expression,
-            (tile_b.x_min, tile_b.y_min, tile_b.x_max, tile_b.y_max),
+            bounds_b,
             tile_size_pixels,
             crs,
         )
@@ -962,7 +969,7 @@ class TestPixelAlignment:
             pixels_a,
             pixels_b,
             err_msg=(
-                f"Pixel mismatch in shared tile at origin {origin}. "
+                f"Pixel mismatch in shared tile with bbox {bounds_a}. "
                 f"This means the grid is not snapped to a global origin — "
                 f"shifting the region by {shift_pixels}px produced different "
                 f"pixel values for the same geographic location."

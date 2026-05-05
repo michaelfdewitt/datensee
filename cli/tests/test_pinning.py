@@ -58,9 +58,7 @@ def test_pins_image_collection_load() -> None:
 
 
 def test_pins_collection_load_table() -> None:
-    expression = _wrap(
-        _load_node("Collection.loadTable", tableId="USDOS/LSIB_SIMPLE/2017")
-    )
+    expression = _wrap(_load_node("Collection.loadTable", tableId="USDOS/LSIB_SIMPLE/2017"))
     pinned = pin_expression(expression, T)
     assert _invocation(pinned)["arguments"]["version"] == {"constantValue": T}
 
@@ -86,14 +84,10 @@ def test_pinning_is_idempotent() -> None:
 def test_existing_version_arg_is_preserved() -> None:
     user_pinned_T = 1_500_000_000_000_000_000
     node = _load_node("Image.load", id="USGS/SRTMGL1_003")
-    node["functionInvocationValue"]["arguments"]["version"] = {
-        "constantValue": user_pinned_T
-    }
+    node["functionInvocationValue"]["arguments"]["version"] = {"constantValue": user_pinned_T}
     expression = _wrap(node)
     pinned = pin_expression(expression, T)
-    assert _invocation(pinned)["arguments"]["version"] == {
-        "constantValue": user_pinned_T
-    }
+    assert _invocation(pinned)["arguments"]["version"] == {"constantValue": user_pinned_T}
 
 
 # ---------------------------------------------------------------------------
@@ -162,12 +156,8 @@ def test_flat_form_with_multiple_top_level_values() -> None:
     )
     pinned = pin_expression(flat, T)
     values = _values(pinned)
-    assert values["0"]["functionInvocationValue"]["arguments"]["version"] == {
-        "constantValue": T
-    }
-    assert values["1"]["functionInvocationValue"]["arguments"]["version"] == {
-        "constantValue": T
-    }
+    assert values["0"]["functionInvocationValue"]["arguments"]["version"] == {"constantValue": T}
+    assert values["1"]["functionInvocationValue"]["arguments"]["version"] == {"constantValue": T}
 
 
 # ---------------------------------------------------------------------------
@@ -200,9 +190,7 @@ def test_run_bigquery_with_for_system_time_passes() -> None:
         "SELECT geom, value FROM proj.ds.tbl "
         "FOR SYSTEM_TIME AS OF TIMESTAMP('2026-04-30T00:00:00Z')"
     )
-    expression = _wrap(
-        _load_node("FeatureCollection.runBigQuery", query=sql)
-    )
+    expression = _wrap(_load_node("FeatureCollection.runBigQuery", query=sql))
     # Must not raise — the user's SQL already pins.
     pinned = pin_expression(expression, T)
     # Query should pass through unchanged.
@@ -211,9 +199,7 @@ def test_run_bigquery_with_for_system_time_passes() -> None:
 
 def test_run_bigquery_match_is_case_insensitive() -> None:
     sql = "select * from proj.ds.tbl for system_time as of timestamp('2026-04-30')"
-    expression = _wrap(
-        _load_node("FeatureCollection.runBigQuery", query=sql)
-    )
+    expression = _wrap(_load_node("FeatureCollection.runBigQuery", query=sql))
     pin_expression(expression, T)  # must not raise
 
 

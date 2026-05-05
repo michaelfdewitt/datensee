@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 
 from datensee.config import PipelineConfig, TileCoordinate
+from datensee.tiling import tile_bbox
 from datensee.validation.catalog import CheckID
 from datensee.validation.report import CheckResult, CheckStatus
 from datensee.validation.tiff import read_tiff_info, read_tiff_pixels
@@ -29,9 +30,10 @@ def check_e03_tile_geospatial_metadata(
 
     For each sampled tile, the GeoTIFF's CRS must match the config CRS,
     and the affine transform origin (translateX, translateY) must correspond
-    to (tile.x_min, tile.y_max) — top-left corner in geographic convention.
+    to the tile's NW corner — derived from ``parent_pixel_grid × tile_offsets``.
     """
     expected_crs = config.tile_grid.crs
+    parent_grid = config.tile_grid.pixel_grid
     failures: list[dict[str, object]] = []
     checked = 0
 
@@ -54,15 +56,17 @@ def check_e03_tile_geospatial_metadata(
             if not _crs_matches(info.crs, expected_crs):
                 issues.append(f"CRS '{info.crs}' != expected '{expected_crs}'")
 
-        # Affine origin check: transform = (scaleX, shearX, translateX, shearY, scaleY, translateY)
-        # translateX should be tile.x_min, translateY should be tile.y_max
+        x_min, _, _, y_max = tile_bbox(parent_grid, tile)
+
+        # Affine origin check: transform = (scaleX, shearX, translateX, shearY, scaleY, translateY).
+        # translateX should be the tile's x_min, translateY its y_max (NW corner).
         if info.transform is not None:
-            tx = info.transform[2]  # translateX = origin X = x_min
-            ty = info.transform[5]  # translateY = origin Y = y_max
-            if abs(tx - tile.x_min) > _ORIGIN_TOLERANCE:
-                issues.append(f"origin X {tx} != tile x_min {tile.x_min}")
-            if abs(ty - tile.y_max) > _ORIGIN_TOLERANCE:
-                issues.append(f"origin Y {ty} != tile y_max {tile.y_max}")
+            tx = info.transform[2]
+            ty = info.transform[5]
+            if abs(tx - x_min) > _ORIGIN_TOLERANCE:
+                issues.append(f"origin X {tx} != tile x_min {x_min}")
+            if abs(ty - y_max) > _ORIGIN_TOLERANCE:
+                issues.append(f"origin Y {ty} != tile y_max {y_max}")
 
         if issues:
             failures.append({"tile": tile_filename(tile), "issues": issues})
@@ -135,7 +139,7 @@ def check_e04_boundary_continuity(
     discontinuities: list[dict[str, object]] = []
 
     for tile in sampled_tiles:
-        # Check right neighbor
+        # Check east neighbor (col + 1).
         right = by_pos.get((tile.row, tile.col + 1))
         if right:
             result = _check_edge(output_dir, tile, right, edge="vertical", config=config)
@@ -144,10 +148,11 @@ def check_e04_boundary_continuity(
                 if result["mad"] > threshold:
                     discontinuities.append(result)
 
-        # Check top neighbor (row + 1 = north in our grid convention)
-        top = by_pos.get((tile.row + 1, tile.col))
-        if top:
-            result = _check_edge(output_dir, tile, top, edge="horizontal", config=config)
+        # Check south neighbor (row + 1, since row 0 is the northernmost
+        # tile and row counts downward in our raster convention).
+        below = by_pos.get((tile.row + 1, tile.col))
+        if below:
+            result = _check_edge(output_dir, tile, below, edge="horizontal", config=config)
             if result is not None:
                 pairs_checked += 1
                 if result["mad"] > threshold:
@@ -203,16 +208,15 @@ def _check_edge(
         return None
 
     if edge == "vertical":
-        # Right edge of A vs left edge of B
+        # Right edge of A (west tile) vs left edge of B (east tile).
         edge_a = pixels_a[:, -1].astype(np.float64)
         edge_b = pixels_b[:, 0].astype(np.float64)
     else:
-        # Top edge of A vs bottom edge of B
-        # Our grid: row increases northward; in raster space, row 0 is top.
-        # tile_a is the southern tile, tile_b is the northern tile.
-        # Southern tile's top row (raster row 0) vs northern tile's bottom row.
-        edge_a = pixels_a[0, :].astype(np.float64)
-        edge_b = pixels_b[-1, :].astype(np.float64)
+        # Row 0 in our grid is the northernmost tile, rows count downward.
+        # tile_a is the northern tile, tile_b the southern tile (row+1).
+        # tile_a's bottom raster row (south edge) abuts tile_b's top row.
+        edge_a = pixels_a[-1, :].astype(np.float64)
+        edge_b = pixels_b[0, :].astype(np.float64)
 
     # Mask NaN values
     valid = ~(np.isnan(edge_a) | np.isnan(edge_b))
@@ -227,5 +231,3 @@ def _check_edge(
         "edge": edge,
         "mad": round(mad, 4),
     }
-
-

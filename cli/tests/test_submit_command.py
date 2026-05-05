@@ -7,9 +7,12 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from datensee.config import (
+    AffineTransform,
     DataflowRunnerConfig,
+    GridDimensions,
     OutputConfig,
     PipelineConfig,
+    PixelGrid,
     RunnerConfig,
     TileCoordinate,
     TileGrid,
@@ -26,9 +29,28 @@ def _config(runner: RunnerConfig) -> PipelineConfig:
         ee_expression='{"result":"0","values":{}}',
         gee_project="my-gcp-project",
         tile_grid=TileGrid(
-            crs="EPSG:4326",
-            scale_meters=30.0,
-            tiles=[TileCoordinate(x_min=0, y_min=0, x_max=1, y_max=1, row=0, col=0)],
+            pixel_grid=PixelGrid(
+                crs_code="EPSG:4326",
+                affine_transform=AffineTransform(
+                    scale_x=1.0,
+                    shear_x=0.0,
+                    translate_x=0.0,
+                    shear_y=0.0,
+                    scale_y=-1.0,
+                    translate_y=1.0,
+                ),
+                dimensions=GridDimensions(width=1, height=1),
+            ),
+            tiles=[
+                TileCoordinate(
+                    col_px=0,
+                    row_px=0,
+                    width_px=1,
+                    height_px=1,
+                    row=0,
+                    col=0,
+                )
+            ],
         ),
         output=OutputConfig(output_path="gs://my-bucket/exports/test"),
         runner=runner,

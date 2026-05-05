@@ -2,6 +2,17 @@
 
 This module defines the contract between the Python CLI and the Java Beam pipeline.
 The serialized form matches pipeline-config.schema.json in /contract.
+
+The canonical export shape is :class:`PixelGrid` — CRS code + 6-tuple affine
+transform + integer dimensions. It mirrors Earth Engine's own ``PixelGrid``
+type so the parent grid (and per-tile sub-grids derived from it) can be sent
+verbatim to the HV ``computePixels`` endpoint.
+
+Tile geometry inside the export is integer pixel rectangles
+(``col_px``/``row_px``/``width_px``/``height_px``) within that parent grid.
+Float bboxes are derived from ``transform × pixel_offsets`` — never persisted —
+so cross-export grid alignment is unconditional whenever two exports share
+the same CRS, scale, and tile size.
 """
 
 from __future__ import annotations
@@ -22,31 +33,74 @@ _BYTES_PER_PIXEL: dict[str, int] = {
 }
 
 
-class TileCoordinate(BaseModel):
-    """A single compute tile's bounding box in the target CRS.
+class GridDimensions(BaseModel):
+    """Pixel dimensions of a grid (mirrors EE's ``GridDimensions``)."""
 
-    `row` and `col` are the compute-tile indices within the export bbox
-    and stay pinned to the *root* compute tile — they do not change when
-    a tile is split adaptively. `out_row` / `out_col` (M6 two-tier
-    tiling) identify the output tile this compute tile belongs to;
-    when two-tier tiling is disabled they equal `row` and `col`.
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
 
-    `lineage` (adaptive quadtree retry — sketch only at present) records
-    the path from the root compute tile down to a sub-tile. Each entry
-    is a quadrant index 0–3, layout-independent of CRS axis order:
-    ``0=x-low/y-low, 1=x-high/y-low, 2=x-low/y-high, 3=x-high/y-high``.
-    Empty list = root compute tile (the common case). Lineage is
-    informational on the success path — the bounding box is the
-    geometric truth the assembler keys on; lineage exists for the
-    failure-journal / retry-decision logic.
+
+class AffineTransform(BaseModel):
+    """6-tuple geo-affine in the EE / GDAL / GeoTIFF convention.
+
+    For axis-aligned grids (always, in our use), ``shear_x`` and ``shear_y``
+    are zero, ``scale_x`` is positive, and ``scale_y`` is **negative** —
+    that puts ``(translate_x, translate_y)`` at the NW corner of the
+    top-left pixel (PixelIsArea: pixel ``(u=0, v=0)`` is the *corner*,
+    not the centre).
     """
 
-    x_min: float
-    y_min: float
-    x_max: float
-    y_max: float
-    row: int
-    col: int
+    scale_x: float
+    shear_x: float = 0.0
+    translate_x: float
+    shear_y: float = 0.0
+    scale_y: float
+    translate_y: float
+
+
+class PixelGrid(BaseModel):
+    """Canonical export grid: CRS + affine + integer dimensions.
+
+    Sent verbatim to EE's ``computePixels`` endpoint at fetch time.
+    """
+
+    crs_code: str = Field(description="EPSG code or proj string, e.g. 'EPSG:4326'")
+    affine_transform: AffineTransform
+    dimensions: GridDimensions
+
+
+class TileCoordinate(BaseModel):
+    """A compute tile as an integer pixel rectangle inside the parent grid.
+
+    ``col_px``/``row_px`` are **local** offsets from the parent grid's
+    ``translate_x``/``translate_y`` — not absolute against a global ``(0, 0)``.
+    The parent's translate already encodes where the export sits in CRS units;
+    tile offsets within it are small. ``width_px``/``height_px`` are the tile's
+    own pixel dimensions; for root tiles they equal ``tile_size_pixels``, and
+    quadtree split children halve each axis.
+
+    ``row`` and ``col`` are the compute-tile indices within the export bbox
+    (row=0 is the northernmost tile, col=0 the westernmost). They stay pinned
+    to the *root* compute tile — split children inherit them so the failure
+    journal can attribute children to the parent that originated them.
+
+    ``out_row``/``out_col`` (M6 two-tier tiling) identify the output tile this
+    compute tile belongs to. When two-tier mode is disabled they equal
+    ``row``/``col``.
+
+    ``lineage`` records the quadtree path from the root compute tile down to a
+    sub-tile. Each entry is a quadrant index 0–3, layout-independent of CRS
+    axis order: ``0=x-low/y-low``, ``1=x-high/y-low``, ``2=x-low/y-high``,
+    ``3=x-high/y-high``. Empty list = root compute tile. Lineage exists for
+    the failure-journal / retry-decision logic.
+    """
+
+    col_px: int = Field(ge=0)
+    row_px: int = Field(ge=0)
+    width_px: int = Field(gt=0)
+    height_px: int = Field(gt=0)
+    row: int = 0
+    col: int = 0
     out_row: int = 0
     out_col: int = 0
     lineage: list[int] = Field(
@@ -56,10 +110,13 @@ class TileCoordinate(BaseModel):
 
 
 class TileGrid(BaseModel):
-    """Tile decomposition of the export region."""
+    """Tile decomposition of the export region.
 
-    crs: str = Field(description="EPSG code or proj string, e.g. 'EPSG:4326'")
-    scale_meters: float = Field(gt=0, description="Pixel size in meters at the native CRS")
+    Carries the parent :class:`PixelGrid` plus the tile size and either inline
+    tiles or a path to an NDJSON tile file.
+    """
+
+    pixel_grid: PixelGrid
     tile_size_pixels: int = Field(default=512, gt=0, description="Tile edge length in pixels")
     tiles: list[TileCoordinate] | None = Field(
         default=None,
@@ -69,6 +126,16 @@ class TileGrid(BaseModel):
         default=None,
         description="GCS URI or local path to NDJSON file of tile coordinates",
     )
+
+    @property
+    def crs(self) -> str:
+        """CRS string — delegates to ``pixel_grid.crs_code``."""
+        return self.pixel_grid.crs_code
+
+    @property
+    def pixel_size(self) -> float:
+        """Pixel size in CRS units (== ``affine_transform.scale_x``)."""
+        return self.pixel_grid.affine_transform.scale_x
 
     @model_validator(mode="after")
     def exactly_one_tile_source(self) -> TileGrid:

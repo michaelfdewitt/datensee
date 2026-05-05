@@ -49,6 +49,7 @@ def _parse_snapshot_time(raw: str | None) -> int | None:
     if raw.isdigit():
         return int(raw)
     from datetime import datetime
+
     try:
         # Accept the trailing 'Z' shorthand for UTC.
         normalized = raw.replace("Z", "+00:00") if raw.endswith("Z") else raw
@@ -633,8 +634,7 @@ def retry_cmd(
 
     if result.next_tiles_count == 0:
         console.print(
-            "[yellow]Nothing to retry — journal is empty or all entries "
-            "are terminal.[/yellow]"
+            "[yellow]Nothing to retry — journal is empty or all entries are terminal.[/yellow]"
         )
         return
 

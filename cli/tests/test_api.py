@@ -18,7 +18,9 @@ class TestTile:
         assert grid.tiles is not None
         assert len(grid.tiles) > 0
         assert grid.crs == "EPSG:4326"
-        assert grid.scale_meters == 30.0
+        # 30 m at the equator constant ≈ 0.0002695 °/px.
+        assert grid.pixel_size > 0
+        assert grid.pixel_size < 0.001
 
     def test_tile_count_varies_with_scale(self) -> None:
         region = demo_region()

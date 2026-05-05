@@ -50,7 +50,7 @@ def render_export_summary(config: PipelineConfig) -> Panel:
 
     tile_px = grid.tile_size_pixels
     table.add_row("Tiles", f"{config.tile_count:,}  ({tile_px}×{tile_px} px)")
-    table.add_row("Scale", f"{grid.scale_meters} m/px  ({grid.crs})")
+    table.add_row("Pixel size", f"{grid.pixel_size:g} {grid.crs} units")
     table.add_row("Output", config.output.output_path)
     table.add_row("Raw size", _format_bytes(config.raw_output_bytes))
 

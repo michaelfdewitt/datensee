@@ -254,7 +254,7 @@ def display_export_summary(config: PipelineConfig) -> None:
 
     rows = [
         ("Tiles", f"{config.tile_count:,} ({tile_px}&times;{tile_px} px)"),
-        ("Scale", f"{grid.scale_meters} m/px ({grid.crs})"),
+        ("Pixel size", f"{grid.pixel_size:g} {grid.crs} units"),
         ("Output", config.output.output_path),
         ("Raw size", _format_bytes(config.raw_output_bytes)),
     ]
@@ -295,15 +295,18 @@ def display_tile_grid(grid: TileGrid, region: dict[str, Any]) -> None:
     from matplotlib.patches import Rectangle
     from shapely.geometry import shape
 
+    from datensee.tiling import tile_bbox
+
     fig, ax = plt.subplots(1, 1, figsize=(10, 8))
 
     # Draw tiles
     if grid.tiles:
         for t in grid.tiles:
+            x_min, y_min, x_max, y_max = tile_bbox(grid.pixel_grid, t)
             rect = Rectangle(
-                (t.x_min, t.y_min),
-                t.x_max - t.x_min,
-                t.y_max - t.y_min,
+                (x_min, y_min),
+                x_max - x_min,
+                y_max - y_min,
                 linewidth=0.5,
                 edgecolor="#0077cc",
                 facecolor="#0077cc",
@@ -323,7 +326,7 @@ def display_tile_grid(grid: TileGrid, region: dict[str, Any]) -> None:
 
     ax.set_xlabel(f"X ({grid.crs})")
     ax.set_ylabel(f"Y ({grid.crs})")
-    ax.set_title(f"{len(grid.tiles or [])} tiles @ {grid.scale_meters} m/px")
+    ax.set_title(f"{len(grid.tiles or [])} tiles @ {grid.pixel_size:g} {grid.crs} units/px")
     ax.legend()
     ax.set_aspect("equal")
     ax.autoscale()

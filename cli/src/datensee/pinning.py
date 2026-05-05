@@ -25,16 +25,20 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
-PINNABLE_LOAD_FUNCTIONS: frozenset[str] = frozenset({
-    "Image.load",
-    "ImageCollection.load",
-    "Feature.load",
-    "Collection.loadTable",
-})
+PINNABLE_LOAD_FUNCTIONS: frozenset[str] = frozenset(
+    {
+        "Image.load",
+        "ImageCollection.load",
+        "Feature.load",
+        "Collection.loadTable",
+    }
+)
 
-UNSUPPORTED_BQ_FUNCTIONS: frozenset[str] = frozenset({
-    "FeatureCollection.loadBigQuery",
-})
+UNSUPPORTED_BQ_FUNCTIONS: frozenset[str] = frozenset(
+    {
+        "FeatureCollection.loadBigQuery",
+    }
+)
 
 RUN_BIGQUERY_FUNCTION: str = "FeatureCollection.runBigQuery"
 

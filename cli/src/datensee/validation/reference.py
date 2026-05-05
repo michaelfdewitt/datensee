@@ -18,6 +18,7 @@ import httpx
 import numpy as np
 
 from datensee.config import PipelineConfig, TileCoordinate
+from datensee.tiling import tile_bbox
 from datensee.validation.catalog import CheckID
 from datensee.validation.report import CheckResult, CheckStatus
 from datensee.validation.tiff import read_tiff_pixels
@@ -119,6 +120,7 @@ def check_e07_pixel_value_accuracy(
     grid = config.tile_grid
     tile_size = grid.tile_size_pixels
     crs = grid.crs
+    parent_grid = grid.pixel_grid
     expression = config.ee_expression
 
     checked = 0
@@ -147,7 +149,7 @@ def check_e07_pixel_value_accuracy(
                     gee_project,
                     access_token,
                     expression,
-                    (tile.x_min, tile.y_min, tile.x_max, tile.y_max),
+                    tile_bbox(parent_grid, tile),
                     tile_size,
                     crs,
                 )

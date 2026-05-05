@@ -22,9 +22,12 @@ import pyproj
 from pydantic import BaseModel
 
 from datensee.config import (
+    AffineTransform,
     DataflowRunnerConfig,
+    GridDimensions,
     OutputConfig,
     PipelineConfig,
+    PixelGrid,
     RateLimitConfig,
     RunnerConfig,
     TileGrid,
@@ -369,6 +372,7 @@ def export(
             gee_project=project,
             ee_expression=ee_expression_user,
             snapshot_time=snapshot_time_nanos,
+            pixel_grid=tile_grid.pixel_grid,
         ),
         credentials=credentials,
     )
@@ -706,7 +710,7 @@ def retry(
         from google.cloud import storage as _gcs
 
         client = _gcs.Client(credentials=credentials, project=project)
-        gs_uri = tiles_file_path[len("gs://"):]
+        gs_uri = tiles_file_path[len("gs://") :]
         bucket_name, _, blob_path = gs_uri.partition("/")
         bucket = client.bucket(bucket_name)
         bucket.blob(blob_path).upload_from_filename(str(local_staging))
@@ -753,12 +757,37 @@ def retry(
         )
     ee_expression = pin_expression(ee_expression, snapshot_time_nanos)
 
+    # The retry's parent PixelGrid must match the original export's
+    # exactly — col_px/row_px in the journal records are local to that
+    # parent's translate_x/y. The original parent is persisted in meta;
+    # legacy meta (no pixel_grid field) gets a translate=0 fallback,
+    # which is fine for a fresh-snap export at the global origin but
+    # produces wrong CRS coordinates for any export whose snapped
+    # bbox sits away from (0, 0). Legacy retries are best-effort.
+    from datensee.tiling import _pixel_size_native
+
+    if persisted_meta is not None and persisted_meta.pixel_grid is not None:
+        parent_pixel_grid = persisted_meta.pixel_grid
+    else:
+        pixel_size = _pixel_size_native(crs, scale)
+        parent_pixel_grid = PixelGrid(
+            crs_code=crs,
+            affine_transform=AffineTransform(
+                scale_x=pixel_size,
+                shear_x=0.0,
+                translate_x=0.0,
+                shear_y=0.0,
+                scale_y=-pixel_size,
+                translate_y=0.0,
+            ),
+            dimensions=GridDimensions(width=tile_size, height=tile_size),
+        )
+
     pipeline_config = PipelineConfig(
         ee_expression=ee_expression,
         gee_project=project,
         tile_grid=TileGrid(
-            crs=crs,
-            scale_meters=scale,
+            pixel_grid=parent_pixel_grid,
             tile_size_pixels=tile_size,
             tiles_file=tiles_file_path,
         ),

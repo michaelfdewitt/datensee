@@ -1,8 +1,24 @@
-"""Tests for region → tile grid decomposition."""
+"""Tests for region → tile grid decomposition (M11 PixelGrid shape)."""
+
+from __future__ import annotations
+
+import math
 
 import pytest
 
-from datensee.tiling import decompose_region
+from datensee.config import (
+    AffineTransform,
+    GridDimensions,
+    PixelGrid,
+    TileCoordinate,
+)
+from datensee.tiling import (
+    _METERS_PER_DEGREE_EQUATOR,
+    _pixel_size_native,
+    decompose_region,
+    tile_bbox,
+    tile_pixel_grid,
+)
 
 CALIFORNIA_BBOX = {
     "type": "Polygon",
@@ -30,27 +46,56 @@ SMALL_SQUARE = {
     ],
 }
 
+SF_BAY = {
+    "type": "Polygon",
+    "coordinates": [
+        [
+            [-122.5, 37.75],
+            [-122.25, 37.75],
+            [-122.25, 38.0],
+            [-122.5, 38.0],
+            [-122.5, 37.75],
+        ]
+    ],
+}
+
+
+# ---------------------------------------------------------------------------
+# Basic decomposition
+# ---------------------------------------------------------------------------
+
 
 def test_decompose_returns_at_least_one_tile() -> None:
     grid = decompose_region(SMALL_SQUARE, scale_meters=30.0)
     assert len(grid.tiles) >= 1
 
 
-def test_decompose_tile_coordinates_are_within_bounds() -> None:
+def test_decompose_tiles_are_positive_pixel_rectangles() -> None:
     grid = decompose_region(SMALL_SQUARE, scale_meters=30.0)
     for tile in grid.tiles:
-        assert tile.x_min < tile.x_max
-        assert tile.y_min < tile.y_max
+        assert tile.width_px > 0
+        assert tile.height_px > 0
+        assert tile.col_px >= 0
+        assert tile.row_px >= 0
 
 
 def test_decompose_crs_is_preserved() -> None:
     grid = decompose_region(SMALL_SQUARE, scale_meters=30.0, crs="EPSG:4326")
     assert grid.crs == "EPSG:4326"
+    assert grid.pixel_grid.crs_code == "EPSG:4326"
 
 
-def test_decompose_scale_is_preserved() -> None:
-    grid = decompose_region(SMALL_SQUARE, scale_meters=100.0)
-    assert grid.scale_meters == 100.0
+def test_decompose_pixel_size_is_consistent_with_scale() -> None:
+    grid = decompose_region(SMALL_SQUARE, scale_meters=100.0, crs="EPSG:4326")
+    expected = 100.0 / _METERS_PER_DEGREE_EQUATOR
+    assert grid.pixel_size == pytest.approx(expected)
+    assert grid.pixel_grid.affine_transform.scale_x == pytest.approx(expected)
+    assert grid.pixel_grid.affine_transform.scale_y == pytest.approx(-expected)
+
+
+def test_decompose_pixel_size_for_projected_crs_is_meters() -> None:
+    grid = decompose_region(SF_BAY, scale_meters=10.0, crs="EPSG:32610", tile_size_pixels=256)
+    assert grid.pixel_size == pytest.approx(10.0)
 
 
 def test_large_scale_produces_fewer_tiles() -> None:
@@ -66,129 +111,177 @@ def test_tile_row_col_are_non_negative() -> None:
         assert tile.col >= 0
 
 
-# --- Projected CRS tests ---
-
-SF_BAY = {
-    "type": "Polygon",
-    "coordinates": [
-        [
-            [-122.5, 37.75],
-            [-122.25, 37.75],
-            [-122.25, 38.0],
-            [-122.5, 38.0],
-            [-122.5, 37.75],
-        ]
-    ],
-}
-
-
 def test_decompose_projected_crs_epsg32610() -> None:
-    """UTM Zone 10N: tile coordinates should be in meters, not degrees."""
     grid = decompose_region(SF_BAY, scale_meters=10.0, crs="EPSG:32610", tile_size_pixels=256)
     assert grid.crs == "EPSG:32610"
     assert len(grid.tiles) >= 1
+    # UTM Zone 10N coordinates for SF Bay are ~5e5 easting, ~4.2e6 northing —
+    # the parent grid should sit there, well above degree magnitudes.
+    assert grid.pixel_grid.affine_transform.translate_x > 1000
+    assert grid.pixel_grid.affine_transform.translate_y > 1000
 
-    # UTM Zone 10N coordinates for SF Bay Area are ~5e5 easting, ~4.2e6 northing
-    for tile in grid.tiles:
-        assert tile.x_min > 1000, "UTM easting should be in meters, not degrees"
-        assert tile.y_min > 1000, "UTM northing should be in meters, not degrees"
 
-
-def test_decompose_projected_crs_produces_different_tiles() -> None:
-    """Same region in different CRS should produce different tile coordinates."""
+def test_decompose_projected_crs_produces_different_translate() -> None:
     grid_geo = decompose_region(SF_BAY, scale_meters=30.0, crs="EPSG:4326")
     grid_utm = decompose_region(SF_BAY, scale_meters=30.0, crs="EPSG:32610")
-    assert grid_geo.tiles[0].x_min != grid_utm.tiles[0].x_min
+    assert (
+        grid_geo.pixel_grid.affine_transform.translate_x
+        != grid_utm.pixel_grid.affine_transform.translate_x
+    )
 
 
-# --- Grid snapping tests ---
+# ---------------------------------------------------------------------------
+# Helpers: tile_pixel_grid, tile_bbox
+# ---------------------------------------------------------------------------
+
+
+def _parent_grid(
+    *,
+    scale: float = 1.0,
+    translate_x: float = 0.0,
+    translate_y: float = 0.0,
+    width: int = 100,
+    height: int = 100,
+    crs: str = "EPSG:4326",
+) -> PixelGrid:
+    return PixelGrid(
+        crs_code=crs,
+        affine_transform=AffineTransform(
+            scale_x=scale,
+            shear_x=0.0,
+            translate_x=translate_x,
+            shear_y=0.0,
+            scale_y=-scale,
+            translate_y=translate_y,
+        ),
+        dimensions=GridDimensions(width=width, height=height),
+    )
+
+
+class TestTilePixelGrid:
+    def test_root_tile_at_origin_inherits_parent_origin(self) -> None:
+        parent = _parent_grid(scale=2.0, translate_x=10.0, translate_y=40.0)
+        tile = TileCoordinate(col_px=0, row_px=0, width_px=10, height_px=10)
+        sub = tile_pixel_grid(parent, tile)
+        assert sub.affine_transform.translate_x == 10.0
+        assert sub.affine_transform.translate_y == 40.0
+        assert sub.dimensions.width == 10
+        assert sub.dimensions.height == 10
+        assert sub.affine_transform.scale_x == 2.0
+        assert sub.affine_transform.scale_y == -2.0
+
+    def test_offset_tile_translates_origin(self) -> None:
+        parent = _parent_grid(scale=2.0, translate_x=10.0, translate_y=40.0)
+        # 5 px right, 7 px down
+        tile = TileCoordinate(col_px=5, row_px=7, width_px=4, height_px=4)
+        sub = tile_pixel_grid(parent, tile)
+        assert sub.affine_transform.translate_x == 10.0 + 5 * 2.0  # 20
+        assert sub.affine_transform.translate_y == 40.0 + 7 * (-2.0)  # 26
+        assert sub.dimensions.width == 4
+        assert sub.dimensions.height == 4
+
+    def test_crs_propagates(self) -> None:
+        parent = _parent_grid(crs="EPSG:32610")
+        tile = TileCoordinate(col_px=0, row_px=0, width_px=8, height_px=8)
+        assert tile_pixel_grid(parent, tile).crs_code == "EPSG:32610"
+
+
+class TestTileBbox:
+    def test_nw_corner_tile(self) -> None:
+        # Worked example from m11-pixel-grid.md.
+        parent = _parent_grid(scale=1.0, translate_x=10.0, translate_y=40.0, width=20, height=20)
+        tile = TileCoordinate(col_px=0, row_px=0, width_px=10, height_px=10)
+        assert tile_bbox(parent, tile) == (10.0, 30.0, 20.0, 40.0)
+
+    def test_se_corner_tile(self) -> None:
+        parent = _parent_grid(scale=1.0, translate_x=10.0, translate_y=40.0, width=20, height=20)
+        tile = TileCoordinate(col_px=10, row_px=10, width_px=10, height_px=10)
+        assert tile_bbox(parent, tile) == (20.0, 20.0, 30.0, 30.0)
+
+    def test_subpixel_tile(self) -> None:
+        # A split child: half-size at offset (5, 5).
+        parent = _parent_grid(scale=1.0, translate_x=0.0, translate_y=10.0, width=10, height=10)
+        tile = TileCoordinate(col_px=5, row_px=5, width_px=5, height_px=5)
+        # x_min = 0 + 5*1 = 5; x_max = 5 + 5*1 = 10
+        # y_max = 10 + 5*(-1) = 5; y_min = 5 + 5*(-1) = 0
+        assert tile_bbox(parent, tile) == (5.0, 0.0, 10.0, 5.0)
+
+
+# ---------------------------------------------------------------------------
+# Snap and alignment
+# ---------------------------------------------------------------------------
 
 
 def test_tiles_are_full_size() -> None:
-    """Every tile must be exactly tile_size_native wide — no edge clipping.
-
-    Geographic CRSs use latitude-dependent meters-per-degree, so the
-    expected size is computed at the bbox centroid latitude (the same
-    value decompose_region uses internally).
-    """
     grid = decompose_region(SMALL_SQUARE, scale_meters=30.0, tile_size_pixels=256)
-    from datensee.tiling import _pixel_sizes_native
-    from shapely.geometry import shape
-
-    miny, maxy = shape(SMALL_SQUARE).bounds[1], shape(SMALL_SQUARE).bounds[3]
-    centroid_lat = (miny + maxy) / 2.0
-    pixel_x, pixel_y = _pixel_sizes_native("EPSG:4326", 30.0, centroid_lat_deg=centroid_lat)
-    expected_w = pixel_x * 256
-    expected_h = pixel_y * 256
-
     for tile in grid.tiles:
-        w = tile.x_max - tile.x_min
-        h = tile.y_max - tile.y_min
-        assert abs(w - expected_w) < 1e-10, f"Tile width {w} != {expected_w}"
-        assert abs(h - expected_h) < 1e-10, f"Tile height {h} != {expected_h}"
+        assert tile.width_px == 256
+        assert tile.height_px == 256
 
 
-def test_tiles_are_full_size_utm() -> None:
-    """Same check in UTM: tiles must be exactly scale × tile_size meters."""
-    grid = decompose_region(SF_BAY, scale_meters=10.0, crs="EPSG:32610", tile_size_pixels=256)
-    expected_size = 10.0 * 256  # 2560 meters
-
-    for tile in grid.tiles:
-        w = tile.x_max - tile.x_min
-        h = tile.y_max - tile.y_min
-        assert abs(w - expected_size) < 1e-6, f"Tile width {w} != {expected_size}"
-        assert abs(h - expected_size) < 1e-6, f"Tile height {h} != {expected_size}"
-
-
-def test_grid_snapped_to_global_origin() -> None:
-    """Tile boundaries must be multiples of tile_size_native from (0, 0)."""
+def test_tiles_offsets_are_tile_size_multiples() -> None:
     grid = decompose_region(SMALL_SQUARE, scale_meters=30.0, tile_size_pixels=256)
-    from datensee.tiling import _pixel_sizes_native
-    from shapely.geometry import shape
-
-    miny, maxy = shape(SMALL_SQUARE).bounds[1], shape(SMALL_SQUARE).bounds[3]
-    centroid_lat = (miny + maxy) / 2.0
-    pixel_x, pixel_y = _pixel_sizes_native("EPSG:4326", 30.0, centroid_lat_deg=centroid_lat)
-    tile_size_x = pixel_x * 256
-    tile_size_y = pixel_y * 256
-
     for tile in grid.tiles:
-        col_idx = tile.x_min / tile_size_x
-        row_idx = tile.y_min / tile_size_y
-        assert abs(col_idx - round(col_idx)) < 1e-9, (
-            f"x_min={tile.x_min} not snapped (col_idx={col_idx})"
-        )
-        assert abs(row_idx - round(row_idx)) < 1e-9, (
-            f"y_min={tile.y_min} not snapped (row_idx={row_idx})"
-        )
+        assert tile.col_px % 256 == 0
+        assert tile.row_px % 256 == 0
 
 
-def test_grid_snapped_to_global_origin_utm() -> None:
-    """UTM tile boundaries must be multiples of tile_size from 0."""
-    grid = decompose_region(SF_BAY, scale_meters=10.0, crs="EPSG:32610", tile_size_pixels=256)
-    tile_size = 10.0 * 256  # 2560 m
-
-    for tile in grid.tiles:
-        col_idx = tile.x_min / tile_size
-        row_idx = tile.y_min / tile_size
-        assert abs(col_idx - round(col_idx)) < 1e-9, (
-            f"x_min={tile.x_min} not snapped (col_idx={col_idx})"
-        )
-        assert abs(row_idx - round(row_idx)) < 1e-9, (
-            f"y_min={tile.y_min} not snapped (row_idx={row_idx})"
-        )
+def test_parent_translate_is_global_snap() -> None:
+    """The parent grid's translate must be a tile-size multiple of pixel size,
+    measured against a global (0, 0) origin in CRS units."""
+    grid = decompose_region(SMALL_SQUARE, scale_meters=30.0, tile_size_pixels=256)
+    pixel_size = grid.pixel_size
+    tile_size_native = pixel_size * 256
+    tx = grid.pixel_grid.affine_transform.translate_x
+    ty = grid.pixel_grid.affine_transform.translate_y
+    assert math.isclose(tx / tile_size_native, round(tx / tile_size_native), abs_tol=1e-9)
+    assert math.isclose(ty / tile_size_native, round(ty / tile_size_native), abs_tol=1e-9)
 
 
-def test_shifted_region_produces_aligned_grid() -> None:
-    """Two overlapping regions at the same centroid latitude produce
-    identical tile boundaries in the overlap area.
+def test_grid_alignment_unconditional_across_latitudes() -> None:
+    """Two exports at very different centroid latitudes must produce identical
+    pixel sizes and tile offsets — that's the whole point of M11. The parent
+    grid translate differs (different bbox) but the affine scale is the same,
+    and shared tiles snap to the same multiple of (pixel_size * tile_size)."""
+    region_low_lat = {
+        "type": "Polygon",
+        "coordinates": [
+            [
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [1.0, 1.0],
+                [0.0, 1.0],
+                [0.0, 0.0],
+            ]
+        ],
+    }
+    region_high_lat = {
+        "type": "Polygon",
+        "coordinates": [
+            [
+                [0.0, 60.0],
+                [1.0, 60.0],
+                [1.0, 61.0],
+                [0.0, 61.0],
+                [0.0, 60.0],
+            ]
+        ],
+    }
+    grid_low = decompose_region(region_low_lat, scale_meters=100.0, tile_size_pixels=256)
+    grid_high = decompose_region(region_high_lat, scale_meters=100.0, tile_size_pixels=256)
+    # Same CRS scale: derives from the equator constant for both.
+    assert grid_low.pixel_size == grid_high.pixel_size
+    # Both translates are multiples of tile_size_native from the global origin.
+    tile_size_native = grid_low.pixel_size * 256
+    for grid in (grid_low, grid_high):
+        tx = grid.pixel_grid.affine_transform.translate_x
+        assert math.isclose(tx / tile_size_native, round(tx / tile_size_native), abs_tol=1e-9)
 
-    Geographic-CRS pixel size is latitude-dependent (1° of longitude is
-    smaller in meters as |lat| grows), so global grid alignment only
-    holds when both regions share a centroid latitude — or when the
-    grid is in a projected CRS (see ``_utm`` variant). Both regions
-    here share the same y-bounds so the assertion is meaningful.
-    """
+
+def test_shifted_region_overlap_is_pixel_identical() -> None:
+    """Overlapping tiles between two same-CRS, same-scale exports share an
+    identical CRS bbox — global-origin snap means the pixel-to-CRS mapping is
+    deterministic regardless of where the export bbox sits."""
     region_a = {
         "type": "Polygon",
         "coordinates": [[[0.0, 0.0], [0.5, 0.0], [0.5, 0.5], [0.0, 0.5], [0.0, 0.0]]],
@@ -197,45 +290,30 @@ def test_shifted_region_produces_aligned_grid() -> None:
         "type": "Polygon",
         "coordinates": [[[0.2, 0.0], [0.7, 0.0], [0.7, 0.5], [0.2, 0.5], [0.2, 0.0]]],
     }
-
     grid_a = decompose_region(region_a, scale_meters=100.0, tile_size_pixels=256)
     grid_b = decompose_region(region_b, scale_meters=100.0, tile_size_pixels=256)
 
-    # Build lookup of tile bounds by (x_min, y_min)
-    bounds_a = {(round(t.x_min, 10), round(t.y_min, 10)) for t in grid_a.tiles}
-    bounds_b = {(round(t.x_min, 10), round(t.y_min, 10)) for t in grid_b.tiles}
-
-    overlap = bounds_a & bounds_b
-    assert len(overlap) > 0, "Expected overlapping tiles between shifted regions"
-
-    # For overlapping tiles, verify exact coordinate match
-    tiles_a_by_origin = {(round(t.x_min, 10), round(t.y_min, 10)): t for t in grid_a.tiles}
-    tiles_b_by_origin = {(round(t.x_min, 10), round(t.y_min, 10)): t for t in grid_b.tiles}
-    for origin in overlap:
-        ta = tiles_a_by_origin[origin]
-        tb = tiles_b_by_origin[origin]
-        assert abs(ta.x_max - tb.x_max) < 1e-10
-        assert abs(ta.y_max - tb.y_max) < 1e-10
+    # Build absolute-bbox lookups — col_px/row_px are local to each parent
+    # so we have to compose with translate to compare across exports.
+    bboxes_a = {tile_bbox(grid_a.pixel_grid, t) for t in grid_a.tiles}
+    bboxes_b = {tile_bbox(grid_b.pixel_grid, t) for t in grid_b.tiles}
+    overlap = bboxes_a & bboxes_b
+    assert len(overlap) > 0
 
 
-def test_adjacent_tiles_share_boundaries() -> None:
-    """Horizontally adjacent tiles must have tile_a.x_max == tile_b.x_min exactly."""
+def test_adjacent_tiles_share_pixel_boundary() -> None:
+    """Compute tiles abutting in the grid have flush pixel offsets."""
     grid = decompose_region(CALIFORNIA_BBOX, scale_meters=1000.0, tile_size_pixels=256)
-
-    tiles_by_rc = {(t.row, t.col): t for t in grid.tiles}
-    for (row, col), tile in tiles_by_rc.items():
-        right = tiles_by_rc.get((row, col + 1))
+    by_rc = {(t.row, t.col): t for t in grid.tiles}
+    for (row, col), tile in by_rc.items():
+        right = by_rc.get((row, col + 1))
         if right:
-            assert abs(tile.x_max - right.x_min) < 1e-10, (
-                f"Gap/overlap between ({row},{col}) and ({row},{col + 1}): "
-                f"{tile.x_max} vs {right.x_min}"
-            )
-        above = tiles_by_rc.get((row + 1, col))
-        if above:
-            assert abs(tile.y_max - above.y_min) < 1e-10, (
-                f"Gap/overlap between ({row},{col}) and ({row + 1},{col}): "
-                f"{tile.y_max} vs {above.y_min}"
-            )
+            assert right.col_px == tile.col_px + tile.width_px
+            assert right.row_px == tile.row_px
+        below = by_rc.get((row + 1, col))
+        if below:
+            assert below.row_px == tile.row_px + tile.height_px
+            assert below.col_px == tile.col_px
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +329,6 @@ def test_out_row_col_default_to_row_col_when_two_tier_disabled() -> None:
 
 
 def test_out_row_col_when_output_tile_equals_compute_tile() -> None:
-    """Setting output_tile_size_pixels equal to tile_size_pixels is a no-op."""
     grid = decompose_region(
         CALIFORNIA_BBOX,
         scale_meters=10000.0,
@@ -264,42 +341,25 @@ def test_out_row_col_when_output_tile_equals_compute_tile() -> None:
 
 
 def test_out_row_col_groups_compute_tiles_into_output_tiles() -> None:
-    """Each compute tile carries the (out_row, out_col) of its containing output tile."""
     grid = decompose_region(
         CALIFORNIA_BBOX,
         scale_meters=10000.0,
         tile_size_pixels=64,
         output_tile_size_pixels=256,  # 4×4 compute tiles per output tile
     )
-
-    # All compute tiles inside one output tile must agree on (out_row, out_col).
-    by_out_key: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    by_out: dict[tuple[int, int], list[tuple[int, int]]] = {}
     for t in grid.tiles:
-        by_out_key.setdefault((t.out_row, t.out_col), []).append((t.row, t.col))
+        by_out.setdefault((t.out_row, t.out_col), []).append((t.row, t.col))
 
-    # Each output cell should hold up to 4×4 = 16 compute tiles (less at the
-    # bbox edge where the bbox doesn't cover the full output cell).
-    for (out_row, out_col), members in by_out_key.items():
-        assert len(members) <= 16, (
-            f"Output ({out_row},{out_col}) should contain at most 16 compute "
-            f"tiles, got {len(members)}: {members}"
-        )
-
-    # Bounding boxes of compute tiles in the same output cell must form a
-    # contiguous block — no orphan tile in a cell that doesn't share a wall
-    # with at least one sibling.
-    for members in by_out_key.values():
-        members.sort()
+    for members in by_out.values():
+        assert len(members) <= 16
         rows = {r for r, _ in members}
         cols = {c for _, c in members}
-        # Within an output cell, compute tiles should occupy consecutive
-        # rows and consecutive cols (modulo bbox clipping).
         assert max(rows) - min(rows) <= 3
         assert max(cols) - min(cols) <= 3
 
 
 def test_out_row_col_uses_floor_division_for_assignment() -> None:
-    """Compute tile (row, col) → (row // N, col // N) for output assignment."""
     grid = decompose_region(
         SMALL_SQUARE,
         scale_meters=30.0,
@@ -307,15 +367,9 @@ def test_out_row_col_uses_floor_division_for_assignment() -> None:
         output_tile_size_pixels=192,  # N = 3
     )
     n = 192 // 64
-    # When the bbox starts at column 0, out_col == col // N with no offset.
-    # With a non-zero start, both indices shift identically — the relation
-    # `(out_col_local + offset_out) * N <= (col_local + offset_compute) <
-    # (out_col_local + offset_out + 1) * N` still holds.
-    # Easier check: for each tile, col // N agrees with its sibling's col // N.
-    by_out = {}
+    by_out: dict[tuple[int, int], list[TileCoordinate]] = {}
     for t in grid.tiles:
         by_out.setdefault((t.out_row, t.out_col), []).append(t)
-    # Within a group, all rows/cols must share the same row // N / col // N.
     for tiles in by_out.values():
         target_block_row = tiles[0].row // n
         target_block_col = tiles[0].col // n
@@ -332,3 +386,17 @@ def test_invalid_output_tile_size_rejected() -> None:
             tile_size_pixels=64,
             output_tile_size_pixels=100,  # not a multiple of 64
         )
+
+
+# ---------------------------------------------------------------------------
+# _pixel_size_native: equator-constant for geographic, passthrough for projected
+# ---------------------------------------------------------------------------
+
+
+def test_pixel_size_native_geographic_uses_equator_constant() -> None:
+    assert _pixel_size_native("EPSG:4326", 30.0) == pytest.approx(30.0 / _METERS_PER_DEGREE_EQUATOR)
+
+
+def test_pixel_size_native_projected_passes_through() -> None:
+    assert _pixel_size_native("EPSG:32610", 30.0) == 30.0
+    assert _pixel_size_native("EPSG:3857", 100.0) == 100.0
