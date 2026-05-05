@@ -31,8 +31,7 @@ public record PipelineConfig(
 
     /** Tile grid configuration. */
     public record TileGridConfig(
-        String crs,
-        @JsonProperty("scale_meters") double scaleMeters,
+        @JsonProperty("pixel_grid") PixelGrid pixelGrid,
         @JsonProperty("tile_size_pixels") int tileSizePixels,
         List<TileCoordinate> tiles,
         @JsonProperty("tiles_file") String tilesFile
@@ -45,6 +44,11 @@ public record PipelineConfig(
         /** Whether tiles are provided via external file rather than inline. */
         public boolean hasExternalTiles() {
             return tilesFile != null && !tilesFile.isBlank();
+        }
+
+        /** CRS code — delegates to {@code pixelGrid.crsCode()}. */
+        public String crs() {
+            return pixelGrid != null ? pixelGrid.crsCode() : null;
         }
     }
 

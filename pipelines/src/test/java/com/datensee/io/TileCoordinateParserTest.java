@@ -13,27 +13,30 @@ class TileCoordinateParserTest {
 
     @Test
     void parsesNdjsonLine() throws Exception {
-        String line = "{\"x_min\":10.0,\"y_min\":20.0,\"x_max\":11.0,\"y_max\":21.0,\"row\":3,\"col\":5}";
+        String line = "{\"col_px\":256,\"row_px\":512,\"width_px\":256,"
+            + "\"height_px\":256,\"row\":3,\"col\":5}";
 
         TileCoordinate tile = MAPPER.readValue(line, TileCoordinate.class);
 
         assertEquals(3, tile.row());
         assertEquals(5, tile.col());
-        assertEquals(10.0, tile.xMin());
-        assertEquals(20.0, tile.yMin());
-        assertEquals(11.0, tile.xMax());
-        assertEquals(21.0, tile.yMax());
+        assertEquals(256, tile.colPx());
+        assertEquals(512, tile.rowPx());
+        assertEquals(256, tile.widthPx());
+        assertEquals(256, tile.heightPx());
     }
 
     @Test
     void roundtripsViaJackson() throws Exception {
-        TileCoordinate original = new TileCoordinate(500000, 4200000, 502560, 4202560, 7, 3);
+        TileCoordinate original = new TileCoordinate(0, 0, 512, 512, 7, 3);
         String json = MAPPER.writeValueAsString(original);
         TileCoordinate restored = MAPPER.readValue(json, TileCoordinate.class);
 
         assertEquals(original.row(), restored.row());
         assertEquals(original.col(), restored.col());
-        assertEquals(original.xMin(), restored.xMin());
-        assertEquals(original.yMax(), restored.yMax());
+        assertEquals(original.colPx(), restored.colPx());
+        assertEquals(original.rowPx(), restored.rowPx());
+        assertEquals(original.widthPx(), restored.widthPx());
+        assertEquals(original.heightPx(), restored.heightPx());
     }
 }

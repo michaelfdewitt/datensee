@@ -5,6 +5,9 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.datensee.AffineTransform;
+import com.datensee.GridDimensions;
+import com.datensee.PixelGrid;
 import com.datensee.TileCoordinate;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -16,12 +19,22 @@ class TileFetchDoFnTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    private String buildRequestBody(String crs, TileCoordinate tile) throws Exception {
+    private static PixelGrid pixelGrid(
+        String crs, double scale, double translateX, double translateY,
+        int width, int height
+    ) {
+        return new PixelGrid(
+            crs,
+            new AffineTransform(scale, 0.0, translateX, 0.0, -scale, translateY),
+            new GridDimensions(width, height)
+        );
+    }
+
+    private String buildRequestBody(PixelGrid parentGrid, TileCoordinate tile) throws Exception {
         TileFetchDoFn doFn = new TileFetchDoFn(
             "{\"result\":\"0\",\"values\":{}}",
             "test-project",
-            256,
-            crs,
+            parentGrid,
             100.0,
             1
         );
@@ -33,9 +46,11 @@ class TileFetchDoFnTest {
     }
 
     @Test
-    void requestBodyUsesCrsFromConstructor() throws Exception {
-        TileCoordinate tile = new TileCoordinate(0, 0, 1, 1, 0, 0);
-        String body = buildRequestBody("EPSG:32610", tile);
+    void requestBodyUsesCrsFromParentGrid() throws Exception {
+        // UTM 10N, 10 m/px, parent grid origin at (500_000, 4_202_560).
+        PixelGrid parent = pixelGrid("EPSG:32610", 10.0, 500_000.0, 4_202_560.0, 256, 256);
+        TileCoordinate tile = new TileCoordinate(0, 0, 256, 256, 0, 0);
+        String body = buildRequestBody(parent, tile);
 
         JsonNode root = MAPPER.readTree(body);
         JsonNode grid = root.get("grid");
@@ -45,8 +60,11 @@ class TileFetchDoFnTest {
 
     @Test
     void requestBodyUsesEpsg4326() throws Exception {
-        TileCoordinate tile = new TileCoordinate(-122.5, 37.5, -122.0, 38.0, 0, 0);
-        String body = buildRequestBody("EPSG:4326", tile);
+        PixelGrid parent = pixelGrid(
+            "EPSG:4326", 30.0 / 111_320.0, -122.5, 38.0, 1024, 1024
+        );
+        TileCoordinate tile = new TileCoordinate(0, 0, 512, 512, 0, 0);
+        String body = buildRequestBody(parent, tile);
 
         JsonNode root = MAPPER.readTree(body);
         assertEquals("EPSG:4326", root.get("grid").get("crsCode").asText());
@@ -54,8 +72,9 @@ class TileFetchDoFnTest {
 
     @Test
     void requestBodyContainsExpressionAndFormat() throws Exception {
-        TileCoordinate tile = new TileCoordinate(0, 0, 1, 1, 0, 0);
-        String body = buildRequestBody("EPSG:4326", tile);
+        PixelGrid parent = pixelGrid("EPSG:4326", 0.0001, 0.0, 1.0, 16, 16);
+        TileCoordinate tile = new TileCoordinate(0, 0, 16, 16, 0, 0);
+        String body = buildRequestBody(parent, tile);
 
         JsonNode root = MAPPER.readTree(body);
         assertNotNull(root.get("expression"), "expression field must be present");
@@ -64,8 +83,9 @@ class TileFetchDoFnTest {
 
     @Test
     void requestBodyDimensionsMatchTileSize() throws Exception {
+        PixelGrid parent = pixelGrid("EPSG:32610", 10.0, 500_000.0, 4_202_560.0, 256, 256);
         TileCoordinate tile = new TileCoordinate(0, 0, 256, 256, 0, 0);
-        String body = buildRequestBody("EPSG:32610", tile);
+        String body = buildRequestBody(parent, tile);
 
         JsonNode dims = MAPPER.readTree(body).get("grid").get("dimensions");
         assertEquals(256, dims.get("width").asInt());
@@ -73,15 +93,31 @@ class TileFetchDoFnTest {
     }
 
     @Test
-    void requestBodyAffineTransformUsesCoordinates() throws Exception {
-        TileCoordinate tile = new TileCoordinate(500000, 4200000, 502560, 4202560, 0, 0);
-        String body = buildRequestBody("EPSG:32610", tile);
+    void requestBodyAffineTransformDerivedFromParentAndOffset() throws Exception {
+        // Parent grid at (500_000, 4_202_560), 10 m/px, tile shifted 256 px
+        // east = 2_560 m east, NW corner stays at translateY.
+        PixelGrid parent = pixelGrid("EPSG:32610", 10.0, 500_000.0, 4_202_560.0, 512, 256);
+        TileCoordinate tile = new TileCoordinate(256, 0, 256, 256, 0, 1);
+        String body = buildRequestBody(parent, tile);
 
         JsonNode affine = MAPPER.readTree(body).get("grid").get("affineTransform");
-        assertEquals(500000.0, affine.get("translateX").asDouble());
-        assertEquals(4202560.0, affine.get("translateY").asDouble());
+        assertEquals(502_560.0, affine.get("translateX").asDouble(), 0.001);
+        assertEquals(4_202_560.0, affine.get("translateY").asDouble(), 0.001);
         assertEquals(10.0, affine.get("scaleX").asDouble(), 0.001);
         assertEquals(-10.0, affine.get("scaleY").asDouble(), 0.001);
+    }
+
+    @Test
+    void requestBodyAffineTranslatesAcrossRowOffset() throws Exception {
+        // Tile shifted 1 row south = -10 m in CRS y (scaleY < 0).
+        PixelGrid parent = pixelGrid("EPSG:32610", 10.0, 500_000.0, 4_202_560.0, 256, 512);
+        TileCoordinate tile = new TileCoordinate(0, 256, 256, 256, 1, 0);
+        String body = buildRequestBody(parent, tile);
+
+        JsonNode affine = MAPPER.readTree(body).get("grid").get("affineTransform");
+        // translateY = parent.translateY + rowPx * scaleY = 4_202_560 + 256 * (-10)
+        //            = 4_200_000.
+        assertEquals(4_200_000.0, affine.get("translateY").asDouble(), 0.001);
     }
 
     // --- EeApiException classification tests ---
@@ -133,7 +169,7 @@ class TileFetchDoFnTest {
 
     @Test
     void classifyFailureUnwrapsEeApiExceptionAndPopulatesKind() {
-        TileCoordinate tile = new TileCoordinate(0, 0, 1, 1, 0, 0);
+        TileCoordinate tile = new TileCoordinate(0, 0, 256, 256, 0, 0);
         // Simulate the retry loop's wrapper: IOException(EeApiException(...)).
         EeApiException root = new EeApiException(
             400, tile.id(), "User memory limit exceeded."
@@ -149,14 +185,15 @@ class TileFetchDoFnTest {
         assertEquals(400, r.httpStatus());
         assertTrue(r.errorMessage().contains("memory limit"));
         assertEquals(5, r.attempts());
-        // Bbox + indices preserved from the failed TileCoordinate.
-        assertEquals(0.0, r.xMin());
+        // Pixel offsets + indices preserved from the failed TileCoordinate.
+        assertEquals(0, r.colPx());
+        assertEquals(256, r.widthPx());
         assertEquals(0, r.row());
     }
 
     @Test
     void classifyFailureFallsBackToUnknownForNonEeException() {
-        TileCoordinate tile = new TileCoordinate(0, 0, 1, 1, 0, 0);
+        TileCoordinate tile = new TileCoordinate(0, 0, 256, 256, 0, 0);
         java.io.IOException ioe = new java.io.IOException("connection reset");
 
         com.datensee.FailedTileRecord r = TileFetchDoFn.classifyFailure(
@@ -169,7 +206,7 @@ class TileFetchDoFnTest {
 
     @Test
     void classifyFailureRewritesAuthErrorMessageWithRemediation() {
-        TileCoordinate tile = new TileCoordinate(0, 0, 1, 1, 0, 0);
+        TileCoordinate tile = new TileCoordinate(0, 0, 256, 256, 0, 0);
         EeApiException root = new EeApiException(
             403, tile.id(), "Permission denied: missing credential."
         );
@@ -202,7 +239,7 @@ class TileFetchDoFnTest {
 
     @Test
     void classifyFailureAuthErrorWithoutSaUsesFallbackPhrase() {
-        TileCoordinate tile = new TileCoordinate(0, 0, 1, 1, 0, 0);
+        TileCoordinate tile = new TileCoordinate(0, 0, 256, 256, 0, 0);
         EeApiException root = new EeApiException(
             403, tile.id(), "Permission denied: insufficient authentication scopes."
         );

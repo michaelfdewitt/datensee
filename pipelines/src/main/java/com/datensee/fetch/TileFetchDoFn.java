@@ -3,7 +3,9 @@ package com.datensee.fetch;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.datensee.AffineTransform;
 import com.datensee.FetchedTile;
+import com.datensee.PixelGrid;
 import com.datensee.TileCoordinate;
 import com.google.auth.oauth2.GoogleCredentials;
 import com.google.common.util.concurrent.RateLimiter;
@@ -57,8 +59,7 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
 
     private final String eeExpression;
     private final String geeProject;
-    private final int tileSizePixels;
-    private final String crs;
+    private final PixelGrid parentGrid;
     private final double perWorkerQps;
 
     // Transient: not serialized by Beam; recreated on each worker in @Setup.
@@ -79,23 +80,22 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
     /**
      * @param eeExpression serialized EE computation (opaque JSON)
      * @param geeProject   GCP project ID for HV API
-     * @param tileSizePixels tile edge size in pixels
-     * @param crs          target CRS code
+     * @param parentGrid   parent {@link PixelGrid} for the export — every
+     *                     tile's per-fetch grid is derived from this by
+     *                     translation
      * @param maxQps       project-wide QPS cap for the HV API
      * @param maxWorkers   expected number of concurrent workers
      */
     public TileFetchDoFn(
         String eeExpression,
         String geeProject,
-        int tileSizePixels,
-        String crs,
+        PixelGrid parentGrid,
         double maxQps,
         int maxWorkers
     ) {
         this.eeExpression = eeExpression;
         this.geeProject = geeProject;
-        this.tileSizePixels = tileSizePixels;
-        this.crs = crs;
+        this.parentGrid = parentGrid;
         this.perWorkerQps = Math.max(1.0, maxQps / Math.max(1, maxWorkers));
     }
 
@@ -123,7 +123,7 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
         try {
             byte[] imageBytes = fetchWithRetry(tile);
             out.get(SUCCESS_TAG).output(
-                new FetchedTile(tile, imageBytes, tileSizePixels, tileSizePixels)
+                new FetchedTile(tile, imageBytes, tile.widthPx(), tile.heightPx())
             );
         } catch (IOException | InterruptedException e) {
             com.datensee.FailedTileRecord record = classifyFailure(
@@ -279,29 +279,34 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
      * EE computation graph. We parse it into a {@link JsonNode} and embed it
      * as the {@code expression} field — the HV API expects a JSON object there,
      * not a quoted string.
+     *
+     * <p>The per-tile grid is derived from the parent {@link PixelGrid} by
+     * translating its affine to the tile's NW corner — no bbox math, no
+     * pixelWidth/pixelHeight derivation. The resulting affine and dimensions
+     * go straight onto the wire.
      */
     private String buildRequestBody(TileCoordinate tile) throws IOException {
         JsonNode expressionNode = MAPPER.readTree(eeExpression);
 
-        double pixelWidth = (tile.xMax() - tile.xMin()) / tileSizePixels;
-        double pixelHeight = (tile.yMax() - tile.yMin()) / tileSizePixels;
+        PixelGrid tileGrid = parentGrid.forTile(tile);
+        AffineTransform a = tileGrid.affineTransform();
 
         ObjectNode affine = MAPPER.createObjectNode();
-        affine.put("scaleX", pixelWidth);
-        affine.put("shearX", 0.0);
-        affine.put("translateX", tile.xMin());
-        affine.put("shearY", 0.0);
-        affine.put("scaleY", -pixelHeight);
-        affine.put("translateY", tile.yMax());
+        affine.put("scaleX", a.scaleX());
+        affine.put("shearX", a.shearX());
+        affine.put("translateX", a.translateX());
+        affine.put("shearY", a.shearY());
+        affine.put("scaleY", a.scaleY());
+        affine.put("translateY", a.translateY());
 
         ObjectNode dimensions = MAPPER.createObjectNode();
-        dimensions.put("width", tileSizePixels);
-        dimensions.put("height", tileSizePixels);
+        dimensions.put("width", tileGrid.dimensions().width());
+        dimensions.put("height", tileGrid.dimensions().height());
 
         ObjectNode grid = MAPPER.createObjectNode();
         grid.set("dimensions", dimensions);
         grid.set("affineTransform", affine);
-        grid.put("crsCode", crs);
+        grid.put("crsCode", tileGrid.crsCode());
 
         ObjectNode requestNode = MAPPER.createObjectNode();
         requestNode.set("expression", expressionNode);

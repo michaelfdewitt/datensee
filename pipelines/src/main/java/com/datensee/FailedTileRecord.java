@@ -11,8 +11,8 @@ import java.time.Instant;
  *
  * <p>This record is the wire contract for {@code _failures.json} (NDJSON,
  * one record per line). It is a *superset* of {@link TileCoordinate}: a
- * future {@code datensee retry --journal} command can feed the journal
- * back in via the existing {@code tiles_file} input path because
+ * {@code datensee retry --journal} command can feed the journal back in
+ * via the existing {@code tiles_file} input path because
  * {@code TileCoordinate} ignores the extra fields. Keeping the formats
  * compatible means failure → retry is a one-liner with no parallel
  * deserialization code path.
@@ -37,10 +37,10 @@ import java.time.Instant;
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 public record FailedTileRecord(
-    @JsonProperty("x_min") double xMin,
-    @JsonProperty("y_min") double yMin,
-    @JsonProperty("x_max") double xMax,
-    @JsonProperty("y_max") double yMax,
+    @JsonProperty("col_px") int colPx,
+    @JsonProperty("row_px") int rowPx,
+    @JsonProperty("width_px") int widthPx,
+    @JsonProperty("height_px") int heightPx,
     int row,
     int col,
     @JsonProperty("out_row") int outRow,
@@ -106,7 +106,7 @@ public record FailedTileRecord(
     ) {
         Instant now = Instant.now();
         return new FailedTileRecord(
-            tile.xMin(), tile.yMin(), tile.xMax(), tile.yMax(),
+            tile.colPx(), tile.rowPx(), tile.widthPx(), tile.heightPx(),
             tile.row(), tile.col(),
             tile.outRow(), tile.outCol(),
             tile.lineage() != null ? tile.lineage() : java.util.List.of(),

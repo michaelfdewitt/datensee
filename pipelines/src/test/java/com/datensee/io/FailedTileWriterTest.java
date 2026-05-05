@@ -35,8 +35,8 @@ class FailedTileWriterTest {
     }
 
     @Test
-    void emitsRichSchemaWithBboxOutTileLineageAndErrorMetadata() throws Exception {
-        TileCoordinate tile = new TileCoordinate(10.0, 20.0, 11.0, 21.0, 3, 5);
+    void emitsRichSchemaWithPixelOffsetOutTileLineageAndErrorMetadata() throws Exception {
+        TileCoordinate tile = new TileCoordinate(256, 512, 256, 256, 3, 5);
         FailedTileRecord record = FailedTileRecord.fromTileWithError(
             tile, EeErrorKind.MEMORY_EXCEEDED,
             "User memory limit exceeded.", 400, 5
@@ -44,11 +44,11 @@ class FailedTileWriterTest {
         String json = emit(record);
         JsonNode parsed = MAPPER.readTree(json);
 
-        // Bounding box + indices (read by tiles_file consumer).
-        assertEquals(10.0, parsed.get("x_min").asDouble());
-        assertEquals(20.0, parsed.get("y_min").asDouble());
-        assertEquals(11.0, parsed.get("x_max").asDouble());
-        assertEquals(21.0, parsed.get("y_max").asDouble());
+        // Pixel offsets + dimensions + indices (read by tiles_file consumer).
+        assertEquals(256, parsed.get("col_px").asInt());
+        assertEquals(512, parsed.get("row_px").asInt());
+        assertEquals(256, parsed.get("width_px").asInt());
+        assertEquals(256, parsed.get("height_px").asInt());
         assertEquals(3, parsed.get("row").asInt());
         assertEquals(5, parsed.get("col").asInt());
         // M6 / two-tier defaults — out_row/out_col mirror row/col when unset.
@@ -76,7 +76,7 @@ class FailedTileWriterTest {
 
     @Test
     void emittedJsonIsSingleLineNdjson() throws Exception {
-        TileCoordinate tile = new TileCoordinate(0.5, 1.5, 2.5, 3.5, 0, 0);
+        TileCoordinate tile = new TileCoordinate(0, 0, 16, 16, 0, 0);
         String json = emit(FailedTileRecord.fromTile(tile));
         assertEquals(-1, json.indexOf('\n'), "no embedded newlines: " + json);
     }
@@ -87,17 +87,17 @@ class FailedTileWriterTest {
         // retry can read failures.json back in via the tiles_file path.
         // TileCoordinate's @JsonIgnoreProperties(ignoreUnknown=true) plus
         // its @JsonCreator default-defending constructor handle the extras.
-        TileCoordinate tile = new TileCoordinate(-122.5, 37.5, -122.0, 38.0, 7, 11);
+        TileCoordinate tile = new TileCoordinate(1024, 2048, 512, 512, 7, 11);
         FailedTileRecord record = FailedTileRecord.fromTileWithError(
             tile, EeErrorKind.COMPUTATION_TIMEOUT, "Computation timed out.", 400, 5
         );
         String json = emit(record);
 
         TileCoordinate parsed = MAPPER.readValue(json, TileCoordinate.class);
-        assertEquals(tile.xMin(), parsed.xMin());
-        assertEquals(tile.yMin(), parsed.yMin());
-        assertEquals(tile.xMax(), parsed.xMax());
-        assertEquals(tile.yMax(), parsed.yMax());
+        assertEquals(tile.colPx(), parsed.colPx());
+        assertEquals(tile.rowPx(), parsed.rowPx());
+        assertEquals(tile.widthPx(), parsed.widthPx());
+        assertEquals(tile.heightPx(), parsed.heightPx());
         assertEquals(tile.row(), parsed.row());
         assertEquals(tile.col(), parsed.col());
         assertEquals(tile.row(), parsed.outRow());
@@ -107,7 +107,7 @@ class FailedTileWriterTest {
 
     @Test
     void unknownKindWhenNoErrorContext() throws Exception {
-        TileCoordinate tile = new TileCoordinate(0, 0, 1, 1, 0, 0);
+        TileCoordinate tile = new TileCoordinate(0, 0, 16, 16, 0, 0);
         String json = emit(FailedTileRecord.fromTile(tile));
         JsonNode parsed = MAPPER.readTree(json);
         assertEquals("UNKNOWN", parsed.get("error_kind").asText());

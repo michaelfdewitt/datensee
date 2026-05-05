@@ -3,8 +3,11 @@ package com.datensee.io;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
+import com.datensee.AffineTransform;
 import com.datensee.FetchedTile;
+import com.datensee.GridDimensions;
 import com.datensee.OutputTileKey;
+import com.datensee.PixelGrid;
 import com.datensee.TileCoordinate;
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
@@ -36,6 +39,15 @@ import org.junit.jupiter.api.io.TempDir;
  */
 class AssembledCogWriterTest {
 
+    private static PixelGrid parentGrid(double pixelSize, double translateX, double translateY,
+                                        int width, int height) {
+        return new PixelGrid(
+            "EPSG:32610",
+            new AffineTransform(pixelSize, 0.0, translateX, 0.0, -pixelSize, translateY),
+            new GridDimensions(width, height)
+        );
+    }
+
     @Test
     void assembles256ComputeTilesInto256x256OutputCog(@TempDir Path tempDir) throws Exception {
         int innerSize = 16;
@@ -43,17 +55,12 @@ class AssembledCogWriterTest {
         int outerSize = innerSize * tilesPerSide;  // 256
         int totalTiles = tilesPerSide * tilesPerSide;  // 256
 
-        // Build the expected pixel grid first so we can construct each
-        // compute tile's TIFF from the corresponding 16x16 slice of it.
         byte[] expectedPixels = new byte[outerSize * outerSize];
         for (int y = 0; y < outerSize; y++) {
             for (int x = 0; x < outerSize; x++) {
-                int blockY = y / innerSize;
-                int blockX = x / innerSize;
-                int withinY = y % innerSize;
-                int withinX = x % innerSize;
                 expectedPixels[y * outerSize + x] = (byte) (
-                    (blockY * 71 + blockX * 31 + withinY * 13 + withinX * 7) & 0xFF
+                    ((y / innerSize) * 71 + (x / innerSize) * 31
+                        + (y % innerSize) * 13 + (x % innerSize) * 7) & 0xFF
                 );
             }
         }
@@ -61,18 +68,18 @@ class AssembledCogWriterTest {
         // Output tile origin: must align to the snapped global output
         // grid (multiple of outputTileSize * pixelSize on each axis),
         // since the assembler snaps to that origin internally. Pick a
-        // non-zero offset so ModelTiepoint isn't trivially zero, but
-        // still on-grid: 16 * outputTileSizeNative = 16 * 256 * 30.
+        // non-zero offset so ModelTiepoint isn't trivially zero.
         double pixelSize = 30.0;
         double outputXMin = -16.0 * outerSize * pixelSize;  // -122880
         double outputYMax = 8.0 * outerSize * pixelSize;    //   61440
 
-        // Fabricate 256 compute tiles. Each one's bbox lands it in the
-        // right (out_row, out_col) cell, and its pixel data is the
-        // 16x16 sub-block of expectedPixels at the corresponding
-        // position. Compute tile (row, col) maps to within-output-tile
-        // pixel offset (col * 16, row * 16) horizontally and from the
-        // top of the output tile vertically.
+        // Parent grid covers exactly this output tile. Tiles inside have
+        // colPx/rowPx local to the parent — i.e. starting at (0, 0).
+        PixelGrid parent = parentGrid(pixelSize, outputXMin, outputYMax, outerSize, outerSize);
+
+        // Fabricate 256 compute tiles. Each one's pixel offsets land it
+        // in the right block, and its pixel data is the 16x16 sub-block
+        // of expectedPixels.
         List<FetchedTile> computeTiles = new ArrayList<>();
         for (int outerRow = 0; outerRow < tilesPerSide; outerRow++) {
             for (int outerCol = 0; outerCol < tilesPerSide; outerCol++) {
@@ -83,19 +90,17 @@ class AssembledCogWriterTest {
                     int dstOff = dy * innerSize;
                     System.arraycopy(expectedPixels, srcOff, tilePixels, dstOff, innerSize);
                 }
-                // bbox: x increases left→right with col, y increases
-                // top→bottom (yMax decreases as row grows).
-                double xMin = outputXMin + outerCol * innerSize * pixelSize;
-                double xMax = xMin + innerSize * pixelSize;
-                double yMax = outputYMax - outerRow * innerSize * pixelSize;
-                double yMin = yMax - innerSize * pixelSize;
+                int colPx = outerCol * innerSize;
+                int rowPx = outerRow * innerSize;
+                double xMin = outputXMin + colPx * pixelSize;
+                double yMax = outputYMax - rowPx * pixelSize;
 
                 byte[] rawTiff = synthesizeStripUint8Tiff(
                     innerSize, innerSize, tilePixels,
                     pixelSize, xMin, yMax
                 );
                 TileCoordinate coord = new TileCoordinate(
-                    xMin, yMin, xMax, yMax,
+                    colPx, rowPx, innerSize, innerSize,
                     outerRow, outerCol,  // local row/col
                     0, 0,                // out_row, out_col — all into one output tile
                     List.of()
@@ -105,20 +110,16 @@ class AssembledCogWriterTest {
         }
         assertEquals(totalTiles, computeTiles.size());
 
-        // Run the assembler DoFn directly via its package-private process()
-        // method, skipping the Beam harness.
         AssembledCogWriter.AssembleAndWriteDoFn doFn =
             new AssembledCogWriter.AssembleAndWriteDoFn(
-                tempDir.toString(), innerSize, outerSize, "deflate"
+                tempDir.toString(), parent, innerSize, outerSize, "deflate"
             );
         doFn.setup();
         doFn.process(KV.of(new OutputTileKey(0, 0), computeTiles));
 
-        // The assembled COG should be at tempDir/tile_r0000_c0000.tif.
         Path cogPath = tempDir.resolve("tile_r0000_c0000.tif");
         byte[] cogBytes = Files.readAllBytes(cogPath);
 
-        // Decode and assert pixel-perfect reconstruction.
         byte[] decoded = TestTiffReader.decodeCogPixels(cogBytes);
         assertArrayEquals(
             expectedPixels, decoded,
@@ -129,8 +130,6 @@ class AssembledCogWriterTest {
 
     @Test
     void smallerCaseFourComputeTilesInto32x32OutputCog(@TempDir Path tempDir) throws Exception {
-        // Sanity-check 2x2 grid as a smaller variant — easier to debug
-        // if the larger test ever fails.
         int innerSize = 16;
         int outerSize = 32;
 
@@ -142,6 +141,7 @@ class AssembledCogWriterTest {
         double pixelSize = 1.0;
         double outputXMin = 0.0;
         double outputYMax = 32.0;
+        PixelGrid parent = parentGrid(pixelSize, outputXMin, outputYMax, outerSize, outerSize);
 
         List<FetchedTile> tiles = new ArrayList<>();
         for (int row = 0; row < 2; row++) {
@@ -151,15 +151,17 @@ class AssembledCogWriterTest {
                     int srcOff = (row * innerSize + dy) * outerSize + col * innerSize;
                     System.arraycopy(expectedPixels, srcOff, tilePixels, dy * innerSize, innerSize);
                 }
-                double xMin = outputXMin + col * innerSize * pixelSize;
-                double xMax = xMin + innerSize * pixelSize;
-                double yMax = outputYMax - row * innerSize * pixelSize;
-                double yMin = yMax - innerSize * pixelSize;
+                int colPx = col * innerSize;
+                int rowPx = row * innerSize;
+                double xMin = outputXMin + colPx * pixelSize;
+                double yMax = outputYMax - rowPx * pixelSize;
                 byte[] tiff = synthesizeStripUint8Tiff(
                     innerSize, innerSize, tilePixels, pixelSize, xMin, yMax
                 );
                 tiles.add(new FetchedTile(
-                    new TileCoordinate(xMin, yMin, xMax, yMax, row, col, 0, 0, List.of()),
+                    new TileCoordinate(
+                        colPx, rowPx, innerSize, innerSize, row, col, 0, 0, List.of()
+                    ),
                     tiff, innerSize, innerSize
                 ));
             }
@@ -167,7 +169,7 @@ class AssembledCogWriterTest {
 
         AssembledCogWriter.AssembleAndWriteDoFn doFn =
             new AssembledCogWriter.AssembleAndWriteDoFn(
-                tempDir.toString(), innerSize, outerSize, "deflate"
+                tempDir.toString(), parent, innerSize, outerSize, "deflate"
             );
         doFn.setup();
         doFn.process(KV.of(new OutputTileKey(0, 0), tiles));
@@ -179,15 +181,12 @@ class AssembledCogWriterTest {
 
     @Test
     void partialGroupEmitsSidecarWithMissingBlocks(@TempDir Path tempDir) throws Exception {
-        // 2×2 output tile with only 3 of 4 compute tiles present —
-        // simulates one upstream fetch failure that was dead-lettered.
-        // Asserts: COG still written (zero-filled at the missing block),
-        // sidecar JSON written enumerating the gap.
         int innerSize = 16;
         int outerSize = 32;
         double pixelSize = 1.0;
         double outputXMin = 0.0;
         double outputYMax = 32.0;
+        PixelGrid parent = parentGrid(pixelSize, outputXMin, outputYMax, outerSize, outerSize);
 
         List<FetchedTile> tiles = new ArrayList<>();
         for (int row = 0; row < 2; row++) {
@@ -197,15 +196,17 @@ class AssembledCogWriterTest {
                 }
                 byte[] tilePixels = new byte[innerSize * innerSize];
                 java.util.Arrays.fill(tilePixels, (byte) 0xAA);
-                double xMin = outputXMin + col * innerSize * pixelSize;
-                double xMax = xMin + innerSize * pixelSize;
-                double yMax = outputYMax - row * innerSize * pixelSize;
-                double yMin = yMax - innerSize * pixelSize;
+                int colPx = col * innerSize;
+                int rowPx = row * innerSize;
+                double xMin = outputXMin + colPx * pixelSize;
+                double yMax = outputYMax - rowPx * pixelSize;
                 byte[] tiff = synthesizeStripUint8Tiff(
                     innerSize, innerSize, tilePixels, pixelSize, xMin, yMax
                 );
                 tiles.add(new FetchedTile(
-                    new TileCoordinate(xMin, yMin, xMax, yMax, row, col, 0, 0, List.of()),
+                    new TileCoordinate(
+                        colPx, rowPx, innerSize, innerSize, row, col, 0, 0, List.of()
+                    ),
                     tiff, innerSize, innerSize
                 ));
             }
@@ -213,7 +214,7 @@ class AssembledCogWriterTest {
 
         AssembledCogWriter.AssembleAndWriteDoFn doFn =
             new AssembledCogWriter.AssembleAndWriteDoFn(
-                tempDir.toString(), innerSize, outerSize, "deflate"
+                tempDir.toString(), parent, innerSize, outerSize, "deflate"
             );
         doFn.setup();
         doFn.process(KV.of(new OutputTileKey(0, 0), tiles));
@@ -238,8 +239,6 @@ class AssembledCogWriterTest {
 
     @Test
     void completeGroupWritesNoSidecar(@TempDir Path tempDir) throws Exception {
-        // Mirror smallerCaseFourComputeTilesInto32x32OutputCog but assert
-        // the partial sidecar is NOT written when every block is present.
         int innerSize = 16;
         int outerSize = 32;
         byte[] expectedPixels = new byte[outerSize * outerSize];
@@ -247,6 +246,7 @@ class AssembledCogWriterTest {
             expectedPixels[i] = (byte) (i & 0xFF);
         }
         double pixelSize = 1.0;
+        PixelGrid parent = parentGrid(pixelSize, 0.0, 32.0, outerSize, outerSize);
 
         List<FetchedTile> tiles = new ArrayList<>();
         for (int row = 0; row < 2; row++) {
@@ -256,15 +256,17 @@ class AssembledCogWriterTest {
                     int srcOff = (row * innerSize + dy) * outerSize + col * innerSize;
                     System.arraycopy(expectedPixels, srcOff, tilePixels, dy * innerSize, innerSize);
                 }
-                double xMin = col * innerSize * pixelSize;
-                double xMax = xMin + innerSize * pixelSize;
-                double yMax = 32.0 - row * innerSize * pixelSize;
-                double yMin = yMax - innerSize * pixelSize;
+                int colPx = col * innerSize;
+                int rowPx = row * innerSize;
+                double xMin = colPx * pixelSize;
+                double yMax = 32.0 - rowPx * pixelSize;
                 byte[] tiff = synthesizeStripUint8Tiff(
                     innerSize, innerSize, tilePixels, pixelSize, xMin, yMax
                 );
                 tiles.add(new FetchedTile(
-                    new TileCoordinate(xMin, yMin, xMax, yMax, row, col, 0, 0, List.of()),
+                    new TileCoordinate(
+                        colPx, rowPx, innerSize, innerSize, row, col, 0, 0, List.of()
+                    ),
                     tiff, innerSize, innerSize
                 ));
             }
@@ -272,7 +274,7 @@ class AssembledCogWriterTest {
 
         AssembledCogWriter.AssembleAndWriteDoFn doFn =
             new AssembledCogWriter.AssembleAndWriteDoFn(
-                tempDir.toString(), innerSize, outerSize, "deflate"
+                tempDir.toString(), parent, innerSize, outerSize, "deflate"
             );
         doFn.setup();
         doFn.process(KV.of(new OutputTileKey(0, 0), tiles));
@@ -301,14 +303,6 @@ class AssembledCogWriterTest {
         int afterStrip = stripOffset + pixels.length;
         int ifdOffset = (afterStrip + 1) & ~1;
 
-        // Tag plan (sorted):
-        // 256 ImageWidth SHORT, 257 ImageLength SHORT, 258 BitsPerSample SHORT,
-        // 259 Compression SHORT (1), 262 Photometric SHORT (1),
-        // 273 StripOffsets LONG, 277 SamplesPerPixel SHORT,
-        // 278 RowsPerStrip SHORT, 279 StripByteCounts LONG,
-        // 284 PlanarConfiguration SHORT (1), 339 SampleFormat SHORT (1),
-        // 33550 ModelPixelScale DOUBLE[3] (overflow),
-        // 33922 ModelTiepoint DOUBLE[6] (overflow).
         int entryCount = 13;
         int ifdSize = 2 + entryCount * 12 + 4;
         int overflowStart = ifdOffset + ifdSize;
@@ -341,10 +335,9 @@ class AssembledCogWriterTest {
         writeShortInline(ifd, 339, 1);
         writeDoubleArrayOffset(ifd, 33550, 3, pixelScaleOffset);
         writeDoubleArrayOffset(ifd, 33922, 6, tiepointOffset);
-        ifd.putInt(0);  // next IFD = 0
+        ifd.putInt(0);
         out.writeBytes(ifd.array());
 
-        // Overflow: pixel scale + tiepoint.
         ByteBuffer overflow = ByteBuffer.allocate(24 + 48).order(order);
         overflow.putDouble(pixelSize);
         overflow.putDouble(pixelSize);
@@ -362,7 +355,7 @@ class AssembledCogWriterTest {
 
     private static void writeShortInline(ByteBuffer buf, int tag, int value) {
         buf.putShort((short) tag);
-        buf.putShort((short) 3);  // SHORT
+        buf.putShort((short) 3);
         buf.putInt(1);
         buf.putShort((short) value);
         buf.putShort((short) 0);
@@ -370,14 +363,14 @@ class AssembledCogWriterTest {
 
     private static void writeLongInline(ByteBuffer buf, int tag, int value) {
         buf.putShort((short) tag);
-        buf.putShort((short) 4);  // LONG
+        buf.putShort((short) 4);
         buf.putInt(1);
         buf.putInt(value);
     }
 
     private static void writeDoubleArrayOffset(ByteBuffer buf, int tag, int count, int offset) {
         buf.putShort((short) tag);
-        buf.putShort((short) 12);  // DOUBLE
+        buf.putShort((short) 12);
         buf.putInt(count);
         buf.putInt(offset);
     }

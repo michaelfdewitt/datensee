@@ -1,7 +1,9 @@
 package com.datensee.io;
 
+import com.datensee.AffineTransform;
 import com.datensee.FetchedTile;
 import com.datensee.OutputTileKey;
+import com.datensee.PixelGrid;
 import com.google.cloud.storage.BlobId;
 import com.google.cloud.storage.BlobInfo;
 import com.google.cloud.storage.Storage;
@@ -38,7 +40,7 @@ import org.slf4j.LoggerFactory;
  *     ─▶ AssembleAndWriteDoFn
  *         ├─ allocate output buffer (outputTileSize × outputTileSize)
  *         ├─ extract pixels from each compute tile, copy into buffer
- *         ├─ CogTranscoder.transcodeFromAssembledPixels(...)
+ *         ├─ CogTranscoder.transcodeFromTileBlocks(...)
  *         └─ write COG to GCS or local
  * </pre>
  *
@@ -47,6 +49,12 @@ import org.slf4j.LoggerFactory;
  * means EE's {@code Image.loadGeoTIFF} reads remain efficient even for
  * large output COGs — the per-tile fetch granularity is preserved as
  * the COG's own internal random-access granularity.
+ *
+ * <p>M11 simplification: tile placement is pure integer arithmetic on
+ * {@code colPx} / {@code rowPx} (the parent {@link PixelGrid}'s local
+ * pixel offsets). The pre-M11 bbox-derived block math, its float
+ * tolerance, and the off-grid / off-block guards all go away — by
+ * construction, every tile lines up.
  *
  * <p>Failure handling: when one or more compute tiles in a group are
  * absent (either dropped to the dead-letter PCollection upstream, or
@@ -64,38 +72,21 @@ import org.slf4j.LoggerFactory;
  *       COG enumerating the missing block coordinates so a downstream
  *       reader can cross-reference against the failures journal.</li>
  * </ul>
- *
- * <p>The number of compute tiles in a complete group depends on whether
- * the output tile lies on the region edge, so the assembler can't
- * distinguish "edge tile, fewer compute tiles by design" from "interior
- * tile with fetch failures" on its own — that disambiguation is the
- * caller's job (cross-reference partial sidecars with {@code _failures.json}).
  */
 public final class AssembledCogWriter
     extends PTransform<PCollection<FetchedTile>, PDone> {
 
     private static final Logger LOG = LoggerFactory.getLogger(AssembledCogWriter.class);
 
-    /**
-     * How far a compute-tile's bbox-derived block origin may drift, in
-     * pixels, from a perfect block boundary before the assembler treats
-     * it as a misaligned tile. With CRS coordinates in millions
-     * (UTM/equal-area projections at small scales), {@code Math.round}
-     * still produces stable integer block indices for any drift well
-     * below 1 pixel — but small ULP differences from float arithmetic
-     * shouldn't trip the alignment guard. 0.001 px = ~3 cm at 30 m/px
-     * resolution, which is comfortably tighter than any real-world
-     * misalignment but loose enough to absorb double-precision noise.
-     */
-    static final double TILE_ALIGNMENT_TOLERANCE_PX = 1e-3;
-
     private final String outputPath;
+    private final PixelGrid parentGrid;
     private final int computeTileSize;
     private final int outputTileSize;
     private final String compression;
 
     public AssembledCogWriter(
         String outputPath,
+        PixelGrid parentGrid,
         int computeTileSize,
         int outputTileSize,
         String compression
@@ -103,10 +94,7 @@ public final class AssembledCogWriter
         // The (outputTileSize % computeTileSize == 0) invariant is also
         // enforced at the wire boundary by PipelineConfig's pydantic
         // validator. We re-check here because Java has multiple potential
-        // clients (CLI-driven pipelines today; Cloud Run / FoundrEE bridge
-        // tomorrow) and the assembler's block math assumes a clean
-        // multiple — `transcodeFromTileBlocks` only checks the weaker
-        // (width % tileSize == 0) invariant.
+        // clients and the assembler's block math assumes a clean multiple.
         if (computeTileSize <= 0) {
             throw new IllegalArgumentException(
                 "computeTileSize must be positive, got " + computeTileSize
@@ -120,6 +108,7 @@ public final class AssembledCogWriter
             );
         }
         this.outputPath = outputPath;
+        this.parentGrid = parentGrid;
         this.computeTileSize = computeTileSize;
         this.outputTileSize = outputTileSize;
         this.compression = compression;
@@ -137,7 +126,7 @@ public final class AssembledCogWriter
             ))
             .apply("GroupByOutputTile", GroupByKey.create())
             .apply("AssembleAndWrite", ParDo.of(new AssembleAndWriteDoFn(
-                outputPath, computeTileSize, outputTileSize, compression
+                outputPath, parentGrid, computeTileSize, outputTileSize, compression
             )));
         return PDone.in(input.getPipeline());
     }
@@ -146,6 +135,7 @@ public final class AssembledCogWriter
         extends DoFn<KV<OutputTileKey, Iterable<FetchedTile>>, Void> {
 
         private final String outputPath;
+        private final PixelGrid parentGrid;
         private final int computeTileSize;
         private final int outputTileSize;
         private final String compression;
@@ -157,11 +147,13 @@ public final class AssembledCogWriter
 
         AssembleAndWriteDoFn(
             String outputPath,
+            PixelGrid parentGrid,
             int computeTileSize,
             int outputTileSize,
             String compression
         ) {
             this.outputPath = outputPath;
+            this.parentGrid = parentGrid;
             this.computeTileSize = computeTileSize;
             this.outputTileSize = outputTileSize;
             this.compression = compression;
@@ -203,25 +195,31 @@ public final class AssembledCogWriter
             FetchedTile first = computeTiles.getFirst();
             byte[] sourceTiff = first.imageBytes();
 
-            // Pixel size in CRS units, derived from the compute tile bbox.
-            double pixelNative =
-                (first.coordinate().xMax() - first.coordinate().xMin()) / computeTileSize;
-            double outputTileSizeNative = pixelNative * outputTileSize;
+            // Output tile pixel origin within the parent grid: snap the
+            // first compute tile's pixel offset down to the nearest
+            // outputTileSize multiple. All compute tiles in the same
+            // (outRow, outCol) group share this origin by construction.
+            int outputColPx =
+                (first.coordinate().colPx() / outputTileSize) * outputTileSize;
+            int outputRowPx =
+                (first.coordinate().rowPx() / outputTileSize) * outputTileSize;
 
-            // Snap output tile origin to the global output grid (anchored
-            // at CRS origin (0,0) — same convention as Python tiling).
-            double outputXMin = Math.floor(
-                first.coordinate().xMin() / outputTileSizeNative
-            ) * outputTileSizeNative;
-            double outputYMin = Math.floor(
-                first.coordinate().yMin() / outputTileSizeNative
-            ) * outputTileSizeNative;
-            double outputYMax = outputYMin + outputTileSizeNative;
+            // The output tile's affine is the parent's translated to its
+            // NW corner.
+            AffineTransform p = parentGrid.affineTransform();
+            AffineTransform outputAffine = new AffineTransform(
+                p.scaleX(),
+                p.shearX(),
+                p.translateX() + outputColPx * p.scaleX() + outputRowPx * p.shearX(),
+                p.shearY(),
+                p.scaleY(),
+                p.translateY() + outputColPx * p.shearY() + outputRowPx * p.scaleY()
+            );
 
             // Each compute tile becomes one inner COG block at index
             // (ty * tilesAcross + tx). Build a row-major list of pixel
-            // buffers; null entries (missing compute tiles, e.g. dead-
-            // lettered upstream) get zero-filled by the transcoder.
+            // buffers; null entries (missing compute tiles) get
+            // zero-filled by the transcoder.
             int tilesAcross = outputTileSize / computeTileSize;
             int tilesDown = outputTileSize / computeTileSize;
             List<byte[]> tilePixels = new ArrayList<>(tilesAcross * tilesDown);
@@ -230,42 +228,17 @@ public final class AssembledCogWriter
             }
 
             for (FetchedTile t : computeTiles) {
-                // Compute the bbox-derived position in pixels and verify
-                // both that the float drift from a perfect integer is
-                // within tolerance (catches off-grid bboxes) and that
-                // the rounded position is a clean multiple of the
-                // compute tile size (catches off-block bboxes).
-                double rawXPx = (t.coordinate().xMin() - outputXMin) / pixelNative;
-                double rawYPx = (outputYMax - t.coordinate().yMax()) / pixelNative;
-                int localXPx = (int) Math.round(rawXPx);
-                int localYPx = (int) Math.round(rawYPx);
-                if (Math.abs(rawXPx - localXPx) > TILE_ALIGNMENT_TOLERANCE_PX
-                    || Math.abs(rawYPx - localYPx) > TILE_ALIGNMENT_TOLERANCE_PX) {
-                    throw new IOException(
-                        "Compute tile " + t.coordinate().id()
-                        + " bbox is not pixel-aligned within output tile " + key
-                        + " (raw position " + rawXPx + "," + rawYPx + " px;"
-                        + " tolerance " + TILE_ALIGNMENT_TOLERANCE_PX + " px)."
-                        + " Check that scale and CRS match the original export."
-                    );
-                }
-                if (localXPx % computeTileSize != 0
-                    || localYPx % computeTileSize != 0) {
-                    throw new IOException(
-                        "Compute tile " + t.coordinate().id()
-                        + " (origin " + localXPx + "," + localYPx
-                        + " px within output tile " + key + ") is not"
-                        + " block-aligned to computeTileSize=" + computeTileSize
-                    );
-                }
-                int tx = localXPx / computeTileSize;
-                int ty = localYPx / computeTileSize;
+                int tx = (t.coordinate().colPx() - outputColPx) / computeTileSize;
+                int ty = (t.coordinate().rowPx() - outputRowPx) / computeTileSize;
                 if (tx < 0 || ty < 0 || tx >= tilesAcross || ty >= tilesDown) {
                     throw new IOException(
                         "Compute tile " + t.coordinate().id()
                         + " (block " + tx + "," + ty + ") falls outside"
                         + " output tile " + key
-                        + " (" + tilesAcross + "x" + tilesDown + " blocks)"
+                        + " (" + tilesAcross + "x" + tilesDown + " blocks)."
+                        + " colPx=" + t.coordinate().colPx() + ", rowPx="
+                        + t.coordinate().rowPx() + ", outputColPx=" + outputColPx
+                        + ", outputRowPx=" + outputRowPx
                     );
                 }
                 tilePixels.set(
@@ -280,7 +253,7 @@ public final class AssembledCogWriter
                 outputTileSize, outputTileSize,
                 computeTileSize,
                 sourceTiff,
-                outputXMin, outputYMax,
+                outputAffine,
                 compression
             );
 

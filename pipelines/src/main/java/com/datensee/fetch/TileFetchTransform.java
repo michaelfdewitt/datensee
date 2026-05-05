@@ -1,5 +1,6 @@
 package com.datensee.fetch;
 
+import com.datensee.PixelGrid;
 import com.datensee.TileCoordinate;
 import org.apache.beam.sdk.transforms.PTransform;
 import org.apache.beam.sdk.transforms.ParDo;
@@ -25,23 +26,20 @@ public final class TileFetchTransform
 
     private final String eeExpression;
     private final String geeProject;
-    private final int tileSizePixels;
-    private final String crs;
+    private final PixelGrid parentGrid;
     private final double maxQps;
     private final int maxWorkers;
 
     public TileFetchTransform(
         String eeExpression,
         String geeProject,
-        int tileSizePixels,
-        String crs,
+        PixelGrid parentGrid,
         double maxQps,
         int maxWorkers
     ) {
         this.eeExpression = eeExpression;
         this.geeProject = geeProject;
-        this.tileSizePixels = tileSizePixels;
-        this.crs = crs;
+        this.parentGrid = parentGrid;
         this.maxQps = maxQps;
         this.maxWorkers = maxWorkers;
     }
@@ -51,7 +49,7 @@ public final class TileFetchTransform
         return input.apply(
             "FetchTileFromEE",
             ParDo.of(new TileFetchDoFn(
-                    eeExpression, geeProject, tileSizePixels, crs, maxQps, maxWorkers
+                    eeExpression, geeProject, parentGrid, maxQps, maxWorkers
                 ))
                 .withOutputTags(TileFetchDoFn.SUCCESS_TAG,
                     TupleTagList.of(TileFetchDoFn.FAILED_TAG))

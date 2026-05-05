@@ -79,6 +79,7 @@ public final class DatensEEPipeline {
         validateConfig(config);
 
         int tileSize = config.tileGrid().effectiveTileSize();
+        PixelGrid parentGrid = config.tileGrid().pixelGrid();
         String crs = config.tileGrid().crs();
         PipelineConfig.RateLimitConfig rateLimit = config.effectiveRateLimit();
         int maxWorkers = resolveMaxWorkers(config);
@@ -115,7 +116,7 @@ public final class DatensEEPipeline {
         PCollectionTuple fetchResult = tiles.apply(
             "FetchTiles",
             new TileFetchTransform(
-                config.eeExpression(), config.geeProject(), tileSize, crs,
+                config.eeExpression(), config.geeProject(), parentGrid,
                 rateLimit.effectiveMaxQps(), maxWorkers
             )
         );
@@ -141,7 +142,8 @@ public final class DatensEEPipeline {
             fetched.apply(
                 "AssembleAndWriteOutputTiles",
                 new AssembledCogWriter(
-                    config.output().outputPath(), tileSize, outputTileSize, compression
+                    config.output().outputPath(), parentGrid, tileSize,
+                    outputTileSize, compression
                 )
             );
         } else {
@@ -315,10 +317,22 @@ public final class DatensEEPipeline {
                 + "or a local directory path."
             );
         }
-        if (config.tileGrid().crs() == null || config.tileGrid().crs().isBlank()) {
+        if (config.tileGrid().pixelGrid() == null
+            || config.tileGrid().pixelGrid().crsCode() == null
+            || config.tileGrid().pixelGrid().crsCode().isBlank()) {
             throw new IllegalArgumentException(
-                "tile_grid.crs is required. Provide an EPSG code (e.g. 'EPSG:4326') "
-                + "or a proj string."
+                "tile_grid.pixel_grid.crs_code is required. Provide an EPSG code "
+                + "(e.g. 'EPSG:4326') or a proj string."
+            );
+        }
+        if (config.tileGrid().pixelGrid().affineTransform() == null) {
+            throw new IllegalArgumentException(
+                "tile_grid.pixel_grid.affine_transform is required."
+            );
+        }
+        if (config.tileGrid().pixelGrid().dimensions() == null) {
+            throw new IllegalArgumentException(
+                "tile_grid.pixel_grid.dimensions is required."
             );
         }
     }

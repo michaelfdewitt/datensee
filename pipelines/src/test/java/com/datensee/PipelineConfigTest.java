@@ -23,11 +23,21 @@ class PipelineConfigTest {
               "ee_expression": "{\\"result\\":\\"0\\",\\"values\\":{}}",
               "gee_project": "test-project",
               "tile_grid": {
-                "crs": "EPSG:4326",
-                "scale_meters": 30.0,
+                "pixel_grid": {
+                  "crs_code": "EPSG:4326",
+                  "affine_transform": {
+                    "scale_x": 0.000269458,
+                    "shear_x": 0,
+                    "translate_x": 0,
+                    "shear_y": 0,
+                    "scale_y": -0.000269458,
+                    "translate_y": 1
+                  },
+                  "dimensions": {"width": 512, "height": 512}
+                },
                 "tile_size_pixels": 512,
                 "tiles": [
-                  {"x_min": 0, "y_min": 0, "x_max": 1, "y_max": 1, "row": 0, "col": 0}
+                  {"col_px": 0, "row_px": 0, "width_px": 512, "height_px": 512, "row": 0, "col": 0}
                 ]
               },
               "output": {
@@ -43,8 +53,11 @@ class PipelineConfigTest {
 
         assertEquals("test-project", config.geeProject());
         assertEquals("EPSG:4326", config.tileGrid().crs());
+        assertEquals("EPSG:4326", config.tileGrid().pixelGrid().crsCode());
         assertEquals(512, config.tileGrid().effectiveTileSize());
         assertEquals(1, config.tileGrid().tiles().size());
+        assertEquals(0, config.tileGrid().tiles().get(0).colPx());
+        assertEquals(512, config.tileGrid().tiles().get(0).widthPx());
         assertEquals("/tmp/test", config.output().outputPath());
         assertEquals(1, config.output().effectiveBandCount());
         assertEquals("float32", config.output().effectiveDataType());
@@ -59,12 +72,22 @@ class PipelineConfigTest {
               "ee_expression": "{\\"result\\":\\"0\\",\\"values\\":{}}",
               "gee_project": "my-project",
               "tile_grid": {
-                "crs": "EPSG:32610",
-                "scale_meters": 10.0,
+                "pixel_grid": {
+                  "crs_code": "EPSG:32610",
+                  "affine_transform": {
+                    "scale_x": 10.0,
+                    "shear_x": 0,
+                    "translate_x": 500000,
+                    "shear_y": 0,
+                    "scale_y": -10.0,
+                    "translate_y": 4202560
+                  },
+                  "dimensions": {"width": 512, "height": 256}
+                },
                 "tile_size_pixels": 256,
                 "tiles": [
-                  {"x_min": 500000, "y_min": 4200000, "x_max": 502560, "y_max": 4202560, "row": 0, "col": 0},
-                  {"x_min": 502560, "y_min": 4200000, "x_max": 505120, "y_max": 4202560, "row": 0, "col": 1}
+                  {"col_px": 0,   "row_px": 0, "width_px": 256, "height_px": 256, "row": 0, "col": 0},
+                  {"col_px": 256, "row_px": 0, "width_px": 256, "height_px": 256, "row": 0, "col": 1}
                 ]
               },
               "output": {
@@ -98,7 +121,8 @@ class PipelineConfigTest {
         PipelineConfig config = MAPPER.readValue(json, PipelineConfig.class);
 
         assertEquals("EPSG:32610", config.tileGrid().crs());
-        assertEquals(10.0, config.tileGrid().scaleMeters());
+        assertEquals(10.0, config.tileGrid().pixelGrid().affineTransform().scaleX());
+        assertEquals(500000.0, config.tileGrid().pixelGrid().affineTransform().translateX());
         assertEquals(256, config.tileGrid().effectiveTileSize());
         assertEquals(2, config.tileGrid().tiles().size());
         assertEquals(3, config.output().effectiveBandCount());
@@ -118,13 +142,19 @@ class PipelineConfigTest {
               "ee_expression": "{}",
               "gee_project": "p",
               "tile_grid": {
-                "crs": "EPSG:4326",
-                "scale_meters": 30.0,
-                "tile_size_pixels": 512,
+                "pixel_grid": {
+                  "crs_code": "EPSG:4326",
+                  "affine_transform": {
+                    "scale_x": 1, "shear_x": 0, "translate_x": 0,
+                    "shear_y": 0, "scale_y": -1, "translate_y": 1
+                  },
+                  "dimensions": {"width": 1, "height": 1}
+                },
+                "tile_size_pixels": 1,
                 "tiles": [
-                  {"x_min": 0, "y_min": 0, "x_max": 1, "y_max": 1, "row": 0, "col": 0},
-                  {"x_min": 1, "y_min": 0, "x_max": 2, "y_max": 1, "row": 0, "col": 1},
-                  {"x_min": 0, "y_min": 1, "x_max": 1, "y_max": 2, "row": 1, "col": 0}
+                  {"col_px": 0, "row_px": 0, "width_px": 1, "height_px": 1, "row": 0, "col": 0},
+                  {"col_px": 1, "row_px": 0, "width_px": 1, "height_px": 1, "row": 0, "col": 1},
+                  {"col_px": 0, "row_px": 1, "width_px": 1, "height_px": 1, "row": 1, "col": 0}
                 ]
               },
               "output": { "output_path": "/tmp/out", "band_count": 1, "data_type": "float32" },
@@ -143,11 +173,17 @@ class PipelineConfigTest {
               "ee_expression": "{}",
               "gee_project": "p",
               "tile_grid": {
-                "crs": "EPSG:4326",
-                "scale_meters": 30.0,
+                "pixel_grid": {
+                  "crs_code": "EPSG:4326",
+                  "affine_transform": {
+                    "scale_x": 1, "shear_x": 0, "translate_x": 0,
+                    "shear_y": 0, "scale_y": -1, "translate_y": 1
+                  },
+                  "dimensions": {"width": 1, "height": 1}
+                },
                 "tile_size_pixels": 512,
                 "tiles": [
-                  {"x_min": 0, "y_min": 0, "x_max": 1, "y_max": 1, "row": 0, "col": 0}
+                  {"col_px": 0, "row_px": 0, "width_px": 1, "height_px": 1, "row": 0, "col": 0}
                 ]
               },
               "output": { "output_path": "/tmp/out" },
@@ -167,10 +203,16 @@ class PipelineConfigTest {
               "ee_expression": "{}",
               "gee_project": "p",
               "tile_grid": {
-                "crs": "EPSG:4326",
-                "scale_meters": 30.0,
+                "pixel_grid": {
+                  "crs_code": "EPSG:4326",
+                  "affine_transform": {
+                    "scale_x": 1, "shear_x": 0, "translate_x": 0,
+                    "shear_y": 0, "scale_y": -1, "translate_y": 1
+                  },
+                  "dimensions": {"width": 1, "height": 1}
+                },
                 "tiles": [
-                  {"x_min": 0, "y_min": 0, "x_max": 1, "y_max": 1, "row": 0, "col": 0}
+                  {"col_px": 0, "row_px": 0, "width_px": 1, "height_px": 1, "row": 0, "col": 0}
                 ]
               },
               "output": { "output_path": "/tmp/out" },
@@ -190,8 +232,14 @@ class PipelineConfigTest {
               "ee_expression": "{}",
               "gee_project": "p",
               "tile_grid": {
-                "crs": "EPSG:4326",
-                "scale_meters": 30.0,
+                "pixel_grid": {
+                  "crs_code": "EPSG:4326",
+                  "affine_transform": {
+                    "scale_x": 1, "shear_x": 0, "translate_x": 0,
+                    "shear_y": 0, "scale_y": -1, "translate_y": 1
+                  },
+                  "dimensions": {"width": 1, "height": 1}
+                },
                 "tiles_file": "gs://bucket/tiles.ndjson"
               },
               "output": { "output_path": "gs://bucket/output" },

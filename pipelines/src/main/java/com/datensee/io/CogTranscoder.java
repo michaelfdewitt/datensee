@@ -1,5 +1,6 @@
 package com.datensee.io;
 
+import com.datensee.AffineTransform;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -46,6 +47,8 @@ public final class CogTranscoder {
     private static final int TAG_SAMPLE_FORMAT = 339;
     private static final int TAG_PREDICTOR = 317;
     private static final int TAG_PLANAR_CONFIGURATION = 284;
+    private static final int TAG_MODEL_PIXEL_SCALE = 33550;
+    private static final int TAG_MODEL_TIEPOINT = 33922;
 
     // TIFF type sizes (in bytes)
     private static final int[] TYPE_SIZES = {0, 1, 1, 2, 4, 8, 1, 1, 2, 4, 8, 4, 8};
@@ -161,13 +164,15 @@ public final class CogTranscoder {
      * the group failed upstream — the COG still tiles cleanly with a
      * blank block where the missing data would have lived).
      *
-     * <p>The {@code outputTileOriginX} / {@code outputTileOriginY} pair
-     * supplies the output tile's geographic origin in CRS units; this is
-     * written as the {@code ModelTiepointTag} so the resulting COG is
-     * georeferenced to the correct top-left corner. All other GeoTIFF
-     * tags (ModelPixelScale, GeoKeyDirectoryTag, GeoAsciiParams, etc.)
-     * are inherited from the supplied source tile — every compute tile
-     * shares them.
+     * <p>The {@link AffineTransform} supplies the output tile's affine in
+     * CRS units; the transcoder writes both the {@code ModelTiepointTag}
+     * (from {@code translateX}/{@code translateY}) and the
+     * {@code ModelPixelScaleTag} (from {@code |scaleX|}/{@code |scaleY|}),
+     * so the COG is authoritatively georeferenced from the parent grid
+     * rather than inheriting a possibly-stale {@code ModelPixelScale}
+     * from the source compute tile. Other GeoTIFF tags
+     * (GeoKeyDirectoryTag, GeoAsciiParams, etc.) are inherited from the
+     * supplied source tile — every compute tile shares them.
      *
      * @param tilePixels             row-major list of per-block pixel
      *                               buffers (length = {@code (width/tileSize)
@@ -182,10 +187,9 @@ public final class CogTranscoder {
      * @param tileSize               COG internal block size = compute tile size
      * @param sourceTiffForMetadata  any compute tile from the group; used
      *                               for sample structure and CRS metadata
-     * @param outputTileOriginX      x-coordinate of output tile origin
-     *                               (typically xMin)
-     * @param outputTileOriginY      y-coordinate of output tile origin
-     *                               (typically yMax)
+     * @param outputAffine           output tile's affine transform — used
+     *                               to write ModelTiepoint and
+     *                               ModelPixelScale tags
      * @param compression            compression algorithm ("deflate" or "none")
      */
     public static byte[] transcodeFromTileBlocks(
@@ -193,8 +197,7 @@ public final class CogTranscoder {
         int width, int height,
         int tileSize,
         byte[] sourceTiffForMetadata,
-        double outputTileOriginX,
-        double outputTileOriginY,
+        AffineTransform outputAffine,
         String compression
     ) throws IOException {
         if (width % tileSize != 0 || height % tileSize != 0) {
@@ -226,15 +229,22 @@ public final class CogTranscoder {
         int samplesPerPixel = sourceEntries.containsKey(277)
             ? getIntValue(sourceEntries, 277) : 1;
 
-        // Override the source ImageWidth/ImageLength and ModelTiepoint
-        // (33922) — everything else (ModelPixelScale, GeoKeyDirectory,
-        // GeoAsciiParams, sample-structure tags) is inherited via the
-        // copy loop in buildCogTiff.
+        // Override ImageWidth/ImageLength + ModelTiepoint + ModelPixelScale
+        // — everything else (GeoKeyDirectory, GeoAsciiParams, sample-
+        // structure tags) is inherited via the copy loop in buildCogTiff.
         Map<Integer, IfdEntry> overridden = new LinkedHashMap<>(sourceEntries);
         overridden.put(TAG_IMAGE_WIDTH, IfdEntry.shortValue(TAG_IMAGE_WIDTH, width));
         overridden.put(TAG_IMAGE_LENGTH, IfdEntry.shortValue(TAG_IMAGE_LENGTH, height));
-        overridden.put(33922, IfdEntry.doubleArray(33922, new double[] {
-            0.0, 0.0, 0.0, outputTileOriginX, outputTileOriginY, 0.0
+        // ModelPixelScale wants |scaleX|, |scaleY|, 0.0 — the GeoTIFF
+        // convention's pixel-scale Y is positive (north-up sign comes
+        // from ModelTiepoint + the implicit row-down raster axis).
+        overridden.put(TAG_MODEL_PIXEL_SCALE, IfdEntry.doubleArray(
+            TAG_MODEL_PIXEL_SCALE,
+            new double[] {Math.abs(outputAffine.scaleX()), Math.abs(outputAffine.scaleY()), 0.0}
+        ));
+        overridden.put(TAG_MODEL_TIEPOINT, IfdEntry.doubleArray(TAG_MODEL_TIEPOINT, new double[] {
+            0.0, 0.0, 0.0,
+            outputAffine.translateX(), outputAffine.translateY(), 0.0
         }));
 
         return partitionCompressBuild(

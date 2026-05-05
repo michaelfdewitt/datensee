@@ -7,23 +7,31 @@ import java.io.Serializable;
 import java.util.List;
 
 /**
- * Bounding box of a single compute tile in the target CRS.
+ * A compute tile as an integer pixel rectangle inside the parent
+ * {@link PixelGrid}.
  *
- * <p>Serializable so it can travel through the Beam pipeline as a PCollection
- * element.
+ * <p>{@code colPx} / {@code rowPx} are <strong>local</strong> offsets from
+ * the parent grid's {@code translateX} / {@code translateY} — not absolute
+ * against a global {@code (0, 0)}. The parent's translate already encodes
+ * where the export sits in CRS units; tile offsets within it are small.
+ * {@code widthPx} / {@code heightPx} are the tile's own pixel dimensions;
+ * for root tiles they equal {@code tile_size_pixels}, and quadtree split
+ * children halve each axis.
  *
- * <p>{@code row} and {@code col} are pinned to the *root* compute tile and do
- * not change under adaptive splitting. {@code outRow} and {@code outCol} are
- * M6 two-tier-tiling indices identifying the output COG this tile contributes
+ * <p>Serializable so it can travel through the Beam pipeline as a
+ * PCollection element.
+ *
+ * <p>{@code row} and {@code col} are pinned to the *root* compute tile
+ * and do not change under adaptive splitting (row=0 is the northernmost
+ * tile, col=0 the westernmost). {@code outRow}/{@code outCol} are M6
+ * two-tier-tiling indices identifying the output COG this tile contributes
  * to (defaults equal {@code row}/{@code col}).
  *
- * <p>{@code lineage} (sketch — adaptive quadtree retry) is the path from the
- * root compute tile to a sub-tile produced by adaptive splitting. Each entry
- * is a quadrant index 0–3, layout-independent of CRS axis order:
- * 0=x-low/y-low, 1=x-high/y-low, 2=x-low/y-high, 3=x-high/y-high.
- * Empty list means root compute tile (the common case). The bounding box
- * is the geometric truth used by the assembler; lineage is metadata for
- * the failure journal and the retry-decision logic.
+ * <p>{@code lineage} (adaptive quadtree retry) is the path from the root
+ * compute tile to a sub-tile. Each entry is a quadrant index 0–3,
+ * layout-independent of CRS axis order: {@code 0=x-low/y-low},
+ * {@code 1=x-high/y-low}, {@code 2=x-low/y-high}, {@code 3=x-high/y-high}.
+ * Empty list means root compute tile (the common case).
  *
  * <p>{@code @JsonIgnoreProperties(ignoreUnknown = true)} lets a failures
  * journal (which carries extra fields like {@code error_kind}, {@code
@@ -32,10 +40,10 @@ import java.util.List;
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 public record TileCoordinate(
-    @JsonProperty("x_min") double xMin,
-    @JsonProperty("y_min") double yMin,
-    @JsonProperty("x_max") double xMax,
-    @JsonProperty("y_max") double yMax,
+    @JsonProperty("col_px") int colPx,
+    @JsonProperty("row_px") int rowPx,
+    @JsonProperty("width_px") int widthPx,
+    @JsonProperty("height_px") int heightPx,
     int row,
     int col,
     @JsonProperty("out_row") int outRow,
@@ -53,10 +61,10 @@ public record TileCoordinate(
      */
     @JsonCreator
     public static TileCoordinate fromJson(
-        @JsonProperty("x_min") double xMin,
-        @JsonProperty("y_min") double yMin,
-        @JsonProperty("x_max") double xMax,
-        @JsonProperty("y_max") double yMax,
+        @JsonProperty("col_px") int colPx,
+        @JsonProperty("row_px") int rowPx,
+        @JsonProperty("width_px") int widthPx,
+        @JsonProperty("height_px") int heightPx,
         @JsonProperty("row") int row,
         @JsonProperty("col") int col,
         @JsonProperty("out_row") Integer outRow,
@@ -64,7 +72,7 @@ public record TileCoordinate(
         @JsonProperty("lineage") List<Integer> lineage
     ) {
         return new TileCoordinate(
-            xMin, yMin, xMax, yMax, row, col,
+            colPx, rowPx, widthPx, heightPx, row, col,
             outRow != null ? outRow : row,
             outCol != null ? outCol : col,
             lineage != null ? List.copyOf(lineage) : List.of()
@@ -76,9 +84,9 @@ public record TileCoordinate(
      * out_row/out_col equal row/col). Used by tests and pre-M6 call sites.
      */
     public TileCoordinate(
-        double xMin, double yMin, double xMax, double yMax, int row, int col
+        int colPx, int rowPx, int widthPx, int heightPx, int row, int col
     ) {
-        this(xMin, yMin, xMax, yMax, row, col, row, col, List.of());
+        this(colPx, rowPx, widthPx, heightPx, row, col, row, col, List.of());
     }
 
     /** Returns a human-readable tile identifier for logging. */
