@@ -120,8 +120,13 @@ public final class AssembledCogWriter
             .apply("KeyByOutputTile", WithKeys.of(
                 (FetchedTile t) -> new OutputTileKey(t.coordinate().outRow(), t.coordinate().outCol())
             ).withKeyType(TypeDescriptor.of(OutputTileKey.class)))
+            // Dataflow's GroupByKey requires a deterministic key coder;
+            // Java's SerializableCoder is non-deterministic by default. We
+            // pair our deterministic OutputTileKeyCoder with the standard
+            // SerializableCoder for the FetchedTile value (records carry
+            // raw GeoTIFF bytes, which are already byte-stable).
             .setCoder(org.apache.beam.sdk.coders.KvCoder.of(
-                SerializableCoder.of(OutputTileKey.class),
+                OutputTileKey.OutputTileKeyCoder.of(),
                 SerializableCoder.of(FetchedTile.class)
             ))
             .apply("GroupByOutputTile", GroupByKey.create())
