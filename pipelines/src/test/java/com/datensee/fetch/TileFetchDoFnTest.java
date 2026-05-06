@@ -34,9 +34,7 @@ class TileFetchDoFnTest {
         TileFetchDoFn doFn = new TileFetchDoFn(
             "{\"result\":\"0\",\"values\":{}}",
             "test-project",
-            parentGrid,
-            100.0,
-            1
+            parentGrid
         );
         Method method = TileFetchDoFn.class.getDeclaredMethod(
             "buildRequestBody", TileCoordinate.class
@@ -184,7 +182,7 @@ class TileFetchDoFnTest {
         assertEquals(EeErrorKind.MEMORY_EXCEEDED, r.errorKind());
         assertEquals(400, r.httpStatus());
         assertTrue(r.errorMessage().contains("memory limit"));
-        assertEquals(5, r.attempts());
+        assertEquals(6, r.attempts());
         // Pixel offsets + indices preserved from the failed TileCoordinate.
         assertEquals(0, r.colPx());
         assertEquals(256, r.widthPx());

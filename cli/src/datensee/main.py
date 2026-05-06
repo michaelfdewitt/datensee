@@ -322,18 +322,124 @@ def status(
         str,
         typer.Option("--region-gcp", help="Dataflow region."),
     ] = "us-central1",
+    tile_count: Annotated[
+        int | None,
+        typer.Option(
+            "--tile-count",
+            help=(
+                "Total compute tile count, used by the failure-rate "
+                "watchdog. Read it off the export's `_pipeline-config.json` "
+                "if you don't have it handy. Without it, the failure-rate "
+                "check is skipped (max_runtime + idle_timeout still apply)."
+            ),
+        ),
+    ] = None,
+    max_runtime_hours: Annotated[
+        float | None,
+        typer.Option(
+            "--max-runtime-hours",
+            help=(
+                "Hard wall-clock cap on the job. Cancels the Dataflow job "
+                "and exits non-zero if exceeded. Default 12 h. Use --no-watchdog "
+                "to disable all checks at once, or pass a value <= 0 to disable "
+                "this specific check."
+            ),
+        ),
+    ] = 12.0,
+    max_failure_rate: Annotated[
+        float | None,
+        typer.Option(
+            "--max-failure-rate",
+            help=(
+                "Cancel if (failures / tile_count) exceeds this fraction "
+                "after the grace period. Default 0.5. Pass a value <= 0 to "
+                "disable. Requires --tile-count."
+            ),
+        ),
+    ] = 0.5,
+    failure_grace_minutes: Annotated[
+        float,
+        typer.Option(
+            "--failure-grace-minutes",
+            help=(
+                "Skip the failure-rate check for this many minutes after "
+                "job start, while the worker pool is ramping up."
+            ),
+        ),
+    ] = 10.0,
+    idle_timeout_minutes: Annotated[
+        float | None,
+        typer.Option(
+            "--idle-timeout-minutes",
+            help=(
+                "Cancel if no progress (no new output_tiles_written or "
+                "tiles_written) for this many minutes. Default 20. Pass a "
+                "value <= 0 to disable."
+            ),
+        ),
+    ] = 20.0,
+    no_watchdog: Annotated[
+        bool,
+        typer.Option(
+            "--no-watchdog",
+            help=(
+                "Disable all watchdog cost controls. Use only when you "
+                "intend to manage cancellation manually."
+            ),
+        ),
+    ] = False,
 ) -> None:
-    """Poll a Dataflow job until it reaches a terminal state."""
+    """Poll a Dataflow job until it reaches a terminal state.
+
+    Applies cost-control watchdog policies by default — wall-clock cap,
+    failure-rate breaker, idle-timeout — that cancel the underlying
+    Dataflow job if any breach is observed. Each policy is independently
+    configurable via flags above; ``--no-watchdog`` turns the whole
+    apparatus off in a single switch.
+    """
+    from datetime import timedelta
+
     from datensee.auth import get_access_token
-    from datensee.status import poll_job
+    from datensee.status import WatchdogConfig, WatchdogTriggered, poll_job
+
+    if no_watchdog:
+        watchdog = WatchdogConfig(
+            max_runtime=None, max_failure_rate=None, idle_timeout=None
+        )
+    else:
+        watchdog = WatchdogConfig(
+            max_runtime=(
+                timedelta(hours=max_runtime_hours)
+                if max_runtime_hours is not None and max_runtime_hours > 0
+                else None
+            ),
+            max_failure_rate=(
+                max_failure_rate
+                if max_failure_rate is not None and max_failure_rate > 0
+                else None
+            ),
+            failure_grace_period=timedelta(minutes=failure_grace_minutes),
+            idle_timeout=(
+                timedelta(minutes=idle_timeout_minutes)
+                if idle_timeout_minutes is not None and idle_timeout_minutes > 0
+                else None
+            ),
+        )
 
     access_token = get_access_token()
-    final_state = poll_job(
-        job_id=job_id,
-        project=project,
-        region=region_gcp,
-        access_token=access_token,
-    )
+    try:
+        final_state = poll_job(
+            job_id=job_id,
+            project=project,
+            region=region_gcp,
+            access_token=access_token,
+            watchdog=watchdog,
+            tile_count=tile_count,
+        )
+    except WatchdogTriggered as exc:
+        console.print(f"[red]Watchdog cancelled job:[/red] {exc.reason}")
+        raise typer.Exit(code=2) from exc
+
     if final_state.value == "JOB_STATE_DONE":
         console.print("[green]Job completed successfully.[/green]")
     else:

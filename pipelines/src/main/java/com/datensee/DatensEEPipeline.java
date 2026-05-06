@@ -81,19 +81,14 @@ public final class DatensEEPipeline {
         int tileSize = config.tileGrid().effectiveTileSize();
         PixelGrid parentGrid = config.tileGrid().pixelGrid();
         String crs = config.tileGrid().crs();
-        PipelineConfig.RateLimitConfig rateLimit = config.effectiveRateLimit();
-        int maxWorkers = resolveMaxWorkers(config);
 
         LOG.info(
-            "Pipeline config: project={}, tiles={}, tileSize={}px, crs={}, "
-            + "output={}, maxQps={}, maxWorkers={}",
+            "Pipeline config: project={}, tiles={}, tileSize={}px, crs={}, output={}",
             config.geeProject(),
             config.tileGrid().hasExternalTiles() ? "(file)" : config.tileCount(),
             tileSize,
             crs,
-            config.output().outputPath(),
-            rateLimit.effectiveMaxQps(),
-            maxWorkers
+            config.output().outputPath()
         );
 
         Pipeline pipeline = Pipeline.create(options);
@@ -116,8 +111,7 @@ public final class DatensEEPipeline {
         PCollectionTuple fetchResult = tiles.apply(
             "FetchTiles",
             new TileFetchTransform(
-                config.eeExpression(), config.geeProject(), parentGrid,
-                rateLimit.effectiveMaxQps(), maxWorkers
+                config.eeExpression(), config.geeProject(), parentGrid
             )
         );
 
@@ -264,16 +258,6 @@ public final class DatensEEPipeline {
         } finally {
             Arrays.fill(buf, (byte) 0);
         }
-    }
-
-    private static int resolveMaxWorkers(PipelineConfig config) {
-        if (config.runner() != null
-            && config.runner().dataflow() != null
-            && config.runner().dataflow().maxWorkers() > 0) {
-            return config.runner().dataflow().maxWorkers();
-        }
-        // Local runner: single JVM, typically 1 effective worker
-        return 1;
     }
 
     private static String failuresOutputPath(String outputPath) {

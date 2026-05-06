@@ -195,24 +195,84 @@ class OutputConfig(BaseModel):
 
 
 class RateLimitConfig(BaseModel):
-    """Rate limiting for the EE High Volume API."""
+    """Advisory rate-limit config. **Currently not enforced by the pipeline.**
+
+    Tile fetches are I/O-bound; the binding throughput constraint is the
+    count of concurrent in-flight HTTP requests we keep open, not a
+    project-wide QPS budget. EE's HV API enforces its own quota and
+    surfaces overflow as 429 — ``TileFetchDoFn``'s exponential-backoff
+    retry path is the rate-shaping signal. A client-side QPS limiter
+    sized below EE's actual capacity just starves Dataflow's autoscaler
+    and slows the export.
+
+    The field stays in the schema for backwards compatibility with
+    callers that pass ``max_qps`` and to keep the user-stated intent
+    visible in ``_pipeline-config.json`` for diagnostics, but neither
+    the Java pipeline nor the Python CLI consults it at runtime.
+    """
 
     max_qps: int = Field(
         default=100,
         gt=0,
-        description="Maximum queries per second across all workers",
+        description=(
+            "Advisory only — see class docstring. The pipeline does not "
+            "enforce a per-worker token budget; throughput is shaped by "
+            "Dataflow worker parallelism plus 429-driven exponential "
+            "backoff."
+        ),
     )
 
 
 class DataflowRunnerConfig(BaseModel):
-    """Dataflow-specific runner options."""
+    """Dataflow-specific runner options.
+
+    The defaults are tuned for I/O-bound tile fetches against the EE HV
+    API: every knob below ratchets actual concurrency upward, because
+    the binding throughput constraint is *concurrent in-flight requests*
+    (workers × harness threads × HTTP latency), not project-wide QPS.
+    EE's own quota system, surfaced as 429s with exponential-backoff
+    retries inside ``TileFetchDoFn``, is the rate-shaping signal —
+    Dataflow-side rate limiters only starve us.
+    """
 
     project: str
     region: str
     temp_location: str = Field(description="GCS URI for Dataflow temp files")
     staging_location: str = Field(description="GCS URI for Dataflow staging files")
     machine_type: str = "n2-standard-4"
+    num_workers: int = Field(
+        default=4,
+        gt=0,
+        description=(
+            "Initial worker count. Dataflow's batch autoscaler is reactive — "
+            "it only scales up after observing backlog — so booting with a "
+            "non-trivial number gets the pipeline to steady-state throughput "
+            "much faster than starting from 1."
+        ),
+    )
     max_workers: int = Field(default=100, gt=0)
+    autoscaling_algorithm: Literal["THROUGHPUT_BASED", "NONE"] = Field(
+        default="THROUGHPUT_BASED",
+        description=(
+            "Dataflow autoscaling mode. Default 'THROUGHPUT_BASED' (the only "
+            "useful choice for batch). Flex Template launches sometimes "
+            "default to 'NONE' depending on Beam version; we pin "
+            "'THROUGHPUT_BASED' so behavior doesn't drift with the runner."
+        ),
+    )
+    number_of_worker_harness_threads: int = Field(
+        default=8,
+        gt=0,
+        description=(
+            "Per-worker fetcher concurrency. Beam's default sizes against "
+            "vCPU count, which is wrong for I/O-bound work — each harness "
+            "thread blocks on a ~1s HTTP round-trip, so we want more "
+            "threads than vCPUs. We default to 8 (2× n2-standard-4 vCPUs) "
+            "to stay inside typical EE HV project-quota concurrency caps; "
+            "projects with paid EE quota can crank this higher to push "
+            "more tiles in flight per worker."
+        ),
+    )
     service_account_email: str | None = None
     network: str | None = None
     subnetwork: str | None = None

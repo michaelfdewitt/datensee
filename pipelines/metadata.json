@@ -8,6 +8,20 @@
       "helpText": "GCS URI of the pipeline-config.json staged by the datensee CLI.",
       "regexes": ["^gs://[^/]+/.+\\.json$"],
       "paramType": "GCS_READ_FILE"
+    },
+    {
+      "name": "numberOfWorkerHarnessThreads",
+      "label": "Per-worker fetcher thread count",
+      "helpText": "Beam pipeline option that caps in-flight HTTP fetches per worker. Tile fetches are I/O-bound, so we want more threads than vCPUs.",
+      "isOptional": true,
+      "regexes": ["^[1-9][0-9]*$"]
+    },
+    {
+      "name": "autoscalingAlgorithm",
+      "label": "Autoscaling algorithm",
+      "helpText": "THROUGHPUT_BASED enables Dataflow's autoscaler; NONE pins the pool to numWorkers. Passed as a Beam option because the Flex Template environment field for this knob is silently ignored.",
+      "isOptional": true,
+      "regexes": ["^(THROUGHPUT_BASED|NONE)$"]
     }
   ]
 }

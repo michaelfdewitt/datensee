@@ -131,14 +131,29 @@ public record PipelineConfig(
         @JsonProperty("dataflow") DataflowConfig dataflow
     ) { }
 
-    /** Dataflow-specific runner options. */
+    /**
+     * Dataflow-specific runner options.
+     *
+     * <p>The worker-pool knobs ({@code numWorkers}, {@code maxWorkers},
+     * {@code autoscalingAlgorithm}, {@code numberOfWorkerHarnessThreads})
+     * are read by the Python CLI into the Flex Template launch payload's
+     * {@code environment} block; the Java pipeline never inspects them
+     * because Beam's runner consumes them as pipeline options before
+     * {@code main()} runs. They live here so the persisted
+     * {@code _pipeline-config.json} captures the full submission shape
+     * for diagnostics.
+     */
+    @com.fasterxml.jackson.annotation.JsonIgnoreProperties(ignoreUnknown = true)
     public record DataflowConfig(
         String project,
         String region,
         @JsonProperty("temp_location") String tempLocation,
         @JsonProperty("staging_location") String stagingLocation,
         @JsonProperty("machine_type") String machineType,
+        @JsonProperty("num_workers") Integer numWorkers,
         @JsonProperty("max_workers") int maxWorkers,
+        @JsonProperty("autoscaling_algorithm") String autoscalingAlgorithm,
+        @JsonProperty("number_of_worker_harness_threads") Integer numberOfWorkerHarnessThreads,
         @JsonProperty("labels") java.util.Map<String, String> labels
     ) { }
 }

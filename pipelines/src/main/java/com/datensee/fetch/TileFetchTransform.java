@@ -27,30 +27,22 @@ public final class TileFetchTransform
     private final String eeExpression;
     private final String geeProject;
     private final PixelGrid parentGrid;
-    private final double maxQps;
-    private final int maxWorkers;
 
     public TileFetchTransform(
         String eeExpression,
         String geeProject,
-        PixelGrid parentGrid,
-        double maxQps,
-        int maxWorkers
+        PixelGrid parentGrid
     ) {
         this.eeExpression = eeExpression;
         this.geeProject = geeProject;
         this.parentGrid = parentGrid;
-        this.maxQps = maxQps;
-        this.maxWorkers = maxWorkers;
     }
 
     @Override
     public PCollectionTuple expand(PCollection<TileCoordinate> input) {
         return input.apply(
             "FetchTileFromEE",
-            ParDo.of(new TileFetchDoFn(
-                    eeExpression, geeProject, parentGrid, maxQps, maxWorkers
-                ))
+            ParDo.of(new TileFetchDoFn(eeExpression, geeProject, parentGrid))
                 .withOutputTags(TileFetchDoFn.SUCCESS_TAG,
                     TupleTagList.of(TileFetchDoFn.FAILED_TAG))
         );

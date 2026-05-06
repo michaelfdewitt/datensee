@@ -8,7 +8,6 @@ import com.datensee.FetchedTile;
 import com.datensee.PixelGrid;
 import com.datensee.TileCoordinate;
 import com.google.auth.oauth2.GoogleCredentials;
-import com.google.common.util.concurrent.RateLimiter;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -28,9 +27,15 @@ import org.slf4j.LoggerFactory;
  * Credentials are initialized once per worker in {@code @Setup} and refreshed
  * as needed before each request.
  *
- * <p>Rate limiting: each worker uses a Guava {@link RateLimiter} configured
- * as {@code maxQps / maxWorkers}. The existing 429 backoff handles overflow
- * if the estimate is too aggressive.
+ * <p>Rate shaping: <strong>none, by design</strong>. Tile fetches are
+ * I/O-bound — the binding constraint on throughput is the count of
+ * concurrent in-flight requests we can sustain (worker count × Beam
+ * harness threads × HTTP client concurrency), not project-wide QPS.
+ * EE's HV API enforces its own quota; if we exceed it the API returns
+ * 429 and the retry path below applies exponential backoff with jitter.
+ * That is the rate-shaping signal — local tokens-per-second budgeting
+ * caps throughput far below what EE will actually serve and starves
+ * autoscaling of any reason to scale up.
  *
  * <p>Error classification: 429/503/5xx are retried with exponential backoff;
  * 400/403/404 are dead-lettered immediately. See {@link EeApiException}.
@@ -50,22 +55,40 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
     private static final String HV_ENDPOINT =
         "https://earthengine-highvolume.googleapis.com/v1/projects/%s/image:computePixels";
     private static final String EE_SCOPE = "https://www.googleapis.com/auth/earthengine";
-    private static final int MAX_RETRIES = 5;
+
+    // Retry budget tuned for fast failure under sustained 429 storms.
+    //
+    // The non-obvious risk: if every attempt sleeps in `Thread.sleep` for
+    // backoff, a stuck tile can hold a Beam harness thread for *minutes*,
+    // Dataflow's autoscaler observes near-zero throughput, and the worker
+    // pool scales DOWN — making the storm worse. To avoid that we cap
+    // both per-attempt sleeps and total wall-clock per tile, and we keep
+    // the per-request HTTP timeout short. Persistently-failing tiles
+    // dead-letter quickly; the user reruns via `datensee retry --journal`,
+    // which is the right place for storm recovery.
+    //
+    // Backoff sequence with caps: 1, 2, 4, 8, 10, 10 (capped at 10s).
+    // Cumulative max sleep = 35s. Plus 6 × 30s HTTP-timeout worst case
+    // = 180s. Hard ceiling = MAX_PER_TILE_BUDGET below, which beats
+    // the retry loop to the punch when persistent failures pile up.
+    private static final int MAX_RETRIES = 6;
     private static final Duration BACKOFF_429 = Duration.ofSeconds(1);
-    private static final Duration BACKOFF_503 = Duration.ofSeconds(5);
-    private static final Duration BACKOFF_DEFAULT = Duration.ofSeconds(2);
+    private static final Duration BACKOFF_503 = Duration.ofSeconds(2);
+    private static final Duration BACKOFF_DEFAULT = Duration.ofSeconds(1);
+    private static final Duration BACKOFF_CAP = Duration.ofSeconds(10);
+    private static final Duration MAX_PER_TILE_BUDGET = Duration.ofSeconds(90);
+    private static final Duration HTTP_REQUEST_TIMEOUT = Duration.ofSeconds(30);
+    private static final Duration HTTP_CONNECT_TIMEOUT = Duration.ofSeconds(10);
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final String eeExpression;
     private final String geeProject;
     private final PixelGrid parentGrid;
-    private final double perWorkerQps;
 
     // Transient: not serialized by Beam; recreated on each worker in @Setup.
     private transient HttpClient httpClient;
     private transient GoogleCredentials credentials;
-    private transient RateLimiter rateLimiter;
 
     // Captured once per worker for AUTH_ERROR remediation messaging. Null
     // when the metadata server is unavailable (e.g. Direct runner).
@@ -83,20 +106,15 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
      * @param parentGrid   parent {@link PixelGrid} for the export — every
      *                     tile's per-fetch grid is derived from this by
      *                     translation
-     * @param maxQps       project-wide QPS cap for the HV API
-     * @param maxWorkers   expected number of concurrent workers
      */
     public TileFetchDoFn(
         String eeExpression,
         String geeProject,
-        PixelGrid parentGrid,
-        double maxQps,
-        int maxWorkers
+        PixelGrid parentGrid
     ) {
         this.eeExpression = eeExpression;
         this.geeProject = geeProject;
         this.parentGrid = parentGrid;
-        this.perWorkerQps = Math.max(1.0, maxQps / Math.max(1, maxWorkers));
     }
 
     @Setup
@@ -104,14 +122,13 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
         credentials = GoogleCredentials.getApplicationDefault()
             .createScoped(Collections.singleton(EE_SCOPE));
         httpClient = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(30))
+            .connectTimeout(HTTP_CONNECT_TIMEOUT)
             .build();
-        rateLimiter = RateLimiter.create(perWorkerQps);
         workerServiceAccount = EeAuthRemediation.discoverWorkerServiceAccount(httpClient);
         firstAuthLogged = false;
         LOG.info(
-            "Worker setup: project={}, rate={} qps/worker, workerSa={}",
-            geeProject, perWorkerQps, workerServiceAccount
+            "Worker setup: project={}, workerSa={} (rate-shaping via 429 backoff only)",
+            geeProject, workerServiceAccount
         );
     }
 
@@ -195,18 +212,33 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
     private byte[] fetchWithRetry(TileCoordinate tile)
         throws IOException, InterruptedException {
         IOException lastException = null;
+        long deadlineMs = System.currentTimeMillis() + MAX_PER_TILE_BUDGET.toMillis();
 
         for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            // Wall-clock budget short-circuit. Without this a tile stuck on
+            // sustained 429s could pile up minutes of cumulative backoff
+            // sleep, holding a worker harness thread idle while the
+            // autoscaler interpreted near-zero throughput as "scale down".
+            // Dead-lettering after the budget gives the worker a chance to
+            // move on; the user reruns via `datensee retry --journal` to
+            // recover.
+            if (System.currentTimeMillis() >= deadlineMs) {
+                throw new IOException(
+                    String.format(
+                        "Per-tile budget %ds exceeded for %s",
+                        MAX_PER_TILE_BUDGET.toSeconds(), tile.id()
+                    ),
+                    lastException
+                );
+            }
             try {
-                rateLimiter.acquire();
                 return fetchTile(tile);
             } catch (EeApiException e) {
                 if (!e.isRetryable()) {
                     throw e;
                 }
                 lastException = e;
-                Duration backoff = initialBackoff(e.httpStatus());
-                long backoffMs = backoff.toMillis() * (1L << (attempt - 1));
+                long backoffMs = capBackoff(initialBackoff(e.httpStatus()), attempt);
                 long jitter = (long) (Math.random() * backoffMs * 0.2);
                 LOG.warn(
                     "{}: attempt {}/{} failed (HTTP {}), retrying in {}ms",
@@ -217,7 +249,7 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
                 }
             } catch (IOException e) {
                 lastException = e;
-                long backoffMs = BACKOFF_DEFAULT.toMillis() * (1L << (attempt - 1));
+                long backoffMs = capBackoff(BACKOFF_DEFAULT, attempt);
                 long jitter = (long) (Math.random() * backoffMs * 0.2);
                 LOG.warn(
                     "{}: attempt {}/{} failed: {}, retrying in {}ms",
@@ -233,6 +265,17 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
             String.format("All %d fetch attempts failed for %s", MAX_RETRIES, tile.id()),
             lastException
         );
+    }
+
+    /**
+     * Exponential backoff with a per-sleep cap. Without the cap, attempt
+     * 6 of a 1s-base sequence sleeps for 32s — multiply that across N
+     * concurrent failing tiles and the worker harness is idle for a
+     * couple of minutes per cycle. The cap puts a ceiling on the tail.
+     */
+    private static long capBackoff(Duration base, int attempt) {
+        long ms = base.toMillis() * (1L << (attempt - 1));
+        return Math.min(ms, BACKOFF_CAP.toMillis());
     }
 
     private static Duration initialBackoff(int httpStatus) {
@@ -254,7 +297,7 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
             .header("Authorization", "Bearer " + token)
             .header("x-goog-user-project", geeProject)
             .POST(HttpRequest.BodyPublishers.ofString(requestBody))
-            .timeout(Duration.ofSeconds(120))
+            .timeout(HTTP_REQUEST_TIMEOUT)
             .build();
 
         HttpResponse<byte[]> response = httpClient.send(

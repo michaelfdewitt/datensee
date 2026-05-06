@@ -261,11 +261,15 @@ def display_export_summary(config: PipelineConfig) -> None:
 
     if config.runner.mode == "dataflow" and config.runner.dataflow is not None:
         df = config.runner.dataflow
-        rows.append(("Runner", f"dataflow ({df.machine_type} &times; {df.max_workers} max)"))
+        rows.append((
+            "Runner",
+            (
+                f"dataflow ({df.machine_type}, {df.num_workers}–{df.max_workers} workers, "
+                f"{df.number_of_worker_harness_threads} threads/worker)"
+            ),
+        ))
     else:
         rows.append(("Runner", "local (DirectRunner)"))
-
-    rows.append(("Rate limit", f"{config.rate_limit.max_qps} QPS"))
 
     row_html = "\n".join(
         f'<tr><td style="padding: 4px 12px; font-weight: bold;">{label}</td>'

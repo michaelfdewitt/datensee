@@ -58,12 +58,11 @@ def render_export_summary(config: PipelineConfig) -> Panel:
         df = config.runner.dataflow
         table.add_row(
             "Runner",
-            f"dataflow  ({df.machine_type} × {df.max_workers} max)",
+            f"dataflow  ({df.machine_type}, {df.num_workers}–{df.max_workers} workers, "
+            f"{df.number_of_worker_harness_threads} threads/worker)",
         )
     else:
         table.add_row("Runner", "local  (DirectRunner)")
-
-    table.add_row("Rate limit", f"{config.rate_limit.max_qps} QPS")
 
     return Panel(table, title="Export Summary", border_style="cyan")
 

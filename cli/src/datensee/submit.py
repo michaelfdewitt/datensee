@@ -489,11 +489,26 @@ def _build_flex_payload(
     ``parameters``; standard Beam runtime knobs go in ``environment``.
     Anything left null is dropped — Dataflow rejects nulls on optional
     fields.
+
+    Worker-pool throughput knobs split between two payload sections:
+
+    * ``numWorkers``, ``maxWorkers`` are typed fields in the Flex
+      Template runtime-environment proto and flow through ``environment``.
+    * ``autoscalingAlgorithm`` and ``numberOfWorkerHarnessThreads`` are
+      Beam pipeline options. Empirically, passing
+      ``autoscalingAlgorithm`` via ``environment`` is silently dropped by
+      the launcher (Dataflow runs with ``"NONE"``), so both ride in
+      ``parameters`` and reach Java's ``main()`` as ``--name=value`` args
+      that Beam's standard option parser picks up.
+
+    We set everything aggressively-but-bounded by default — see
+    :class:`DataflowRunnerConfig` for the rationale.
     """
     environment: dict[str, object] = {
         "tempLocation": df.temp_location,
         "stagingLocation": df.staging_location,
         "machineType": df.machine_type,
+        "numWorkers": df.num_workers,
         "maxWorkers": df.max_workers,
     }
     if df.service_account_email:
@@ -505,11 +520,17 @@ def _build_flex_payload(
     if df.labels:
         environment["additionalUserLabels"] = df.labels
 
+    parameters: dict[str, object] = {
+        "configFile": config_uri,
+        "autoscalingAlgorithm": df.autoscaling_algorithm,
+        "numberOfWorkerHarnessThreads": str(df.number_of_worker_harness_threads),
+    }
+
     return {
         "launchParameter": {
             "jobName": job_name,
             "containerSpecGcsPath": spec_uri,
-            "parameters": {"configFile": config_uri},
+            "parameters": parameters,
             "environment": environment,
         }
     }

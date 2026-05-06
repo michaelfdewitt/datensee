@@ -79,7 +79,11 @@ def test_flex_payload_minimal() -> None:
     lp = payload["launchParameter"]
     assert lp["jobName"] == "datensee-1234"
     assert lp["containerSpecGcsPath"] == "gs://datensee-templates/v0.1.0a1/datensee.json"
-    assert lp["parameters"] == {"configFile": "gs://b/exports/_pipeline-config.json"}
+    assert lp["parameters"] == {
+        "configFile": "gs://b/exports/_pipeline-config.json",
+        "autoscalingAlgorithm": "THROUGHPUT_BASED",
+        "numberOfWorkerHarnessThreads": "8",
+    }
     assert lp["environment"]["tempLocation"] == "gs://b/tmp"
     assert lp["environment"]["stagingLocation"] == "gs://b/staging"
     assert lp["environment"]["maxWorkers"] == 100

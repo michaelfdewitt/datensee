@@ -192,6 +192,11 @@ def export(
     temp_location: str | None = None,
     max_qps: int = 100,
     labels: dict[str, str] | None = None,
+    machine_type: str | None = None,
+    num_workers: int | None = None,
+    max_workers: int | None = None,
+    autoscaling_algorithm: Literal["THROUGHPUT_BASED", "NONE"] | None = None,
+    number_of_worker_harness_threads: int | None = None,
     jar: Path | str | None = None,
     snapshot_time: int | None = None,
     dry_run: bool = False,
@@ -307,8 +312,22 @@ def export(
         output_tile_size_pixels=output_tile_size,
     )
 
-    # Build config
+    # Build config — worker-pool kwargs are optional; we only override
+    # the DataflowRunnerConfig defaults when the caller set them.
     if runner == "dataflow":
+        df_overrides: dict[str, Any] = {}
+        if machine_type is not None:
+            df_overrides["machine_type"] = machine_type
+        if num_workers is not None:
+            df_overrides["num_workers"] = num_workers
+        if max_workers is not None:
+            df_overrides["max_workers"] = max_workers
+        if autoscaling_algorithm is not None:
+            df_overrides["autoscaling_algorithm"] = autoscaling_algorithm
+        if number_of_worker_harness_threads is not None:
+            df_overrides["number_of_worker_harness_threads"] = (
+                number_of_worker_harness_threads
+            )
         runner_config = RunnerConfig(
             mode="dataflow",
             dataflow=DataflowRunnerConfig(
@@ -317,6 +336,7 @@ def export(
                 temp_location=temp_location,
                 staging_location=temp_location.rstrip("/") + "/staging",
                 labels=labels,
+                **df_overrides,
             ),
         )
     else:
@@ -466,6 +486,8 @@ def poll(
     *,
     callback: Callable[[Any], None] | None = None,
     poll_interval: int = 15,
+    watchdog: Any | None = None,
+    tile_count: int | None = None,
 ) -> Any:
     """Poll a Dataflow job until it reaches a terminal state.
 
@@ -476,9 +498,21 @@ def poll(
         callback: Optional callback(JobInfo) called on each poll tick.
             If None, uses Rich Live display (CLI mode).
         poll_interval: Seconds between polls.
+        watchdog: :class:`datensee.status.WatchdogConfig` controlling
+            cost-control circuit breakers (max_runtime, max_failure_rate,
+            idle_timeout). Defaults to the package-level defaults — see
+            :class:`WatchdogConfig`. Pass a custom instance to override
+            individual fields, or ``WatchdogConfig(max_runtime=None, ...)``
+            to disable specific checks.
+        tile_count: Total compute tile count. When provided, enables the
+            failure-rate circuit breaker. ``api.export()`` returns this
+            on its ``ExportResult.config.tile_count``.
 
     Returns:
         Final JobState.
+
+    Raises:
+        WatchdogTriggered: If a watchdog policy cancels the job.
     """
     from datensee.notebook import ensure_auth
 
@@ -495,6 +529,8 @@ def poll(
         access_token=access_token,
         poll_interval_seconds=poll_interval,
         status_callback=callback,
+        watchdog=watchdog,
+        tile_count=tile_count,
     )
 
 
