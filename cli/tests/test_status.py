@@ -82,7 +82,7 @@ class TestFetchJobInfo:
                     "metrics": [
                         {
                             "name": {
-                                "name": "elements_produced",
+                                "name": "ElementCount",
                                 "context": {"output_user_name": "fetch-tiles"},
                             },
                             "scalar": "42",

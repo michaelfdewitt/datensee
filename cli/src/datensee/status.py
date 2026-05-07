@@ -164,12 +164,22 @@ def _watchdog_check(
                 f"threshold is {config.max_failure_rate:.0%}"
             )
 
-    # 3. Idle-progress detector. Reset the stall timer whenever the
-    # max of the two completion counters increases.
+    # 3. Idle-progress detector. Reset the stall timer whenever ANY
+    # progress signal increases — completed-output counters
+    # (output_tiles_written / tiles_written) AND the system-level fetch
+    # element count AND the dead-letter counter. The first two only
+    # move once the M6 GroupByKey has fired (i.e. after the entire
+    # fetch phase finishes), so a fetch-only-bound pipeline could look
+    # idle for hours under a counter-only check. ElementCount on the
+    # fetch step's output PCollection moves per successful fetch, and
+    # failures_written moves per dead-letter — between the four, real
+    # forward progress is always reflected somewhere.
     if config.idle_timeout is not None:
         progress = max(
             info.output_tiles_written or 0,
             info.tiles_written or 0,
+            info.elements_produced or 0,
+            info.failures_written or 0,
         )
         now = time.monotonic()
         if progress > state.last_progress_value:
@@ -384,8 +394,14 @@ def _parse_metrics(data: dict) -> _ParsedMetrics:
                 out.compute_tiles_assembled = value
             continue
 
-        # Beam-system metrics for the progress display.
-        if name == "elements_produced" and ctx.get("output_user_name"):
+        # Beam-system metrics for the progress display + watchdog idle
+        # signal. Runner v2 emits per-PCollection counts as `ElementCount`
+        # (not `elements_produced` — that name was the pre-Runner-v2
+        # spelling). We track the maximum across all output_user_name
+        # contexts as a coarse "is the pipeline doing anything?" signal,
+        # which lets the watchdog detect M6 fetch-phase progress before
+        # GroupByKey lets the per-output-tile counters move.
+        if name == "ElementCount" and ctx.get("output_user_name"):
             if out.elements_produced is None or value > out.elements_produced:
                 out.elements_produced = value
         if name == "elements_added":

@@ -68,17 +68,23 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
     // which is the right place for storm recovery.
     //
     // Backoff sequence with caps: 1, 2, 4, 8, 10, 10 (capped at 10s).
-    // Cumulative max sleep = 35s. Plus 6 × 30s HTTP-timeout worst case
-    // = 180s. Hard ceiling = MAX_PER_TILE_BUDGET below, which beats
-    // the retry loop to the punch when persistent failures pile up.
+    // Cumulative max sleep = 35s. HTTP_REQUEST_TIMEOUT must be wide
+    // enough for EE's actual response latency under contention — EE HV
+    // queues internally when a project is near its concurrency cap, so
+    // a tight per-request timeout shows up as 100%-timeout symptom even
+    // when the project's quota is fine. 90s leaves headroom for that.
+    // MAX_PER_TILE_BUDGET (180s) caps total wall-clock per tile, which
+    // is what actually matters for autoscaler health: a tile can take
+    // up to one 90s timeout + a retry, then dead-letter — never the
+    // multi-minute pile-ups that triggered the original 48-hour runaway.
     private static final int MAX_RETRIES = 6;
     private static final Duration BACKOFF_429 = Duration.ofSeconds(1);
     private static final Duration BACKOFF_503 = Duration.ofSeconds(2);
     private static final Duration BACKOFF_DEFAULT = Duration.ofSeconds(1);
     private static final Duration BACKOFF_CAP = Duration.ofSeconds(10);
-    private static final Duration MAX_PER_TILE_BUDGET = Duration.ofSeconds(90);
-    private static final Duration HTTP_REQUEST_TIMEOUT = Duration.ofSeconds(30);
-    private static final Duration HTTP_CONNECT_TIMEOUT = Duration.ofSeconds(10);
+    private static final Duration MAX_PER_TILE_BUDGET = Duration.ofSeconds(180);
+    private static final Duration HTTP_REQUEST_TIMEOUT = Duration.ofSeconds(90);
+    private static final Duration HTTP_CONNECT_TIMEOUT = Duration.ofSeconds(15);
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -99,6 +105,17 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
     // serializes processElement within an instance, so a plain boolean is
     // sufficient.
     private transient boolean firstAuthLogged;
+
+    // Same pattern for "log the first HV request body in full at INFO so
+    // operators have a sanity-check artifact in the worker logs, every
+    // subsequent request logs only its per-tile grid at DEBUG". The full
+    // body includes the EE expression which can be tens of KB; emitting
+    // it once per worker is cheap and lets us spot-check that the
+    // serialized affine + dimensions + crsCode actually match what the
+    // CLI thinks it's sending. The fix for the original incident this
+    // logging was added to detect was a wire-format mismatch that took
+    // a manual `replay-from-journal` round-trip to confirm.
+    private transient boolean firstRequestLogged;
 
     /**
      * @param eeExpression serialized EE computation (opaque JSON)
@@ -126,6 +143,7 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
             .build();
         workerServiceAccount = EeAuthRemediation.discoverWorkerServiceAccount(httpClient);
         firstAuthLogged = false;
+        firstRequestLogged = false;
         LOG.info(
             "Worker setup: project={}, workerSa={} (rate-shaping via 429 backoff only)",
             geeProject, workerServiceAccount
@@ -327,6 +345,14 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
      * translating its affine to the tile's NW corner — no bbox math, no
      * pixelWidth/pixelHeight derivation. The resulting affine and dimensions
      * go straight onto the wire.
+     *
+     * <p>Logging: the first request per worker logs the full body at
+     * INFO so an operator triaging a wire-format issue has a concrete
+     * artifact in the worker logs without needing to redeploy with extra
+     * verbosity. Subsequent requests log just the per-tile grid object
+     * at DEBUG (the EE expression is fixed across the job and is already
+     * persisted in the staged pipeline-config.json — no value in
+     * re-emitting it on every fetch).
      */
     private String buildRequestBody(TileCoordinate tile) throws IOException {
         JsonNode expressionNode = MAPPER.readTree(eeExpression);
@@ -356,6 +382,21 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
         requestNode.put("fileFormat", "GEO_TIFF");
         requestNode.set("grid", grid);
 
-        return MAPPER.writeValueAsString(requestNode);
+        String body = MAPPER.writeValueAsString(requestNode);
+
+        // Operator-facing wire-format sanity check. Once per worker at
+        // INFO + the full body; per-tile grid at DEBUG forever after.
+        if (!firstRequestLogged) {
+            LOG.info(
+                "{}: first HV request body (subsequent requests log just"
+                + " the per-tile grid at DEBUG): {}",
+                tile.id(), body
+            );
+            firstRequestLogged = true;
+        } else if (LOG.isDebugEnabled()) {
+            LOG.debug("{}: HV request grid = {}", tile.id(), grid);
+        }
+
+        return body;
     }
 }

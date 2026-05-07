@@ -32,7 +32,6 @@ from datensee.config import (
     RunnerConfig,
     TileGrid,
 )
-from datensee.expression import clip_expression
 from datensee.tiling import decompose_region
 
 # ---------------------------------------------------------------------------
@@ -300,8 +299,21 @@ def export(
     snapshot_time_nanos = snapshot_time if snapshot_time is not None else time.time_ns()
     ee_expression = pin_expression(ee_expression, snapshot_time_nanos)
 
-    # Clip expression to region
-    ee_expression = clip_expression(ee_expression, geojson_geometry)
+    # Note: we deliberately do NOT wrap in `Image.clip(geometry=region)`
+    # here. Each tile's per-fetch grid (affine + dimensions + crsCode)
+    # already pins the exact pixels EE needs to compute; adding a clip
+    # forces EE to evaluate the polygon mask against the *whole* user
+    # geometry per tile — redundant work that scales with polygon
+    # complexity and dominated fetch latency in the M11 validation runs
+    # (uncached EE was responding in 1.0–1.2 s clipped vs ~1.0 s
+    # unclipped, but the clipped path was the one that intermittently
+    # timed out at 90 s under contention). Decompose-time intersection
+    # with the geometry already keeps tiles fully outside the polygon
+    # out of the workload (see ``tiling.decompose_region``); edge tiles
+    # return data for their full area, which callers can mask in
+    # post-processing if desired. The :func:`expression.clip_expression`
+    # helper is still available for callers that explicitly want EE-side
+    # masking.
 
     # Tile
     tile_grid = decompose_region(
