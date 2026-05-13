@@ -111,7 +111,8 @@ public final class DatensEEPipeline {
         PCollectionTuple fetchResult = tiles.apply(
             "FetchTiles",
             new TileFetchTransform(
-                config.eeExpression(), config.geeProject(), parentGrid
+                config.eeExpression(), config.geeProject(), parentGrid,
+                options.getEeImpersonateSa()
             )
         );
 

@@ -8,13 +8,16 @@ import com.datensee.FetchedTile;
 import com.datensee.PixelGrid;
 import com.datensee.TileCoordinate;
 import com.google.auth.oauth2.GoogleCredentials;
+import com.google.auth.oauth2.ImpersonatedCredentials;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Collections;
+import java.util.List;
 import org.apache.beam.sdk.transforms.DoFn;
 import org.apache.beam.sdk.values.TupleTag;
 import org.slf4j.Logger;
@@ -91,6 +94,13 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
     private final String eeExpression;
     private final String geeProject;
     private final PixelGrid parentGrid;
+    // Optional: email of an SA to impersonate for EE auth. Empty/null
+    // means workers use their own ADC. Plumbed through from the
+    // {@code --eeImpersonateSa} pipeline option; the worker SA must hold
+    // {@code roles/iam.serviceAccountTokenCreator} on the target SA.
+    // Useful when EE quota or registration should land on a dedicated
+    // identity that you don't want to actually run Dataflow workers as.
+    private final String impersonateSa;
 
     // Transient: not serialized by Beam; recreated on each worker in @Setup.
     private transient HttpClient httpClient;
@@ -123,21 +133,55 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
      * @param parentGrid   parent {@link PixelGrid} for the export — every
      *                     tile's per-fetch grid is derived from this by
      *                     translation
+     * @param impersonateSa optional email of a service account to
+     *                      impersonate for EE auth. Empty/null = use the
+     *                      worker's ADC directly.
      */
     public TileFetchDoFn(
         String eeExpression,
         String geeProject,
-        PixelGrid parentGrid
+        PixelGrid parentGrid,
+        String impersonateSa
     ) {
         this.eeExpression = eeExpression;
         this.geeProject = geeProject;
         this.parentGrid = parentGrid;
+        this.impersonateSa = impersonateSa;
     }
 
     @Setup
     public void setup() throws IOException {
-        credentials = GoogleCredentials.getApplicationDefault()
-            .createScoped(Collections.singleton(EE_SCOPE));
+        // Build the source credential — the worker's own ADC. On Dataflow
+        // this is ComputeEngineCredentials from the metadata server; on
+        // local DirectRunner it's whatever `gcloud auth application-default
+        // login` set up. createScoped() is only needed for credential
+        // types that require an explicit scope hint (service-account JSON
+        // files); ComputeEngineCredentials and UserCredentials ignore it.
+        GoogleCredentials sourceCreds = GoogleCredentials.getApplicationDefault();
+        if (sourceCreds.createScopedRequired()) {
+            sourceCreds = sourceCreds.createScoped(Collections.singleton(EE_SCOPE));
+        }
+
+        // If `impersonateSa` is set, wrap source creds in ImpersonatedCredentials
+        // so EE sees this run as the configured target SA. Workers call
+        // IAM's generateAccessToken under the hood, on demand, with 1-hour
+        // tokens that refresh transparently. The worker SA must have
+        // roles/iam.serviceAccountTokenCreator on the target. Empty/null
+        // means use the source ADC directly (legacy behavior).
+        if (impersonateSa != null && !impersonateSa.isEmpty()) {
+            credentials = ImpersonatedCredentials.newBuilder()
+                .setSourceCredentials(sourceCreds)
+                .setTargetPrincipal(impersonateSa)
+                .setScopes(List.of(
+                    "https://www.googleapis.com/auth/cloud-platform",
+                    EE_SCOPE
+                ))
+                .setLifetime(3600)
+                .build();
+        } else {
+            credentials = sourceCreds;
+        }
+
         httpClient = HttpClient.newBuilder()
             .connectTimeout(HTTP_CONNECT_TIMEOUT)
             .build();
@@ -145,8 +189,10 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
         firstAuthLogged = false;
         firstRequestLogged = false;
         LOG.info(
-            "Worker setup: project={}, workerSa={} (rate-shaping via 429 backoff only)",
-            geeProject, workerServiceAccount
+            "Worker setup: project={}, workerSa={}, credType={}, impersonateSa={}",
+            geeProject, workerServiceAccount,
+            credentials.getClass().getSimpleName(),
+            impersonateSa == null || impersonateSa.isEmpty() ? "<none>" : impersonateSa
         );
     }
 
@@ -314,7 +360,7 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
             .header("Content-Type", "application/json")
             .header("Authorization", "Bearer " + token)
             .header("x-goog-user-project", geeProject)
-            .POST(HttpRequest.BodyPublishers.ofString(requestBody))
+            .POST(HttpRequest.BodyPublishers.ofString(requestBody, StandardCharsets.UTF_8))
             .timeout(HTTP_REQUEST_TIMEOUT)
             .build();
 
@@ -326,6 +372,19 @@ public final class TileFetchDoFn extends DoFn<TileCoordinate, FetchedTile> {
         int status = response.statusCode();
         if (status != 200) {
             String body = new String(response.body());
+            // Dump every response header on non-200 so we can see Retry-After,
+            // x-ratelimit-*, x-goog-quota-*, server-timing, etc. — anything EE
+            // sends that hints at *why* we're being throttled. 429s in
+            // particular are the signal we're chasing right now.
+            StringBuilder hdrs = new StringBuilder();
+            response.headers().map().forEach((k, v) -> {
+                if (hdrs.length() > 0) hdrs.append(" | ");
+                hdrs.append(k).append("=").append(String.join(",", v));
+            });
+            LOG.warn(
+                "{}: HTTP {} response headers: {}",
+                tile.id(), status, hdrs
+            );
             throw new EeApiException(status, tile.id(), body);
         }
 

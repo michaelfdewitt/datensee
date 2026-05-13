@@ -27,22 +27,25 @@ public final class TileFetchTransform
     private final String eeExpression;
     private final String geeProject;
     private final PixelGrid parentGrid;
+    private final String impersonateSa;
 
     public TileFetchTransform(
         String eeExpression,
         String geeProject,
-        PixelGrid parentGrid
+        PixelGrid parentGrid,
+        String impersonateSa
     ) {
         this.eeExpression = eeExpression;
         this.geeProject = geeProject;
         this.parentGrid = parentGrid;
+        this.impersonateSa = impersonateSa;
     }
 
     @Override
     public PCollectionTuple expand(PCollection<TileCoordinate> input) {
         return input.apply(
             "FetchTileFromEE",
-            ParDo.of(new TileFetchDoFn(eeExpression, geeProject, parentGrid))
+            ParDo.of(new TileFetchDoFn(eeExpression, geeProject, parentGrid, impersonateSa))
                 .withOutputTags(TileFetchDoFn.SUCCESS_TAG,
                     TupleTagList.of(TileFetchDoFn.FAILED_TAG))
         );
