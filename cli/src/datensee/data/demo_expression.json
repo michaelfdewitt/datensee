@@ -1,41 +1,85 @@
 {
   "result": "0",
   "values": {
+    "1": {
+      "constantValue": [
+        "SR_B5",
+        "SR_B4"
+      ]
+    },
+    "2": {
+      "functionInvocationValue": {
+        "functionName": "Image.select",
+        "arguments": {
+          "bandSelectors": {
+            "valueReference": "1"
+          },
+          "input": {
+            "argumentReference": "_MAPPING_VAR_0_0"
+          }
+        }
+      }
+    },
     "0": {
       "functionInvocationValue": {
         "functionName": "Image.normalizedDifference",
         "arguments": {
-          "bandNames": {"constantValue": ["SR_B5", "SR_B4"]},
+          "bandNames": {
+            "valueReference": "1"
+          },
           "input": {
             "functionInvocationValue": {
               "functionName": "reduce.median",
               "arguments": {
                 "collection": {
                   "functionInvocationValue": {
-                    "functionName": "Collection.filter",
+                    "functionName": "Collection.map",
                     "arguments": {
-                      "collection": {
-                        "functionInvocationValue": {
-                          "functionName": "ImageCollection.load",
-                          "arguments": {
-                            "id": {"constantValue": "LANDSAT/LC09/C02/T1_L2"}
-                          }
+                      "baseAlgorithm": {
+                        "functionDefinitionValue": {
+                          "argumentNames": [
+                            "_MAPPING_VAR_0_0"
+                          ],
+                          "body": "2"
                         }
                       },
-                      "filter": {
+                      "collection": {
                         "functionInvocationValue": {
-                          "functionName": "Filter.dateRangeContains",
+                          "functionName": "Collection.filter",
                           "arguments": {
-                            "leftValue": {
+                            "collection": {
                               "functionInvocationValue": {
-                                "functionName": "DateRange",
+                                "functionName": "ImageCollection.load",
                                 "arguments": {
-                                  "end": {"constantValue": "2023-09-01"},
-                                  "start": {"constantValue": "2023-06-01"}
+                                  "id": {
+                                    "constantValue": "LANDSAT/LC09/C02/T1_L2"
+                                  }
                                 }
                               }
                             },
-                            "rightField": {"constantValue": "system:time_start"}
+                            "filter": {
+                              "functionInvocationValue": {
+                                "functionName": "Filter.dateRangeContains",
+                                "arguments": {
+                                  "leftValue": {
+                                    "functionInvocationValue": {
+                                      "functionName": "DateRange",
+                                      "arguments": {
+                                        "end": {
+                                          "constantValue": "2023-09-01"
+                                        },
+                                        "start": {
+                                          "constantValue": "2023-06-01"
+                                        }
+                                      }
+                                    }
+                                  },
+                                  "rightField": {
+                                    "constantValue": "system:time_start"
+                                  }
+                                }
+                              }
+                            }
                           }
                         }
                       }
