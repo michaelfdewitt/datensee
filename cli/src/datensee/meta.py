@@ -23,12 +23,19 @@ doesn't capture.
 from __future__ import annotations
 
 import hashlib
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from datensee.config import PixelGrid
+
+logger = logging.getLogger(__name__)
+
+# Snapshot times above this are nanoseconds, written before the units
+# fix. Microseconds for any date through ~year 5138 stay below this.
+_NANOS_THRESHOLD: int = 10**17
 
 if TYPE_CHECKING:
     from google.auth.credentials import Credentials
@@ -63,6 +70,27 @@ class ExportMeta(BaseModel):
     ee_expression: str
     snapshot_time: int | None = None
     pixel_grid: PixelGrid | None = None
+
+    @model_validator(mode="after")
+    def _migrate_nanos_snapshot_time(self) -> ExportMeta:
+        """Convert legacy nanosecond ``snapshot_time`` to microseconds.
+
+        Meta files written before the units fix stored Unix nanos.
+        Passing those into ``pin_expression`` now raises — the right
+        repair is to divide by 1000. Done in-place at read time so a
+        retry against an old export still works without manual editing.
+        """
+        if self.snapshot_time is not None and self.snapshot_time > _NANOS_THRESHOLD:
+            migrated = self.snapshot_time // 1_000
+            logger.warning(
+                "ExportMeta.snapshot_time=%d is in nanoseconds (legacy "
+                "format). Migrating in-memory to microseconds=%d. Re-run "
+                "the export to persist the corrected value.",
+                self.snapshot_time,
+                migrated,
+            )
+            self.snapshot_time = migrated
+        return self
 
     @property
     def ee_expression_sha256(self) -> str:

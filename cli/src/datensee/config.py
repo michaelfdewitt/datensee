@@ -316,10 +316,13 @@ class PipelineConfig(BaseModel):
     snapshot_time: int | None = Field(
         default=None,
         description=(
-            "Unix nanos at which the EE expression's asset references "
-            "were pinned (snapshot consistency across parallel tile "
-            "fetches). Set by api.export(); read by api.retry() to pin "
-            "split children to the same snapshot as their parents."
+            "Unix microseconds at which the EE expression's asset "
+            "references were pinned (snapshot consistency across "
+            "parallel tile fetches). Set by api.export(); read by "
+            "api.retry() to pin split children to the same snapshot "
+            "as their parents. Microseconds is what EE's `version` "
+            "load argument actually expects — nanoseconds lands in "
+            "an INTERNAL-crash range."
         ),
     )
 

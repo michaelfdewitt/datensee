@@ -42,7 +42,13 @@ def _version_callback(value: bool) -> None:
 
 
 def _parse_snapshot_time(raw: str | None) -> int | None:
-    """Parse the --snapshot-time CLI value into Unix nanos."""
+    """Parse the --snapshot-time CLI value into Unix microseconds.
+
+    Accepts ISO-8601 (`'2026-04-30T12:00:00Z'`) or an integer literal
+    interpreted as Unix microseconds. The units changed in the M10
+    units fix: an old script passing nanoseconds will land in EE's
+    INTERNAL-crash range and be rejected by ``pin_expression``.
+    """
     if raw is None:
         return None
     raw = raw.strip()
@@ -53,10 +59,10 @@ def _parse_snapshot_time(raw: str | None) -> int | None:
     try:
         # Accept the trailing 'Z' shorthand for UTC.
         normalized = raw.replace("Z", "+00:00") if raw.endswith("Z") else raw
-        return int(datetime.fromisoformat(normalized).timestamp() * 1_000_000_000)
+        return int(datetime.fromisoformat(normalized).timestamp() * 1_000_000)
     except ValueError as exc:
         raise typer.BadParameter(
-            f"--snapshot-time {raw!r} is neither Unix nanos nor ISO-8601: {exc}"
+            f"--snapshot-time {raw!r} is neither Unix micros nor ISO-8601: {exc}"
         ) from exc
 
 
@@ -224,8 +230,8 @@ def export(
             help=(
                 "Pin every asset reference in the EE expression to this "
                 "moment. Accepts an ISO-8601 UTC timestamp (e.g. "
-                "'2026-04-30T12:00:00Z') or Unix nanoseconds. Defaults to "
-                "submit time. Override only to reproduce a prior export."
+                "'2026-04-30T12:00:00Z') or Unix microseconds. Defaults "
+                "to submit time. Override only to reproduce a prior export."
             ),
         ),
     ] = None,
@@ -248,7 +254,7 @@ def export(
     """Submit an Earth Engine export job to Cloud Dataflow (or local runner)."""
     ee_expression = expression_file.read_text().strip()
     geojson_geometry = json.loads(region_file.read_text())
-    snapshot_time_nanos = _parse_snapshot_time(snapshot_time)
+    snapshot_time_micros = _parse_snapshot_time(snapshot_time)
 
     def confirm(config: PipelineConfig) -> None:
         console.print(render_export_summary(config))
@@ -270,7 +276,7 @@ def export(
             temp_location=temp_location,
             max_qps=max_qps,
             jar=jar,
-            snapshot_time=snapshot_time_nanos,
+            snapshot_time=snapshot_time_micros,
             dry_run=dry_run,
             confirm_callback=confirm,
         )
@@ -403,9 +409,7 @@ def status(
     from datensee.status import WatchdogConfig, WatchdogTriggered, poll_job
 
     if no_watchdog:
-        watchdog = WatchdogConfig(
-            max_runtime=None, max_failure_rate=None, idle_timeout=None
-        )
+        watchdog = WatchdogConfig(max_runtime=None, max_failure_rate=None, idle_timeout=None)
     else:
         watchdog = WatchdogConfig(
             max_runtime=(
@@ -414,9 +418,7 @@ def status(
                 else None
             ),
             max_failure_rate=(
-                max_failure_rate
-                if max_failure_rate is not None and max_failure_rate > 0
-                else None
+                max_failure_rate if max_failure_rate is not None and max_failure_rate > 0 else None
             ),
             failure_grace_period=timedelta(minutes=failure_grace_minutes),
             idle_timeout=(

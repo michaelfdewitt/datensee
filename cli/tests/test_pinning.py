@@ -8,10 +8,11 @@ import pytest
 
 from datensee.pinning import (
     BigQueryNotPinnedError,
+    SnapshotTimeOutOfRangeError,
     pin_expression,
 )
 
-T = 1_700_000_000_123_456_789  # arbitrary fixed Unix nanos
+T = 1_700_000_000_123_456  # arbitrary fixed Unix microseconds (2023-11-14)
 
 
 def _wrap(node: dict) -> str:
@@ -82,7 +83,7 @@ def test_pinning_is_idempotent() -> None:
 
 
 def test_existing_version_arg_is_preserved() -> None:
-    user_pinned_T = 1_500_000_000_000_000_000
+    user_pinned_T = 1_500_000_000_000_000  # micros
     node = _load_node("Image.load", id="USGS/SRTMGL1_003")
     node["functionInvocationValue"]["arguments"]["version"] = {"constantValue": user_pinned_T}
     expression = _wrap(node)
@@ -227,3 +228,31 @@ def test_expression_without_loads_is_unchanged() -> None:
 def test_invalid_json_propagates() -> None:
     with pytest.raises(json.JSONDecodeError):
         pin_expression("not valid json {", T)
+
+
+# ---------------------------------------------------------------------------
+# Units guard — regression for the silent-hang bug
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        1_778_588_808_169_445_000,  # the actual nanos value that hung EE in the wild
+        10**17 + 1,  # boundary
+        10**18,
+    ],
+)
+def test_nanosecond_snapshot_time_is_rejected(bad_value: int) -> None:
+    """Catches the unit confusion that lands in EE's INTERNAL-crash range."""
+    expression = _wrap(_load_node("ImageCollection.load", id="LANDSAT/LC09/C02/T1_L2"))
+    with pytest.raises(SnapshotTimeOutOfRangeError, match="INTERNAL-crash"):
+        pin_expression(expression, bad_value)
+
+
+def test_microsecond_snapshot_time_for_far_future_still_accepted() -> None:
+    """Any plausible Earth date in micros fits under the threshold."""
+    year_5000_micros = 95_617_584_000_000_000  # 5000-01-01 UTC, in micros
+    expression = _wrap(_load_node("Image.load", id="USGS/SRTMGL1_003"))
+    pinned = pin_expression(expression, year_5000_micros)
+    assert _invocation(pinned)["arguments"]["version"] == {"constantValue": year_5000_micros}

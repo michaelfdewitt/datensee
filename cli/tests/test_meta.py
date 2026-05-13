@@ -108,3 +108,39 @@ def test_output_tile_size_none_round_trips(tmp_path: Path) -> None:
     reloaded = read_meta(str(tmp_path))
     assert reloaded is not None
     assert reloaded.output_tile_size_pixels is None
+
+
+def test_legacy_nanosecond_snapshot_time_is_migrated(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Pre-fix meta files stored ``snapshot_time`` in nanoseconds. A
+    retry today must still work — read should silently divide by 1000
+    and warn, so the migrated value lands safely under
+    ``pin_expression``'s out-of-range guard."""
+    args = dict(_ORIGINAL_KW)
+    args["snapshot_time"] = 1_778_588_808_169_445_000  # legacy nanos
+    raw_path = tmp_path / EXPORT_META_FILENAME
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    # Write directly — build_meta would route through the validator and
+    # migrate before persisting, which isn't the legacy path we test.
+    raw_path.write_text(
+        ExportMeta.model_construct(**args).model_dump_json(),
+        encoding="utf-8",
+    )
+
+    with caplog.at_level("WARNING"):
+        reloaded = read_meta(str(tmp_path))
+
+    assert reloaded is not None
+    assert reloaded.snapshot_time == 1_778_588_808_169_445  # micros
+    assert any("nanoseconds (legacy" in r.message for r in caplog.records)
+
+
+def test_microsecond_snapshot_time_round_trips_unchanged(tmp_path: Path) -> None:
+    args = dict(_ORIGINAL_KW)
+    args["snapshot_time"] = 1_778_588_808_169_445  # already micros
+    meta = build_meta(**args)
+    write_meta(str(tmp_path), meta)
+    reloaded = read_meta(str(tmp_path))
+    assert reloaded is not None
+    assert reloaded.snapshot_time == 1_778_588_808_169_445

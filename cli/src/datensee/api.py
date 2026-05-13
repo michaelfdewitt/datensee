@@ -44,6 +44,16 @@ def _load_data(name: str) -> str:
     return (Path(__file__).parent / "data" / name).read_text()
 
 
+def _now_micros() -> int:
+    """Wall-clock now as a Unix microsecond timestamp.
+
+    Used to stamp ``snapshot_time`` on every export. Microseconds —
+    not nanoseconds — because that's the unit EE's ``version`` load
+    argument actually wants; see :mod:`datensee.pinning`.
+    """
+    return time.time_ns() // 1_000
+
+
 def demo_expression() -> str:
     """Return the serialized EE expression for the built-in NDVI demo."""
     return _load_data("demo_expression.json").strip()
@@ -234,11 +244,11 @@ def export(
             the Flex Template launch. Only applied in 'dataflow' mode.
             Useful for filtering jobs.list responses by caller / tag.
         jar: Path to the pipeline JAR (auto-detected if None).
-        snapshot_time: Unix nanos to pin every asset reference in
-            ``ee_expression`` to. Defaults to wall-clock now at submit
-            time. Override only when you need a deterministic snapshot
-            (e.g. reproducing a prior export). Workers see a consistent
-            view of mutable assets across the whole job.
+        snapshot_time: Unix microseconds to pin every asset reference
+            in ``ee_expression`` to. Defaults to wall-clock now at
+            submit time. Override only when you need a deterministic
+            snapshot (e.g. reproducing a prior export). Workers see a
+            consistent view of mutable assets across the whole job.
         dry_run: If True, validate but don't submit.
         progress_callback: Optional callback(completed, total) for local
             mode progress. Ignored for Dataflow mode.
@@ -296,8 +306,8 @@ def export(
     # tile A see the new version while tile B sees the old one.
     from datensee.pinning import pin_expression
 
-    snapshot_time_nanos = snapshot_time if snapshot_time is not None else time.time_ns()
-    ee_expression = pin_expression(ee_expression, snapshot_time_nanos)
+    snapshot_time_micros = snapshot_time if snapshot_time is not None else _now_micros()
+    ee_expression = pin_expression(ee_expression, snapshot_time_micros)
 
     # Note: we deliberately do NOT wrap in `Image.clip(geometry=region)`
     # here. Each tile's per-fetch grid (affine + dimensions + crsCode)
@@ -337,9 +347,7 @@ def export(
         if autoscaling_algorithm is not None:
             df_overrides["autoscaling_algorithm"] = autoscaling_algorithm
         if number_of_worker_harness_threads is not None:
-            df_overrides["number_of_worker_harness_threads"] = (
-                number_of_worker_harness_threads
-            )
+            df_overrides["number_of_worker_harness_threads"] = number_of_worker_harness_threads
         runner_config = RunnerConfig(
             mode="dataflow",
             dataflow=DataflowRunnerConfig(
@@ -364,7 +372,7 @@ def export(
         ),
         runner=runner_config,
         rate_limit=RateLimitConfig(max_qps=max_qps),
-        snapshot_time=snapshot_time_nanos,
+        snapshot_time=snapshot_time_micros,
     )
 
     # The confirm callback fires for both dry-runs and real submissions so
@@ -403,7 +411,7 @@ def export(
             output_tile_size_pixels=output_tile_size,
             gee_project=project,
             ee_expression=ee_expression_user,
-            snapshot_time=snapshot_time_nanos,
+            snapshot_time=snapshot_time_micros,
             pixel_grid=tile_grid.pixel_grid,
         ),
         credentials=credentials,
@@ -794,16 +802,16 @@ def retry(
     from datensee.pinning import pin_expression
 
     if persisted_meta is not None and persisted_meta.snapshot_time is not None:
-        snapshot_time_nanos = persisted_meta.snapshot_time
+        snapshot_time_micros = persisted_meta.snapshot_time
     else:
-        snapshot_time_nanos = time.time_ns()
+        snapshot_time_micros = _now_micros()
         logging.getLogger(__name__).warning(
             "datensee retry: no snapshot_time in meta — original export was "
             "unpinned. Retry children will pin to %d (now). The output COGs "
             "may end up with sub-tiles fetched at different snapshots.",
-            snapshot_time_nanos,
+            snapshot_time_micros,
         )
-    ee_expression = pin_expression(ee_expression, snapshot_time_nanos)
+    ee_expression = pin_expression(ee_expression, snapshot_time_micros)
 
     # The retry's parent PixelGrid must match the original export's
     # exactly — col_px/row_px in the journal records are local to that
@@ -845,7 +853,7 @@ def retry(
         ),
         runner=runner_config,
         rate_limit=RateLimitConfig(max_qps=max_qps),
-        snapshot_time=snapshot_time_nanos,
+        snapshot_time=snapshot_time_micros,
     )
 
     if dry_run:

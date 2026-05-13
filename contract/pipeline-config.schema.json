@@ -162,7 +162,7 @@
     },
     "snapshot_time": {
       "type": "integer",
-      "description": "Unix nanos at which all asset references in ee_expression were pinned. Workers see a consistent view of mutable assets. Diagnostic only on the Java side — pinning is already baked into ee_expression by the CLI."
+      "description": "Unix microseconds at which all asset references in ee_expression were pinned. Workers see a consistent view of mutable assets. Diagnostic only on the Java side — pinning is already baked into ee_expression by the CLI. Microseconds is the unit EE's `version` load argument expects; pre-fix exports stored this as nanoseconds, which causes EE INTERNAL crashes."
     },
     "runner": {
       "type": "object",
