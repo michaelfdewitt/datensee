@@ -1,6 +1,6 @@
 # Retry-with-Journal — Adaptive Quadtree Retry
 
-> **Status: contract sketched, implementation pending.** This document defines the wire format and semantics so the format is stable from day one. The actual `datensee retry` command and quadtree-splitting logic are follow-up work.
+> **Status: implemented.** `datensee retry`, the quadtree splitter, the classifier, and the two-tier merge path are all in the tree — see "What's actually in the tree right now" below. The one open piece is the Dataflow-side carryover merge (see Known limitations).
 
 ## The idea
 
@@ -9,7 +9,9 @@ When a tile fetch fails, the failure journal (`{output}/_failures.json`) is a co
 1. **Retries the tile as-is** (transient errors: rate-limit, generic 5xx, timeout-but-not-EE-timeout).
 2. **Splits the tile into 4 quadrants** and submits them as new compute tiles (EE-specific complexity errors: `MEMORY_EXCEEDED`, `COMPUTATION_TIMEOUT`).
 
-Successful sub-tiles flow into the existing M6 assembler keyed by `(out_row, out_col)`, so split children land in the same output COG as their parent — at smaller pixel granularity but at correct positions, because the bounding box is the geometric truth.
+Retry requires the `{output}/_export_meta.json` sidecar written by the original export — with its persisted `pixel_grid` — and hard-errors without it (no legacy fallback). The parent grid is what lets journal records' local pixel offsets be reconstructed into CRS coordinates.
+
+Successful sub-tiles flow into the existing two-tier assembler keyed by `(out_row, out_col)`, so split children land in the same output COG as their parent — at smaller pixel granularity but at correct positions, because the integer pixel rectangle inside the parent `PixelGrid` is the geometric truth. Retry rounds set `output.merge_existing_output=true`, so the assembler decodes the existing output COG as the baseline canvas and overlays the re-fetched tiles (sub-block placement of split children is supported) instead of rebuilding the file from this round's tiles alone.
 
 The split is recursive but bounded: each round emits a fresh `failures.json` with whatever is still failing; the operator (or an outer driver) re-runs `datensee retry` until either the journal is empty or every remaining failure has hit the depth cap.
 
@@ -25,7 +27,7 @@ This is genuinely differentiating. The built-in `Export.image.toCloudStorage` do
 
 ```json
 {
-  "x_min": -120.5, "y_min": 37.5, "x_max": -120.4, "y_max": 37.6,
+  "col_px": 2560, "row_px": 1536, "width_px": 512, "height_px": 512,
   "row": 3, "col": 5,
   "out_row": 0, "out_col": 0,
   "lineage": [],
@@ -43,9 +45,9 @@ This is genuinely differentiating. The built-in `Export.image.toCloudStorage` do
 
 | Field | Type | Notes |
 |---|---|---|
-| `x_min`, `y_min`, `x_max`, `y_max` | float | Bounding box in target CRS. Geometric truth — drives both fetch and assembly. |
+| `col_px`, `row_px`, `width_px`, `height_px` | int | Integer pixel rectangle inside the parent `PixelGrid` (local offsets from the grid's `translate_x`/`translate_y`). Geometric truth — drives both fetch and assembly. CRS coordinates are derived via the parent grid's affine transform (persisted in `_export_meta.json`), never stored. Quadtree split children halve `width_px`/`height_px`. |
 | `row`, `col` | int | **Root** compute tile indices (within the export bbox). Pinned across splits — see "Lineage" below. |
-| `out_row`, `out_col` | int | M6 output-tile indices. Split children inherit these from their parent. |
+| `out_row`, `out_col` | int | two-tier output-tile indices. Split children inherit these from their parent. |
 | `lineage` | list[int] | Quadtree path from root tile. See below. |
 | `error_kind` | enum | Classification used by the retry decision. See `EeErrorKind`. |
 | `error_message` | string | Truncated EE response body for debugging. |
@@ -94,26 +96,28 @@ The mapping is **CRS-axis-order-independent**:
 Two failure rounds would conflict if `(row, col)` rolled forward with each split — you'd get sub-tiles with the same `(row, col)` as their grandchildren and you couldn't tell them apart. Pinning `(row, col)` to the root and using `lineage` to disambiguate means:
 
 - A tile is uniquely identified by `(out_row, out_col, row, col, lineage)`.
-- The bbox is the canonical retry input — two different lineage paths yielding the same bbox are equivalent (and an idempotent dedupe pass could collapse them).
-- The assembler doesn't need to know about lineage at all — it keys on `(out_row, out_col)` and writes pixels at offsets implied by the bbox.
+- The pixel rect is the canonical retry input — two different lineage paths yielding the same rect are equivalent (and an idempotent dedupe pass could collapse them).
+- The assembler doesn't need to know about lineage at all — it keys on `(out_row, out_col)` and writes pixels at the offsets implied by the pixel rect.
 
 ## Error classification
 
-The classifier inspects HTTP status and (for HTTP 400) the EE response body:
+The classifier inspects HTTP status and (for HTTP 400 only) the EE response body:
 
 | `error_kind` | Trigger | Retry policy |
 |---|---|---|
-| `MEMORY_EXCEEDED` | HTTP 400 + body matches `/memory limit exceeded/i` | **Split** |
-| `COMPUTATION_TIMEOUT` | HTTP 400 + body matches `/timed out/i` | **Split** |
+| `MEMORY_EXCEEDED` | HTTP **400** + body matches `/memory limit exceeded/i` | **Split** |
+| `COMPUTATION_TIMEOUT` | HTTP **400** + body matches `/timed out/i` | **Split** |
 | `RATE_LIMITED` | HTTP 429 | Retry same tile, exponential backoff |
-| `RETRYABLE_SERVER` | HTTP 5xx | Retry same tile, exponential backoff |
+| `RETRYABLE_SERVER` | HTTP 5xx (including 504), **regardless of body** | Retry same tile, exponential backoff |
 | `AUTH_ERROR` | HTTP 401 / 403 with auth-error body | **Don't retry** — surface to user |
 | `FATAL_REQUEST` | HTTP 400 / 403 / 404 (no EE-specific signature) | **Don't retry** |
 | `UNKNOWN` | Anything else | Retry same tile, log full body |
 
+The split-eligible signatures are **gated to HTTP 400 deliberately**: only EE's own complexity verdict (which it reports as a 400 with a descriptive body) should ever trigger a quadtree split. A 504, or a 5xx whose body happens to say "timed out", is infrastructure weather — those stay `RETRYABLE_SERVER` no matter what the body contains.
+
 The split allowlist is **intentionally minimal**. Splitting on a generic 5xx would mask transient infrastructure issues; splitting on auth would yield 4 more auth failures. Adding a kind to the split allowlist is a one-line config change later — removing one that's already triggering production cascades is a fire.
 
-EE doesn't expose a structured error code for OOM/timeout. The discriminant is the body string, which is documented under EE's [debugging guide](https://developers.google.com/earth-engine/guides/debugging). The classifier should match case-insensitively, on stable substrings only, and fall back to `UNKNOWN` when the body doesn't match any known pattern (so we don't silently mis-classify a future EE error message change).
+EE doesn't expose a structured error code for OOM/timeout. The discriminant is the body string, which is documented under EE's [debugging guide](https://developers.google.com/earth-engine/guides/debugging). The classifier matches case-insensitively, on stable substrings only, and falls back to a status-only verdict when the body doesn't match any known pattern (so we don't silently mis-classify a future EE error message change).
 
 ## Retry semantics
 
@@ -123,9 +127,9 @@ A round of `datensee retry --journal failures.json` is, conceptually:
 for record in journal:
     if record.error_kind in SPLIT_ALLOWLIST and len(record.lineage) < MAX_DEPTH:
         for q in [0, 1, 2, 3]:
-            yield split_tile(record, quadrant=q)  # bbox halved, lineage extended
+            yield split_tile(record, quadrant=q)  # pixel rect halved, lineage extended
     elif record.error_kind in RETRY_ALLOWLIST:
-        yield TileCoordinate.from_record(record)   # same bbox, same lineage
+        yield TileCoordinate.from_record(record)   # same pixel rect, same lineage
     else:  # FATAL_REQUEST, AUTH_ERROR
         yield record  # write straight back to next round's failures journal
 ```
@@ -137,7 +141,7 @@ Each round produces a new failures journal. The driver loops until either the jo
 - `MAX_DEPTH` = **2** (1 → 4 → 16 sub-tiles per root compute tile, max).
 - `SPLIT_ALLOWLIST` = `{MEMORY_EXCEEDED, COMPUTATION_TIMEOUT}`.
 - `RETRY_ALLOWLIST` = `{RATE_LIMITED, RETRYABLE_SERVER, UNKNOWN}`.
-- Adaptive splitting is **opt-in** via a config flag (default off). A first-time user gets dead-letter behavior, not surprise quadtree cascades.
+- Adaptive splitting is **opt-in**: it only ever runs inside `datensee retry` (never on the default `export` path). It works for every export shape — retry rounds run with `merge_existing_output`, so split children overlay their parent's output COG in place (an two-tier block or a single-tile COG alike). A first-time user gets dead-letter behavior, not surprise quadtree cascades.
 
 ## What's actually in the tree right now
 
@@ -146,8 +150,9 @@ The full path is implemented:
 - **Wire contract** — `TileCoordinate.lineage` (Python + Java), `FailedTileRecord` (Java record covering all journal fields), `EeErrorKind` enum with the full set of kinds, `TileCoordinate` Jackson-tolerant of unknown fields so journals feed back as `tiles_file`.
 - **Classifier** — `EeErrorKind.classify(httpStatus, body)` matches "memory limit"/"timed out" substrings against (status, body), with stable fallbacks for unmatched cases. `TileFetchDoFn.classifyFailure` walks the cause chain to find the original `EeApiException` and stamps the dead-letter record with the proper kind, status, and truncated body.
 - **Dead-letter side output** — `TileFetchDoFn.FAILED_TAG` is typed `FailedTileRecord`. `FailedTileWriter` serializes it directly. `_failures.json` now carries real `error_kind` values, not placeholders.
-- **Python splitter** — `datensee.retry.decide(record, max_depth, allowlists)` returns one of `split` (4 quadrant children), `retry_same` (1 child, same bbox), `depth_cap` (no children, carried over), `terminal` (no children), `unknown_kind` (no children). `split_tile(parent)` does pure-geometry quadrant bisection in bbox coordinates (axis-order-independent). `plan_retry(records)` aggregates a stream into a `RetryPlan` with `next_tiles`, `carryover`, and per-action `stats`.
-- **`datensee retry` CLI** — reads a journal, runs `plan_retry`, writes the next-round tiles to `{output}/_retry_tiles.json` (or stages to GCS), and submits a fresh pipeline run with `tile_grid.tiles_file` set. Same export-style flags so the user keeps full control of pipeline parameters; `--max-depth` defaults to 2, capped at 6.
+- **Python splitter** — `datensee.pixel.retry.decide(record, max_depth, allowlists)` returns one of `split` (4 quadrant children), `retry_same` (1 child, same pixel rect), `depth_cap` (no children, carried over), `terminal` (no children), `unknown_kind` (no children). `split_tile(parent)` halves the parent's integer pixel rect on each axis (quadrant indexing defined in CRS-bbox terms, so it's axis-order-independent). `plan_retry(records)` aggregates a stream into a `RetryPlan` with `next_tiles`, `carryover`, and per-action `stats`.
+- **`datensee retry` CLI** — reads the `_export_meta.json` sidecar (hard requirement — it must carry the parent `pixel_grid`) and the journal, runs `plan_retry`, writes the next-round tiles to `{output}/_retry_tiles.json` (or stages to GCS), and submits a fresh pipeline run with `tile_grid.tiles_file` set and `merge_existing_output=true`, so re-fetched tiles overlay the existing output COGs. Export-style flags default to the values persisted in the meta sidecar; `--max-depth` defaults to 2, capped at 6.
+- **two-tier merge path** — `AssembledCogWriter` decodes the existing output COG as the baseline canvas when `merge_existing_output` is set, then overlays this round's tiles — including sub-block quadtree split children — and bumps the `output_tiles_merged` counter. Partial *fresh* writes (some compute tiles dead-lettered, no baseline to merge into) are zero-filled, logged as WARN, and counted on `output_tiles_partial`; `_failures.json` remains the canonical record of what's missing.
 
 ### Tests pinned
 
@@ -157,6 +162,8 @@ The full path is implemented:
 
 ### `_failures.json` is the canonical view of stuck tiles
 
+The journal carries **both fetch failures and write-stage failures**: when a transcode, assembly, or upload step throws, the affected tiles dead-letter into `_failures.json` (with `error_kind=UNKNOWN` and a message prefixed `write-stage:`) instead of failing the job — symmetric with fetch failures. There is no separate sidecar for partial output; the journal is the one place to look.
+
 After each retry round, `api.retry` appends carryover records (terminal kinds + depth-capped split-eligible records) into the new `_failures.json` that the pipeline just wrote. The journal is therefore always the complete current view: new failures from this round + everything from previous rounds that's still stuck. Re-running `datensee retry --journal _failures.json` against it is idempotent — terminal records get re-classified as terminal next round, land back in carryover, get re-merged. No accumulation past steady state.
 
 This means:
@@ -164,10 +171,13 @@ This means:
 - Bumping `--max-depth` on a later retry round can rescue previously-capped tiles, because they're still in the journal.
 - A user looking at `_failures.json` sees auth errors and depth-capped tiles, not just whatever happened to fail in the most recent pipeline run.
 
+### The retry loop driver
+
+`datensee retry --until-done` (or `api.retry_until_done()`) loops rounds until the journal has no retryable work, capped by `--max-rounds` (default 5) with `--round-backoff` seconds between rounds so EE transients can clear. In Dataflow mode each round's job is polled to a terminal state before the next round reads the journal. The loop exits green when the journal is clear, yellow when only stuck records (terminal / depth-capped) remain, and red on a non-DONE Dataflow terminal state or an exhausted round budget.
+
+### Carryover merge is pipeline-side
+
+The retry CLI stages no-progress records to `{output}/_carryover.json` and points the pipeline at it via the config's `carryover_file` field; `DatensEEPipeline.writeFailuresJournal` unions those lines with this round's fresh failures before the `TextIO.write` that emits `_failures.json`. One code path on every runner — no Python post-step, nothing racing Dataflow's asynchronous journal writer. Journals on GCS are read directly by the retry CLI (`gs://` URIs supported), so Dataflow retries need no manual download step.
+
 ### Known limitations
-
-- **No automatic retry loop yet.** The user re-runs `datensee retry` themselves until the journal is empty. A wrapper that loops with backoff is a small follow-up but would change the UX surface, so it's left as a separate task.
-- **Dataflow / GCS carryover merge isn't wired yet.** `_failures.json` lives in GCS for Dataflow runs, and the pipeline writes it asynchronously (after `submit_job` returns), so the Python-side append-after-submit approach used in local mode would race the pipeline writer. Today the carryover is logged and dropped between rounds in Dataflow; local-mode retries are the supported path.
-
-  **Planned approach: move the merge into the Java pipeline.** The retry CLI will write the carryover as an additional input file (e.g. `{output}/_carryover.json`); the pipeline's failures-journal write will read that file at runtime and union it with this round's new failures before writing `_failures.json`. This keeps the journal as the single source of truth, avoids the post-step / race / orchestration complexity of a separate `retry-finalize`, and works identically across local + Dataflow. See `docs/handoff.md` and the milestone list in `CLAUDE.md`.
-- **Retry assumes pipeline-config parity with the original export.** Children inherit `(out_row, out_col)` from their parents, so they need to land in the same M6 output COG; the assembler relies on the same `output_tile_size_pixels` setting. The CLI takes the same flags as `export`; the user is responsible for keeping them aligned.
+- **Retry requires pipeline-config parity with the original export — and enforces it via the meta sidecar.** Children inherit `(out_row, out_col)` from their parents, so they need to land in the same two-tier output COG; the assembler relies on the same `output_tile_size_pixels` setting. `datensee retry` reads scale / CRS / tile sizes / `snapshot_time` / the parent `pixel_grid` from `{output}/_export_meta.json` by default and raises `ExportMetaMismatch` when an explicitly-passed flag disagrees with the persisted values.

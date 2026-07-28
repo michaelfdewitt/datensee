@@ -256,3 +256,35 @@ def test_microsecond_snapshot_time_for_far_future_still_accepted() -> None:
     expression = _wrap(_load_node("Image.load", id="USGS/SRTMGL1_003"))
     pinned = pin_expression(expression, year_5000_micros)
     assert _invocation(pinned)["arguments"]["version"] == {"constantValue": year_5000_micros}
+
+
+@pytest.mark.parametrize("bad_value", [0, -1, -1_000_000])
+def test_non_positive_snapshot_time_is_rejected(bad_value: int) -> None:
+    """-1 is EE's 'latest' sentinel — pinning to it would silently defeat
+    snapshot consistency; 0 and below never resolve to a real version."""
+    expression = _wrap(_load_node("ImageCollection.load", id="LANDSAT/LC09/C02/T1_L2"))
+    with pytest.raises(SnapshotTimeOutOfRangeError, match="positive"):
+        pin_expression(expression, bad_value)
+
+
+def test_load_geotiff_emits_unpinnable_warning() -> None:
+    """GCS-backed loads have no version mechanism — the gap must be loud."""
+    import warnings
+
+    from datensee.pinning import UnpinnableLoadWarning
+
+    expression = _wrap(
+        _load_node("Image.loadGeoTIFF", id="gs://bucket/some.tif"),
+    )
+    with pytest.warns(UnpinnableLoadWarning, match="loadGeoTIFF"):
+        pinned = pin_expression(expression, 1_778_588_808_169_445)
+    # The node itself is left untouched — no version arg injected.
+    assert "version" not in _invocation(pinned)["arguments"]
+
+    # Regular pinnable loads never warn.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UnpinnableLoadWarning)
+        pin_expression(
+            _wrap(_load_node("Image.load", id="USGS/SRTMGL1_003")),
+            1_778_588_808_169_445,
+        )

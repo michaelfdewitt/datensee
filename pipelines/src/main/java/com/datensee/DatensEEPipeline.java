@@ -2,13 +2,16 @@ package com.datensee;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
-import com.datensee.fetch.TileFetchDoFn;
-import com.datensee.fetch.TileFetchTransform;
-import com.datensee.io.AssembledCogWriter;
-import com.datensee.io.CogWriter;
-import com.datensee.io.FailedTileWriter;
-import com.datensee.io.TileCoordinateParser;
 import com.datensee.options.DatensEEOptions;
+import com.datensee.pixel.FailedTileRecord;
+import com.datensee.pixel.FetchedTile;
+import com.datensee.pixel.PixelGrid;
+import com.datensee.pixel.PixelOutputTransform;
+import com.datensee.pixel.TileCoordinate;
+import com.datensee.pixel.fetch.TileFetchDoFn;
+import com.datensee.pixel.fetch.TileFetchTransform;
+import com.datensee.pixel.io.FailedTileWriter;
+import com.datensee.pixel.io.TileCoordinateParser;
 import com.google.auth.oauth2.AccessToken;
 import com.google.auth.oauth2.GoogleCredentials;
 import java.io.IOException;
@@ -30,8 +33,10 @@ import org.apache.beam.sdk.io.TextIO;
 import org.apache.beam.sdk.io.fs.MatchResult;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.transforms.Create;
+import org.apache.beam.sdk.transforms.Flatten;
 import org.apache.beam.sdk.transforms.ParDo;
 import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.PCollectionList;
 import org.apache.beam.sdk.values.PCollectionTuple;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -43,8 +48,9 @@ import org.slf4j.LoggerFactory;
  * tile grid, and output destination; then orchestrates distributed tile
  * fetching via the Earth Engine High Volume API and COG assembly.
  *
- * <p>M3 features: partial failure tolerance (dead-letter), per-worker rate
- * limiting, smart retry classification, file-based tile input, VRT assembly.
+ * <p>Partial-failure model: fetch and write failures dead-letter into the
+ * failures journal instead of failing the job; {@code datensee retry}
+ * feeds the journal back in. Tiles arrive inline or via a tiles file.
  */
 public final class DatensEEPipeline {
 
@@ -117,45 +123,28 @@ public final class DatensEEPipeline {
         );
 
         PCollection<FetchedTile> fetched = fetchResult.get(TileFetchDoFn.SUCCESS_TAG);
-        PCollection<FailedTileRecord> failed = fetchResult.get(TileFetchDoFn.FAILED_TAG);
+        PCollection<FailedTileRecord> fetchFailed = fetchResult.get(TileFetchDoFn.FAILED_TAG);
 
         // --- Write successful tiles as COGs ---
-        // Compression is deflate (zlib via java.util.zip) by default; "none"
-        // is also accepted. Anything else fails inside the transcoder.
-        String compression = config.output().effectiveCompression();
+        // The terminal raster write stage lives in com.datensee.pixel so the
+        // shell here stays runner- and shape-agnostic. two-tier routing
+        // (output_tile_size_pixels > tile_size_pixels → assemble; otherwise
+        // one COG per compute tile) is decided inside the transform. Write
+        // failures dead-letter instead of failing the job, symmetric with
+        // the fetch stage.
+        PCollection<FailedTileRecord> writeFailed = fetched.apply(
+            "WritePixelOutput",
+            PixelOutputTransform.fromConfig(config, parentGrid, tileSize)
+        );
 
-        // M6 routing: when output_tile_size_pixels is set and larger
-        // than the compute tile size, group compute tiles by output tile
-        // and assemble. Otherwise fall through to one COG per compute tile.
-        int outputTileSize = config.output().effectiveOutputTileSizePixels(tileSize);
-        boolean twoTier = outputTileSize > tileSize;
-        if (twoTier) {
-            LOG.info(
-                "M6 two-tier tiling: output tile size = {}px (= {}x{} compute tiles per output COG)",
-                outputTileSize, outputTileSize / tileSize, outputTileSize / tileSize
-            );
-            fetched.apply(
-                "AssembleAndWriteOutputTiles",
-                new AssembledCogWriter(
-                    config.output().outputPath(), parentGrid, tileSize,
-                    outputTileSize, compression
-                )
-            );
-        } else {
-            fetched.apply(
-                "WriteTiles",
-                new CogWriter(config.output().outputPath(), tileSize, compression)
-            );
-        }
-
-        // --- Write failure report ---
-        String failuresPath = failuresOutputPath(config.output().outputPath());
-        failed
-            .apply("FormatFailedTiles", ParDo.of(new FailedTileWriter()))
-            .apply("WriteFailures", TextIO.write()
-                .to(failuresPath)
-                .withoutSharding()
-                .withSuffix(".json"));
+        // --- Write failure report (fetch + write stages + carryover) ---
+        writeFailuresJournal(
+            pipeline,
+            PCollectionList.of(fetchFailed).and(writeFailed)
+                .apply("FlattenFailures", Flatten.pCollections()),
+            config.hasCarryover() ? config.carryoverFile() : null,
+            failuresOutputPath(config.output().outputPath())
+        );
 
         var result = pipeline.run();
 
@@ -268,6 +257,46 @@ public final class DatensEEPipeline {
         return outputPath + "/_failures";
     }
 
+    /**
+     * Serialize this run's failure records and union them with the staged
+     * carryover journal (when {@code carryoverFile} is non-null) before
+     * writing {@code _failures.json}.
+     *
+     * <p>Carryover lines are the previous round's no-progress records
+     * (terminal kinds, depth-capped splits), already stamped with their
+     * {@code journal_reason} by the retry CLI — they pass through
+     * verbatim. Doing the union here, inside the pipeline, keeps the
+     * journal complete on every runner: the old Python append-after-submit
+     * approach raced Dataflow's asynchronous journal writer and silently
+     * dropped carryover between rounds.
+     *
+     * <p>Package-private and pipeline-shaped so a {@code TestPipeline}
+     * can drive it directly against temp files.
+     */
+    static void writeFailuresJournal(
+        Pipeline pipeline,
+        PCollection<FailedTileRecord> failed,
+        String carryoverFile,
+        String failuresPath
+    ) {
+        PCollection<String> fresh = failed
+            .apply("FormatFailedTiles", ParDo.of(new FailedTileWriter()));
+        PCollection<String> lines;
+        if (carryoverFile != null) {
+            LOG.info("Merging carryover journal from {}", carryoverFile);
+            PCollection<String> carryover = pipeline
+                .apply("ReadCarryover", TextIO.read().from(carryoverFile));
+            lines = PCollectionList.of(fresh).and(carryover)
+                .apply("UnionCarryover", Flatten.pCollections());
+        } else {
+            lines = fresh;
+        }
+        lines.apply("WriteFailures", TextIO.write()
+            .to(failuresPath)
+            .withoutSharding()
+            .withSuffix(".json"));
+    }
+
     private static PipelineConfig loadConfig(String configFile) throws IOException {
         // Resolve through Beam's FileSystems so gs:// and local paths share
         // a code path. Avoids hard-coding GCS-vs-local branching here.
@@ -277,11 +306,29 @@ public final class DatensEEPipeline {
         }
     }
 
-    private static void validateConfig(PipelineConfig config) {
+    // Package-private for direct test coverage.
+    static void validateConfig(PipelineConfig config) {
         if (config.geeProject() == null || config.geeProject().isBlank()) {
             throw new IllegalArgumentException(
                 "gee_project is required. Set it to your GCP project ID "
                 + "with the Earth Engine API enabled."
+            );
+        }
+        // The discriminator gates which payload we expect. Today "pixel"
+        // is the only kind; vector will land later as a sibling payload.
+        String kind = config.pipelineKind();
+        if (kind != null && !kind.isBlank() && !"pixel".equals(kind)) {
+            throw new IllegalArgumentException(
+                "Unsupported pipeline_kind='" + kind + "'. This pipeline JAR "
+                + "only handles pipeline_kind='pixel'."
+            );
+        }
+        if (config.pixel() == null) {
+            throw new IllegalArgumentException(
+                "pipeline_kind='pixel' requires a 'pixel' payload "
+                + "(tile_grid + output). The Python CLI builds this; the "
+                + "config JSON looks corrupt or was written by an "
+                + "incompatible client."
             );
         }
         boolean hasInlineTiles = config.tileGrid() != null
@@ -291,14 +338,14 @@ public final class DatensEEPipeline {
             && config.tileGrid().hasExternalTiles();
         if (!hasInlineTiles && !hasFileTiles) {
             throw new IllegalArgumentException(
-                "tile_grid must contain either inline tiles or a tiles_file path. "
+                "pixel.tile_grid must contain either inline tiles or a tiles_file path. "
                 + "Check that the region intersects the tile grid."
             );
         }
         if (config.output() == null || config.output().outputPath() == null
             || config.output().outputPath().isBlank()) {
             throw new IllegalArgumentException(
-                "output.output_path is required. Provide a GCS URI (gs://…) "
+                "pixel.output.output_path is required. Provide a GCS URI (gs://…) "
                 + "or a local directory path."
             );
         }
@@ -306,18 +353,18 @@ public final class DatensEEPipeline {
             || config.tileGrid().pixelGrid().crsCode() == null
             || config.tileGrid().pixelGrid().crsCode().isBlank()) {
             throw new IllegalArgumentException(
-                "tile_grid.pixel_grid.crs_code is required. Provide an EPSG code "
+                "pixel.tile_grid.pixel_grid.crs_code is required. Provide an EPSG code "
                 + "(e.g. 'EPSG:4326') or a proj string."
             );
         }
         if (config.tileGrid().pixelGrid().affineTransform() == null) {
             throw new IllegalArgumentException(
-                "tile_grid.pixel_grid.affine_transform is required."
+                "pixel.tile_grid.pixel_grid.affine_transform is required."
             );
         }
         if (config.tileGrid().pixelGrid().dimensions() == null) {
             throw new IllegalArgumentException(
-                "tile_grid.pixel_grid.dimensions is required."
+                "pixel.tile_grid.pixel_grid.dimensions is required."
             );
         }
     }

@@ -54,7 +54,7 @@ beautifully onto a distributed fetcher.
 
 Crucially: **you don't need to understand the expression to use it.**
 Earth Engine has already promised to evaluate it. You just need to call
-it, a lot, in parallel, with proper rate limiting and retries.
+it, a lot, in parallel, with proper retries and backoff.
 
 That's the entire premise of DatensEE.
 
@@ -132,9 +132,10 @@ On **quotas**: the HV API has per-project request budgets, and a
 realistic continental-scale export will saturate the default very
 quickly. Quota uplifts go through the same channel they always have —
 see the [Earth Engine usage and quota docs](https://developers.google.com/earth-engine/guides/usage)
-for the current process. DatensEE's per-worker rate limiter is designed
-to live within whatever budget you have, so you can run conservatively
-on default quotas and scale up after a quota review.
+for the current process. DatensEE deliberately ships no client-side
+rate limiter: EE's quota system is the rate-shaping signal, and workers
+respond to 429s with exponential backoff. To run conservatively on
+default quotas, cap the worker count; scale it up after a quota review.
 
 ## Gotchas (the honest part)
 
@@ -190,18 +191,25 @@ peacefully.
 
 ## What's next
 
-Two things we're actively working on:
+Two things already work that we're still polishing, and one that's ahead:
 
-- **Two-tier tiling (M6).** Today's output is one COG per fetch tile,
-  which is fine at small scale but produces unwieldy file counts at
-  continental scale. M6 separates *compute tiles* (small, sized for the
-  EE HV API) from *output tiles* (large, sized for practical file
-  counts), grouping with a Beam `GroupByKey` and assembling into larger
-  COGs at write time.
-- **Adaptive tiling.** A regular grid wastes requests in sparse regions
-  and pushes memory limits in dense ones. Quadtree decomposition based
-  on tile complexity is the obvious next step but has real complexity
-  cost — we want to do it once, well.
+- **Two-tier tiling.** *Compute tiles* (small, sized for the EE HV API)
+  are separate from *output tiles* (large, sized for practical file
+  counts): compute tiles are grouped with a Beam `GroupByKey` and
+  assembled into larger multi-block COGs at write time. Set
+  `output_tile_size_pixels` to dial output granularity from "one COG
+  per fetch" to "one COG per region".
+- **Adaptive retry.** When a tile fails because the expression hit EE's
+  per-tile memory or timeout limit, `datensee retry` splits it into 4
+  quadrant children and re-fetches at smaller area-per-call — recursive,
+  depth-capped, driven by a structured failures journal. Transient
+  failures retry as-is; the journal is always the complete picture of
+  what's still missing.
+- **Proactive adaptive tiling.** A regular grid wastes requests in
+  sparse regions and pushes memory limits in dense ones. Choosing tile
+  sizes *up front* from data density (rather than reactively on
+  failure) is the obvious next step but has real complexity cost — we
+  want to do it once, well.
 
 ## Feedback
 

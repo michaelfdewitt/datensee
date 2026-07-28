@@ -123,6 +123,20 @@ class TestRenderStatusHtml:
         html = _render_status_html("job-789", info)
         assert "75.0%" in html
 
+    def test_emits_valid_css_percent(self) -> None:
+        """The template is rendered with str.format, not %-formatting.
+
+        Regression: the table width was written as ``100%%`` (a printf-style
+        escape that str.format never unescapes), so browsers received
+        invalid CSS.
+        """
+        from datensee.notebook import _render_status_html
+        from datensee.status import JobInfo, JobState
+
+        html = _render_status_html("job-css", JobInfo(state=JobState.DONE))
+        assert "%%" not in html
+        assert "width: 100%;" in html
+
 
 class TestEnsureJar:
     def test_returns_found_jar(self, tmp_path: object) -> None:

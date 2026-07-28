@@ -14,10 +14,9 @@ from pathlib import Path
 import pytest
 
 from datensee.config import TileCoordinate
-from datensee.retry import (
+from datensee.pixel.retry import (
     DEFAULT_MAX_DEPTH,
     JOURNAL_REASON_DEPTH_CAP,
-    JOURNAL_REASON_SPLIT_DISABLED,
     JOURNAL_REASON_TERMINAL,
     JOURNAL_REASON_UNKNOWN_KIND,
     JournalParseError,
@@ -266,21 +265,21 @@ class TestPlanRetry:
         plan_retry([original])
         assert original == before
 
-    def test_allow_split_false_demotes_split_eligible_to_carryover(self) -> None:
+    def test_split_eligible_kinds_split_regardless_of_output_shape(self) -> None:
+        """Splitting is legal for every export shape: retry rounds run with
+        merge_existing_output, so split children overlay their parent's
+        output COG in place — there is no non-two-tier filename-clobber hazard
+        and no split_disabled demotion anymore."""
         records = [
             _record(error_kind="MEMORY_EXCEEDED"),
             _record(error_kind="COMPUTATION_TIMEOUT"),
             _record(error_kind="RATE_LIMITED"),
         ]
-        plan = plan_retry(records, allow_split=False)
-        assert plan.stats.get("split", 0) == 0
-        assert plan.stats["split_disabled"] == 2
+        plan = plan_retry(records)
+        assert plan.stats["split"] == 2
         assert plan.stats["retry_same"] == 1
-        kinds_in_carryover = {r["error_kind"] for r in plan.carryover}
-        assert kinds_in_carryover == {"MEMORY_EXCEEDED", "COMPUTATION_TIMEOUT"}
-        for record in plan.carryover:
-            assert record["journal_reason"] == JOURNAL_REASON_SPLIT_DISABLED
-        assert len(plan.next_tiles) == 1
+        assert len(plan.next_tiles) == 9  # 4 + 4 children + 1 same-rect
+        assert plan.carryover == []
 
 
 # ---------------------------------------------------------------------------
@@ -349,55 +348,75 @@ class TestJournalIO:
 # ---------------------------------------------------------------------------
 
 
-class TestApiRetryCarryoverMerge:
-    """End-to-end: api.retry() must append carryover (terminal + depth-cap)
-    records back into _failures.json so the journal stays the canonical
-    view of "what's still stuck" between retry rounds.
+def _stage_meta(
+    tmp_path: Path,
+    *,
+    ee_expression: str = '{"result":"0","values":{"0":{"constantValue":1}}}',
+    project: str = "test-project",
+    tile_size: int = 512,
+    output_tile_size: int | None = 1024,
+) -> None:
+    """Write a matching _export_meta.json — retry refuses to run without one."""
+    from datensee.config import AffineTransform, GridDimensions, PixelGrid
+    from datensee.meta import build_meta, write_meta
+
+    pixel_size = 30.0 / 111_320.0
+    write_meta(
+        str(tmp_path),
+        build_meta(
+            crs="EPSG:4326",
+            scale_meters=30.0,
+            tile_size_pixels=tile_size,
+            output_tile_size_pixels=output_tile_size,
+            gee_project=project,
+            ee_expression=ee_expression,
+            pixel_grid=PixelGrid(
+                crs_code="EPSG:4326",
+                affine_transform=AffineTransform(
+                    scale_x=pixel_size,
+                    shear_x=0.0,
+                    translate_x=0.0,
+                    shear_y=0.0,
+                    scale_y=-pixel_size,
+                    translate_y=0.0,
+                ),
+                dimensions=GridDimensions(width=1024, height=1024),
+            ),
+        ),
+    )
+
+
+class TestApiRetryCarryoverStaging:
+    """api.retry() stages no-progress records to _carryover.json and points
+    the pipeline at it via config.carryover_file — the *pipeline* unions
+    them into the next _failures.json (same code path local + Dataflow),
+    so the journal stays the canonical view of stuck tiles with no Python
+    post-step. The union itself is pinned by DatensEEPipelineJournalTest
+    (Java) and the integration suite.
     """
 
-    def test_terminal_kinds_appear_in_failures_json(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from datensee import api
-
-        journal = tmp_path / "_failures.json"
-        terminal_record = _record(
-            error_kind="AUTH_ERROR",
-            col_px=0,
-            row_px=0,
-            width_px=512,
-            height_px=512,
-            row=0,
-            col=0,
-        )
-        memory_record = _record(
-            error_kind="MEMORY_EXCEEDED",
-            col_px=0,
-            row_px=0,
-            width_px=512,
-            height_px=512,
-            row=0,
-            col=0,
-        )
-        journal.write_text(json.dumps(memory_record) + "\n" + json.dumps(terminal_record) + "\n")
-
-        new_pipeline_failure = _record(
-            error_kind="RATE_LIMITED",
-            col_px=0,
-            row_px=0,
-            width_px=256,
-            height_px=256,
-            row=0,
-            col=0,
-            lineage=[0],
-        )
-
-        def fake_submit(*_args, **_kwargs):
-            (tmp_path / "_failures.json").write_text(json.dumps(new_pipeline_failure) + "\n")
-            return None
-
-        from datensee import notebook
+    def _run_retry(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, journal_records):
+        from datensee import api, notebook
         from datensee import submit as submit_mod
+
+        _stage_meta(tmp_path)
+        journal = tmp_path / "_failures.json"
+        journal.write_text("".join(json.dumps(r) + "\n" for r in journal_records))
+
+        captured: dict[str, object] = {}
+
+        def fake_submit(config, **_kwargs):
+            captured["carryover_file"] = config.carryover_file
+            captured["merge_existing_output"] = config.output.merge_existing_output
+            # Simulate the pipeline: write fresh failures + union carryover,
+            # exactly what DatensEEPipeline.writeFailuresJournal does.
+            lines = [json.dumps(_record(error_kind="RATE_LIMITED", lineage=[0]))]
+            if config.carryover_file:
+                lines += [
+                    ln for ln in Path(config.carryover_file).read_text().splitlines() if ln.strip()
+                ]
+            journal.write_text("".join(ln + "\n" for ln in lines))
+            return None
 
         monkeypatch.setattr(submit_mod, "submit_job", fake_submit)
         monkeypatch.setattr(notebook, "ensure_jar", lambda: tmp_path / "stub.jar")
@@ -412,64 +431,71 @@ class TestApiRetryCarryoverMerge:
             tile_size=512,
             output_tile_size=1024,
             max_depth=2,
+        )
+        return result, captured
+
+    def test_terminal_records_are_staged_and_config_points_at_them(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        result, captured = self._run_retry(
+            tmp_path,
+            monkeypatch,
+            [
+                _record(error_kind="MEMORY_EXCEEDED"),
+                _record(error_kind="AUTH_ERROR", col_px=512, col=1),
+            ],
         )
 
         assert result.stats.get("split") == 1
         assert result.stats.get("terminal") == 1
         assert result.next_tiles_count == 4
         assert result.carryover_count == 1
+        assert captured["merge_existing_output"] is True
 
-        merged_lines = (tmp_path / "_failures.json").read_text().strip().splitlines()
-        merged = [json.loads(line) for line in merged_lines]
-        kinds = sorted(r["error_kind"] for r in merged)
-        assert kinds == ["AUTH_ERROR", "RATE_LIMITED"], (
-            f"Expected the new pipeline failure plus the carried-over AUTH_ERROR, got {kinds}"
-        )
-        by_kind = {r["error_kind"]: r for r in merged}
-        assert by_kind["AUTH_ERROR"]["journal_reason"] == JOURNAL_REASON_TERMINAL
+        carryover_path = tmp_path / "_carryover.json"
+        assert captured["carryover_file"] == str(carryover_path)
+        staged = [
+            json.loads(line) for line in carryover_path.read_text().splitlines() if line.strip()
+        ]
+        assert len(staged) == 1
+        assert staged[0]["error_kind"] == "AUTH_ERROR"
+        assert staged[0]["journal_reason"] == JOURNAL_REASON_TERMINAL
 
-    def test_depth_capped_records_appear_in_failures_json(
+        # With the (simulated) pipeline union, the journal holds fresh +
+        # carryover; tiles_failed_this_round counts only the fresh line.
+        assert result.tiles_failed_this_round == 1
+
+    def test_depth_capped_records_are_staged(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from datensee import api
-
-        capped_record = _record(error_kind="MEMORY_EXCEEDED", lineage=[0, 1])
-        progressing_record = _record(error_kind="RATE_LIMITED")
-
-        journal = tmp_path / "_failures.json"
-        journal.write_text(json.dumps(capped_record) + "\n" + json.dumps(progressing_record) + "\n")
-
-        def fake_submit(*_args, **_kwargs):
-            (tmp_path / "_failures.json").write_text("")
-            return None
-
-        from datensee import notebook
-        from datensee import submit as submit_mod
-
-        monkeypatch.setattr(submit_mod, "submit_job", fake_submit)
-        monkeypatch.setattr(notebook, "ensure_jar", lambda: tmp_path / "stub.jar")
-        monkeypatch.setattr(notebook, "ensure_auth", lambda: None)
-
-        result = api.retry(
-            journal=journal,
-            ee_expression='{"result":"0","values":{"0":{"constantValue":1}}}',
-            project="test-project",
-            output=str(tmp_path),
-            runner="local",
-            tile_size=512,
-            output_tile_size=1024,
-            max_depth=2,
+        result, captured = self._run_retry(
+            tmp_path,
+            monkeypatch,
+            [
+                _record(error_kind="MEMORY_EXCEEDED", lineage=[0, 1], width_px=128, height_px=128),
+                _record(error_kind="MEMORY_EXCEEDED", col_px=512, col=1),
+            ],
         )
 
         assert result.stats.get("depth_cap") == 1
         assert result.carryover_count == 1
+        staged = [
+            json.loads(line)
+            for line in Path(str(captured["carryover_file"])).read_text().splitlines()
+            if line.strip()
+        ]
+        assert staged[0]["journal_reason"] == JOURNAL_REASON_DEPTH_CAP
+        assert staged[0]["lineage"] == [0, 1]
 
-        merged_lines = (tmp_path / "_failures.json").read_text().strip().splitlines()
-        merged = [json.loads(line) for line in merged_lines]
-        assert len(merged) == 1
-        assert merged[0]["error_kind"] == "MEMORY_EXCEEDED"
-        assert merged[0]["lineage"] == [0, 1]
-        assert merged[0]["journal_reason"] == JOURNAL_REASON_DEPTH_CAP
+    def test_no_carryover_means_no_staged_file_and_no_config_field(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        result, captured = self._run_retry(
+            tmp_path, monkeypatch, [_record(error_kind="RATE_LIMITED")]
+        )
+        assert result.carryover_count == 0
+        assert captured["carryover_file"] is None
+        assert not (tmp_path / "_carryover.json").exists()
 
 
 class TestApiRetryReadsFromMeta:
@@ -478,8 +504,10 @@ class TestApiRetryReadsFromMeta:
     _EXPRESSION = '{"result":"0","values":{"0":{"constantValue":1}}}'
 
     def _stage_export(self, tmp_path: Path) -> None:
+        from datensee.config import AffineTransform, GridDimensions, PixelGrid
         from datensee.meta import build_meta, write_meta
 
+        pixel_size = 30.0 / 111_320.0
         meta = build_meta(
             crs="EPSG:4326",
             scale_meters=30.0,
@@ -487,6 +515,18 @@ class TestApiRetryReadsFromMeta:
             output_tile_size_pixels=1024,
             gee_project="staged-project",
             ee_expression=self._EXPRESSION,
+            pixel_grid=PixelGrid(
+                crs_code="EPSG:4326",
+                affine_transform=AffineTransform(
+                    scale_x=pixel_size,
+                    shear_x=0.0,
+                    translate_x=0.0,
+                    shear_y=0.0,
+                    scale_y=-pixel_size,
+                    translate_y=0.0,
+                ),
+                dimensions=GridDimensions(width=1024, height=1024),
+            ),
         )
         write_meta(str(tmp_path), meta)
 
@@ -563,7 +603,7 @@ class TestApiRetryReadsFromMeta:
 
         with pytest.raises(FileNotFoundError) as exc_info:
             api.retry(output=str(tmp_path), project="some-project")
-        assert "ee_expression" in str(exc_info.value)
+        assert "_export_meta.json" in str(exc_info.value)
 
     def test_retry_with_meta_and_explicit_journal_path(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -581,3 +621,64 @@ class TestApiRetryReadsFromMeta:
 
         result = api.retry(output=str(tmp_path), journal=custom_journal)
         assert result.next_tiles_count == 1
+
+
+# ---------------------------------------------------------------------------
+# retry_until_done — the round driver
+# ---------------------------------------------------------------------------
+
+
+class TestRetryUntilDone:
+    def _fake_rounds(self, monkeypatch: pytest.MonkeyPatch, next_counts: list[int]) -> list[dict]:
+        """Stub api.retry to return a scripted sequence of round results."""
+        from datensee import api
+
+        calls: list[dict] = []
+        counts = iter(next_counts)
+
+        def fake_retry(**kwargs):
+            calls.append(kwargs)
+            return api.RetryResult(
+                next_tiles_count=next(counts),
+                carryover_count=1,
+                stats={},
+                tiles_failed_this_round=0,
+            )
+
+        monkeypatch.setattr(api, "retry", fake_retry)
+        return calls
+
+    def test_stops_when_no_retryable_work(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from datensee import api
+
+        calls = self._fake_rounds(monkeypatch, [4, 2, 0])
+        result = api.retry_until_done(output="/tmp/x", round_backoff_seconds=0)
+        assert result.stopped == "no_retryable_work"
+        assert len(result.rounds) == 3
+        assert len(calls) == 3
+
+    def test_stops_at_max_rounds_with_work_remaining(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from datensee import api
+
+        self._fake_rounds(monkeypatch, [4, 4, 4, 4, 4])
+        result = api.retry_until_done(output="/tmp/x", max_rounds=3, round_backoff_seconds=0)
+        assert result.stopped == "max_rounds"
+        assert len(result.rounds) == 3
+
+    def test_round_callback_fires_per_round(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from datensee import api
+
+        self._fake_rounds(monkeypatch, [4, 0])
+        seen: list[int] = []
+        api.retry_until_done(
+            output="/tmp/x",
+            round_backoff_seconds=0,
+            round_callback=lambda i, _r: seen.append(i),
+        )
+        assert seen == [1, 2]
+
+    def test_dry_run_is_rejected(self) -> None:
+        from datensee import api
+
+        with pytest.raises(ValueError, match="dry_run"):
+            api.retry_until_done(output="/tmp/x", dry_run=True)

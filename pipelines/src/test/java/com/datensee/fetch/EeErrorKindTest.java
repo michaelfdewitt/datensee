@@ -45,14 +45,27 @@ class EeErrorKindTest {
     }
 
     @Test
-    void httpStatus504IsTimeoutEvenWithoutBodyMatch() {
+    void gatewayTimeoutsAreRetryableNotSplitEligible() {
+        // COMPUTATION_TIMEOUT drives quadtree splitting, so it must only
+        // come from EE's own complexity verdict (HTTP 400 + signature).
+        // A 504 — or any 5xx whose body mentions a timeout — is
+        // infrastructure trouble; splitting on it would turn a transient
+        // storm into a 4x request cascade.
         assertEquals(
-            EeErrorKind.COMPUTATION_TIMEOUT,
+            EeErrorKind.RETRYABLE_SERVER,
             EeErrorKind.classify(504, "Gateway timeout")
         );
         assertEquals(
-            EeErrorKind.COMPUTATION_TIMEOUT,
+            EeErrorKind.RETRYABLE_SERVER,
             EeErrorKind.classify(504, "")
+        );
+        assertEquals(
+            EeErrorKind.RETRYABLE_SERVER,
+            EeErrorKind.classify(503, "upstream request timed out")
+        );
+        assertEquals(
+            EeErrorKind.RETRYABLE_SERVER,
+            EeErrorKind.classify(500, "deadline exceeded")
         );
     }
 

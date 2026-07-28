@@ -27,7 +27,7 @@ import numpy as np
 import pytest
 
 from datensee.auth import get_access_token
-from datensee.tiling import _pixel_size_native, decompose_region, tile_bbox
+from datensee.pixel.tiling import _pixel_size_native, decompose_region, tile_bbox
 
 HV_ENDPOINT = (
     "https://earthengine-highvolume.googleapis.com/v1/projects/{project}/image:computePixels"
@@ -860,7 +860,7 @@ class TestPixelAlignment:
         `shift_pixels` in the x direction (easting) and compare pixels
         in the overlap area.
         """
-        # M11: pixel size is single-axis and latitude-independent — for
+        # By design: pixel size is single-axis and latitude-independent — for
         # geographic CRSs we go through the equator constant; for projected
         # CRSs scale_meters is the literal pixel size in CRS units.
         pixel_native_x = _pixel_size_native(crs, scale_meters)
@@ -1050,3 +1050,151 @@ class TestPixelAlignment:
             tile_size_pixels=64,
             shift_pixels=10,
         )
+
+
+# ---------------------------------------------------------------------------
+# Full-pipeline two-tier + retry-merge + carryover (requires the pipeline JAR)
+# ---------------------------------------------------------------------------
+
+
+def _find_pipeline_jar():
+    from datensee.jar import find_jar
+
+    try:
+        return find_jar(None)
+    except FileNotFoundError:
+        return None
+
+
+@pytest.mark.integration
+class TestTwoTierExportRetryMergeEndToEnd:
+    """Run the REAL pipeline (local runner, real EE fetches) through the
+    full two-tier + adaptive-retry story:
+
+    1. Two-tier export over a region whose compute-tile snap would NOT
+       land on an output-tile boundary (the historical origin-seam bug).
+    2. Zero-cost validation suite passes against the real output.
+    3. A synthetic journal with a retry-same failure, a split-eligible
+       failure, and a terminal failure drives a retry round: the pipeline
+       must merge re-fetched tiles (including quadtree split children)
+       into the existing COGs, and union the terminal record into the new
+       journal (pipeline-side carryover merge).
+    4. The nodata value survives to the output COGs' GDAL_NODATA tag.
+
+    Requires the pipeline JAR (``datensee jar build``) and rasterio
+    (validation extra); skips with a clear message otherwise.
+    """
+
+    REGION = {
+        "type": "Polygon",
+        "coordinates": [
+            [
+                [-122.52, 37.32],
+                [-122.06, 37.32],
+                [-122.06, 37.78],
+                [-122.52, 37.78],
+                [-122.52, 37.32],
+            ]
+        ],
+    }
+
+    def test_export_validate_retry_merge_carryover(self, gee_project: str, tmp_path) -> None:
+        rasterio = pytest.importorskip("rasterio", reason="needs the [validation] extra")
+        import numpy as np
+
+        import datensee
+        from datensee.pixel.validation import validate_output
+
+        jar = _find_pipeline_jar()
+        if jar is None:
+            pytest.skip("pipeline JAR not built — run `datensee jar build` first")
+
+        out = tmp_path / "m6-out"
+        result = datensee.export(
+            ee_expression=datensee.api.demo_expression(),
+            region=self.REGION,
+            project=gee_project,
+            output=str(out),
+            scale=90.0,
+            crs="EPSG:4326",
+            tile_size=256,
+            output_tile_size=512,
+            nodata=-9999.0,
+            runner="local",
+            jar=jar,
+        )
+        assert result.tiles_failed == 0
+
+        # Origin snapped to output-tile boundaries (the seam contract).
+        p = result.config.tile_grid.pixel_grid.affine_transform
+        assert round(p.translate_x / p.scale_x) % 512 == 0
+        assert round(-p.translate_y / p.scale_x) % 512 == 0
+
+        report = validate_output(str(out), result.config)
+        assert report.all_passed, "\n".join(
+            f"{r.check_id}: {r.status} {r.message}" for r in report.results
+        )
+
+        # nodata tag survives the whole chain.
+        cogs = sorted(out.glob("tile_*.tif"))
+        with rasterio.open(cogs[0]) as ds:
+            assert ds.nodata == -9999.0
+
+        # --- Retry round: retry-same + split + terminal carryover ---
+        tiles = result.config.tile_grid.tiles
+        interior = [t for t in tiles if t.col_px > 0 and t.row_px > 0]
+        retry_same_victim = interior[0]
+        split_victim = next(t for t in tiles if t is not retry_same_victim)
+
+        before = {f.name: f.read_bytes() for f in cogs}
+        journal = out / "_failures.json"
+        journal.write_text(
+            "\n".join(
+                json.dumps(rec)
+                for rec in (
+                    {**retry_same_victim.model_dump(), "error_kind": "RATE_LIMITED"},
+                    {**split_victim.model_dump(), "error_kind": "MEMORY_EXCEEDED"},
+                    {**tiles[0].model_dump(), "error_kind": "AUTH_ERROR"},
+                )
+            )
+            + "\n"
+        )
+
+        rr = datensee.api.retry(output=str(out), runner="local", jar=jar)
+        assert rr.stats.get("retry_same") == 1
+        assert rr.stats.get("split") == 1
+        assert rr.stats.get("terminal") == 1
+        assert rr.next_tiles_count == 5  # 1 same-rect + 4 children
+        assert rr.tiles_failed_this_round == 0
+        assert rr.carryover_count == 1
+
+        # Pipeline-side carryover union: the journal now holds exactly the
+        # terminal record, stamped by the retry planner.
+        merged = [json.loads(line) for line in journal.read_text().splitlines() if line.strip()]
+        assert len(merged) == 1
+        assert merged[0]["error_kind"] == "AUTH_ERROR"
+        assert merged[0]["journal_reason"] == "terminal"
+
+        # Merge semantics: deterministic re-fetches leave every COG
+        # pixel-identical (the old bug zero-filled everything the round
+        # didn't touch), and COGs outside the retried groups are
+        # byte-identical.
+        touched = {
+            f"tile_r{t.out_row:04d}_c{t.out_col:04d}.tif" for t in (retry_same_victim, split_victim)
+        }
+        for cog_path in cogs:
+            if cog_path.name in touched:
+                with rasterio.open(cog_path) as ds:
+                    after_px = ds.read()
+                with rasterio.io.MemoryFile(before[cog_path.name]) as mf, mf.open() as ds:
+                    before_px = ds.read()
+                assert np.array_equal(
+                    np.nan_to_num(before_px, nan=-1.0e30),
+                    np.nan_to_num(after_px, nan=-1.0e30),
+                ), f"{cog_path.name}: retry merge changed pixels"
+                with rasterio.open(cog_path) as ds:
+                    assert ds.nodata == -9999.0, "nodata must survive the merge"
+            else:
+                assert cog_path.read_bytes() == before[cog_path.name], (
+                    f"{cog_path.name} modified by retry"
+                )

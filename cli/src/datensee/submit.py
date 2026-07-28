@@ -334,6 +334,12 @@ def _run_local_with_progress(
     0.5s. When progress_callback is provided, calls it with (completed, total)
     instead of rendering a Rich progress bar.
 
+    The JVM's stdout/stderr are continuously drained by a background
+    thread into a bounded tail. Without the drain, Beam's per-tile INFO
+    logging fills the OS pipe buffer (~64KB), the JVM blocks on write,
+    and the export hangs forever while this loop keeps polling a
+    process that can never finish.
+
     Args:
         cmd: Java command to execute.
         output_dir: Directory where tile GeoTIFFs are written.
@@ -344,15 +350,28 @@ def _run_local_with_progress(
     Raises:
         subprocess.CalledProcessError: If the Java process exits non-zero.
     """
+    import threading
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
         pass_fds=pass_fds,
+        bufsize=1,
     )
+
+    tail_lines: deque[str] = deque(maxlen=200)
+
+    def _drain() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            tail_lines.append(line.rstrip("\n"))
+
+    drain_thread = threading.Thread(target=_drain, name="datensee-jvm-drain", daemon=True)
+    drain_thread.start()
 
     if progress_callback is not None:
         while process.poll() is None:
@@ -381,9 +400,11 @@ def _run_local_with_progress(
             completed = _count_completed_tiles(output_dir)
             progress.update(task, completed=min(completed, total_tiles or completed))
 
+    drain_thread.join(timeout=5.0)
     if process.returncode != 0:
-        stderr = process.stderr.read() if process.stderr else ""
-        raise subprocess.CalledProcessError(process.returncode, cmd, output="", stderr=stderr)
+        raise subprocess.CalledProcessError(
+            process.returncode, cmd, output="", stderr="\n".join(tail_lines)
+        )
 
 
 def _maybe_externalize_tiles(
@@ -410,7 +431,10 @@ def _maybe_externalize_tiles(
         tiles_file=tiles_file_path,
     )
 
-    return config.model_copy(update={"tile_grid": new_grid})
+    # `tile_grid` lives inside `pixel:` now; replace the whole payload so
+    # the model_copy update walks the nested record.
+    new_pixel = config.pixel.model_copy(update={"tile_grid": new_grid})
+    return config.model_copy(update={"pixel": new_pixel})
 
 
 def _tiles_file_path(output_path: str) -> str:

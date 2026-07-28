@@ -1,17 +1,40 @@
-"""Application Default Credentials helper.
+"""Application Default Credentials helpers.
 
-Retrieves an OAuth2 bearer token using ADC. This token is used by the
-Python CLI for Dataflow job status polling. The Java pipeline handles
-its own auth independently via the same ADC mechanism.
+Long-lived callers (e.g. the Dataflow poll loop) should hold the
+:class:`~google.auth.credentials.Credentials` object from
+:func:`get_credentials` and let it refresh as tokens expire.
+:func:`get_access_token` returns a one-shot bearer token for short-lived
+calls. The Java pipeline handles its own auth independently via the
+same ADC mechanism.
 """
 
 from __future__ import annotations
 
 import google.auth
+import google.auth.credentials
 import google.auth.transport.requests
 
 _EE_SCOPE = "https://www.googleapis.com/auth/earthengine"
 _CLOUD_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+
+
+def get_credentials() -> google.auth.credentials.Credentials:
+    """Return Application Default Credentials with cloud-platform scope.
+
+    The credential object is refreshable: callers holding it across a
+    token lifetime (~1 h) can call ``credentials.refresh(Request())``
+    (or rely on consumers like :func:`datensee.status.poll_job` that
+    refresh automatically) instead of restarting with a new token.
+
+    Returns:
+        Refreshable Google credentials for GCP APIs (Dataflow, GCS, ...).
+
+    Raises:
+        google.auth.exceptions.DefaultCredentialsError: If ADC is not configured.
+            Run `gcloud auth application-default login` to fix this.
+    """
+    credentials, _ = google.auth.default(scopes=[_CLOUD_SCOPE])
+    return credentials
 
 
 def get_access_token(scopes: list[str] | None = None) -> str:

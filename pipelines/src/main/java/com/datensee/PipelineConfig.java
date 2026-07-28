@@ -1,32 +1,78 @@
 package com.datensee;
 
+import com.datensee.pixel.PixelGrid;
+import com.datensee.pixel.TileCoordinate;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import java.util.List;
 
 /**
  * Top-level configuration passed from the Python CLI to the Beam pipeline.
  *
- * <p>Deserializes from the JSON file written by the Python CLI. The
- * {@code eeExpression} field is opaque — the pipeline never interprets it.
+ * <p>The envelope holds runner-agnostic submission fields (auth, snapshot
+ * pin, runner selection, rate limit) plus a {@code pipelineKind}
+ * discriminator and the kind-specific payload. Today only
+ * {@code pipelineKind="pixel"} is supported and the payload lives under
+ * {@link #pixel}; a future vector pipeline will plug a sibling field
+ * onto the same envelope without touching the pixel side.
+ *
+ * <p>The {@code eeExpression} field is opaque — the pipeline never
+ * interprets it.
+ *
+ * <p>Back-compat: {@link #tileGrid()} and {@link #output()} are
+ * convenience accessors that delegate into {@link #pixel}, so consumers
+ * inside {@code DatensEEPipeline} don't churn for the Phase 2 wire-shape
+ * change.
  */
+@com.fasterxml.jackson.annotation.JsonIgnoreProperties(ignoreUnknown = true)
 public record PipelineConfig(
+    @JsonProperty("pipeline_kind") String pipelineKind,
     @JsonProperty("ee_expression") String eeExpression,
     @JsonProperty("gee_project") String geeProject,
-    @JsonProperty("tile_grid") TileGridConfig tileGrid,
-    @JsonProperty("output") OutputConfig output,
     @JsonProperty("runner") RunnerConfig runner,
-    @JsonProperty("rate_limit") RateLimitConfig rateLimit,
-    @JsonProperty("snapshot_time") Long snapshotTime
+    @JsonProperty("snapshot_time") Long snapshotTime,
+    @JsonProperty("carryover_file") String carryoverFile,
+    @JsonProperty("pixel") PixelPayload pixel
 ) {
+
+    /**
+     * Whether a carryover journal was staged for this run. Set by
+     * {@code datensee retry}: records that made no progress last round
+     * (terminal kinds, depth-capped splits) are written to
+     * {@code {output}/_carryover.json} and unioned with this run's fresh
+     * failures when the pipeline writes {@code _failures.json} — so the
+     * journal stays the complete view of stuck tiles on every runner,
+     * with no Python post-step racing the async writer.
+     */
+    public boolean hasCarryover() {
+        return carryoverFile != null && !carryoverFile.isBlank();
+    }
 
     /** Convenience method for logging. */
     public int tileCount() {
-        return tileGrid != null && tileGrid.tiles() != null ? tileGrid.tiles().size() : 0;
+        TileGridConfig tg = tileGrid();
+        return tg != null && tg.tiles() != null ? tg.tiles().size() : 0;
     }
 
-    /** Returns effective rate limit config with defaults. */
-    public RateLimitConfig effectiveRateLimit() {
-        return rateLimit != null ? rateLimit : new RateLimitConfig(100);
+    /**
+     * Pixel-pipeline payload — selected when {@code pipelineKind == "pixel"}.
+     *
+     * <p>Carries the raster-specific work-unit description: the parent
+     * tile grid and the output config that says where COGs land and how
+     * they're packed.
+     */
+    public record PixelPayload(
+        @JsonProperty("tile_grid") TileGridConfig tileGrid,
+        @JsonProperty("output") OutputConfig output
+    ) { }
+
+    /** Pixel payload's tile grid, or {@code null} if the payload is absent. */
+    public TileGridConfig tileGrid() {
+        return pixel != null ? pixel.tileGrid() : null;
+    }
+
+    /** Pixel payload's output config, or {@code null} if the payload is absent. */
+    public OutputConfig output() {
+        return pixel != null ? pixel.output() : null;
     }
 
     /** Tile grid configuration. */
@@ -69,8 +115,22 @@ public record PipelineConfig(
         @JsonProperty("band_count") int bandCount,
         @JsonProperty("data_type") String dataType,
         @JsonProperty("output_tile_size_pixels") Integer outputTileSizePixels,
-        CogConfig cog
+        @JsonProperty("merge_existing_output") Boolean mergeExistingOutput,
+        @JsonProperty("nodata") Double nodata,
+        @JsonProperty("compression") String compression
     ) {
+        /**
+         * Whether the two-tier assembler should merge this run's tiles into an
+         * already-existing output COG instead of replacing it. Set by
+         * {@code datensee retry} so re-fetched tiles (including quadtree
+         * split children) overlay the blocks that already succeeded.
+         * Defaults to false: a fresh export replaces stale files rather
+         * than silently blending old pixels into failed blocks.
+         */
+        public boolean effectiveMergeExistingOutput() {
+            return Boolean.TRUE.equals(mergeExistingOutput);
+        }
+
         /**
          * Returns the configured band count (informational; see class
          * javadoc), defaulting to 1 when not set.
@@ -89,7 +149,7 @@ public record PipelineConfig(
 
         /**
          * Returns the output COG edge size in pixels, defaulting to the
-         * compute tile size when M6 two-tier tiling is disabled.
+         * compute tile size when two-tier tiling is disabled.
          */
         public int effectiveOutputTileSizePixels(int computeTileSize) {
             return outputTileSizePixels != null && outputTileSizePixels > 0
@@ -102,26 +162,7 @@ public record PipelineConfig(
          * {@code "deflate"} when no {@code cog} block is present.
          */
         public String effectiveCompression() {
-            return cog != null && cog.compress() != null && !cog.compress().isBlank()
-                ? cog.compress() : "deflate";
-        }
-    }
-
-    /** Cloud Optimized GeoTIFF parameters. */
-    public record CogConfig(
-        @JsonProperty("overview_levels") List<Integer> overviewLevels,
-        int blocksize,
-        String compress,
-        int predictor
-    ) { }
-
-    /** Rate limiting configuration. */
-    public record RateLimitConfig(
-        @JsonProperty("max_qps") int maxQps
-    ) {
-        /** Returns QPS, defaulting to 100 if not set. */
-        public int effectiveMaxQps() {
-            return maxQps > 0 ? maxQps : 100;
+            return compression != null && !compression.isBlank() ? compression : "deflate";
         }
     }
 

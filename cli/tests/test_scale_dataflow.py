@@ -39,14 +39,12 @@ from datensee.config import (
     DataflowRunnerConfig,
     OutputConfig,
     PipelineConfig,
-    RateLimitConfig,
     RunnerConfig,
 )
 from datensee.display import _format_bytes
-from datensee.expression import clip_expression
 from datensee.jar import find_jar
+from datensee.pixel.tiling import decompose_region
 from datensee.submit import submit_job
-from datensee.tiling import decompose_region
 
 # ---------------------------------------------------------------------------
 # Sentinel-2 NDVI expression
@@ -235,7 +233,9 @@ class TestZurichNdviDataflow:
         print(f"\nTile count: {tile_count}")
 
         # -- Build config --
-        expression = clip_expression(_sentinel2_ndvi_expression(), _SWITZERLAND)
+        # No EE-side clip: decompose-time region intersection keeps
+        # out-of-region tiles out of the workload entirely.
+        expression = _sentinel2_ndvi_expression()
 
         temp_location = f"gs://{gcs_bucket}/dataflow-temp"
 
@@ -259,7 +259,6 @@ class TestZurichNdviDataflow:
                     max_workers=50,
                 ),
             ),
-            rate_limit=RateLimitConfig(max_qps=100),
         )
 
         # -- Config summary --

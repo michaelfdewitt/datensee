@@ -9,6 +9,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from datensee.config import PipelineConfig
+from datensee.cost import CostEstimate, estimate_cost
 
 
 def _format_duration(seconds: float) -> str:
@@ -31,6 +32,40 @@ def _format_bytes(n: int) -> str:
     if n < 1024**3:
         return f"{n / 1024**2:.1f} MB"
     return f"{n / 1024**3:.2f} GB"
+
+
+def _format_usd(value: float) -> str:
+    """Format a USD amount, flooring tiny non-zero values at '<$0.01'."""
+    if 0 < value < 0.005:
+        return "<$0.01"
+    return f"${value:,.2f}"
+
+
+def _add_cost_rows(table: Table, estimate: CostEstimate) -> None:
+    """Append the 'Estimated cost' rows to an export-summary table."""
+    if estimate.tile_count == 0:
+        table.add_row(
+            "Est. cost", "[dim]unavailable — tile count unknown (tiles externalized)[/dim]"
+        )
+        return
+
+    table.add_row(
+        "Est. EECU",
+        f"{estimate.eecu_seconds_low:,.0f}–{estimate.eecu_seconds_high:,.0f} EECU-s "
+        f"({estimate.eecu_hours_low:,.2f}–{estimate.eecu_hours_high:,.2f} EECU-h)  "
+        "[dim]free for non-commercial EE use[/dim]",
+    )
+    if estimate.dataflow_usd_low is None or estimate.dataflow_usd_high is None:
+        table.add_row("Est. Dataflow", "none (local runner)")
+    else:
+        table.add_row(
+            "Est. Dataflow",
+            f"{_format_usd(estimate.dataflow_usd_low)}–{_format_usd(estimate.dataflow_usd_high)}",
+        )
+    if estimate.shuffle_usd is not None:
+        table.add_row("Est. shuffle", f"{_format_usd(estimate.shuffle_usd)}  (two-tier GroupByKey)")
+    table.add_row("Est. storage", f"{_format_usd(estimate.storage_usd_per_month)}/month")
+    table.add_row("", "[dim]rough estimate; EECU usage is expression-dependent[/dim]")
 
 
 def render_export_summary(config: PipelineConfig) -> Panel:
@@ -63,6 +98,8 @@ def render_export_summary(config: PipelineConfig) -> Panel:
         )
     else:
         table.add_row("Runner", "local  (DirectRunner)")
+
+    _add_cost_rows(table, estimate_cost(config))
 
     return Panel(table, title="Export Summary", border_style="cyan")
 

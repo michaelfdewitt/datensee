@@ -45,7 +45,7 @@ def _parse_snapshot_time(raw: str | None) -> int | None:
     """Parse the --snapshot-time CLI value into Unix microseconds.
 
     Accepts ISO-8601 (`'2026-04-30T12:00:00Z'`) or an integer literal
-    interpreted as Unix microseconds. The units changed in the M10
+    interpreted as Unix microseconds. The units changed in the snapshot pinning
     units fix: an old script passing nanoseconds will land in EE's
     INTERNAL-crash range and be rejected by ``pin_expression``.
     """
@@ -54,12 +54,17 @@ def _parse_snapshot_time(raw: str | None) -> int | None:
     raw = raw.strip()
     if raw.isdigit():
         return int(raw)
-    from datetime import datetime
+    from datetime import UTC, datetime
 
     try:
         # Accept the trailing 'Z' shorthand for UTC.
         normalized = raw.replace("Z", "+00:00") if raw.endswith("Z") else raw
-        return int(datetime.fromisoformat(normalized).timestamp() * 1_000_000)
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            # The help text promises UTC; a naive timestamp must not be
+            # reinterpreted in the machine's local timezone.
+            dt = dt.replace(tzinfo=UTC)
+        return int(dt.timestamp() * 1_000_000)
     except ValueError as exc:
         raise typer.BadParameter(
             f"--snapshot-time {raw!r} is neither Unix micros nor ISO-8601: {exc}"
@@ -96,7 +101,7 @@ def demo(
         typer.Option(
             "--output",
             "-o",
-            help="Local directory for output tiles + VRT. Created if absent.",
+            help="Local directory of COG tiles. Created if absent.",
         ),
     ] = Path("./datensee-output"),
     jar: Annotated[
@@ -194,8 +199,20 @@ def export(
         typer.Option(
             "--output-tile-size",
             help=(
-                "M6 two-tier tiling: output COG edge in pixels (multiple of "
+                "two-tier tiling: output COG edge in pixels (multiple of "
                 "--tile-size). Defaults to one COG per compute tile."
+            ),
+        ),
+    ] = None,
+    nodata: Annotated[
+        float | None,
+        typer.Option(
+            "--nodata",
+            help=(
+                "Nodata value stamped on every output COG (GDAL_NODATA tag). "
+                "EE returns masked pixels as 0 — unmask(sentinel) your "
+                "expression and pass the sentinel here so GIS tools can "
+                "tell nodata from real zeros."
             ),
         ),
     ] = None,
@@ -215,14 +232,6 @@ def export(
         Path | None,
         typer.Option("--jar", help="Path to the pipeline JAR (auto-detected if omitted)."),
     ] = None,
-    max_qps: Annotated[
-        int,
-        typer.Option(
-            "--max-qps",
-            help="Max queries per second to the EE HV API (shared across all workers).",
-            min=1,
-        ),
-    ] = 100,
     snapshot_time: Annotated[
         str | None,
         typer.Option(
@@ -271,10 +280,10 @@ def export(
             crs=crs,
             tile_size=tile_size,
             output_tile_size=output_tile_size,
+            nodata=nodata,
             runner=runner,  # type: ignore[arg-type]
             region_gcp=region_gcp,
             temp_location=temp_location,
-            max_qps=max_qps,
             jar=jar,
             snapshot_time=snapshot_time_micros,
             dry_run=dry_run,
@@ -306,7 +315,7 @@ def export(
         )
 
     if run_validate and is_local_filesystem_output:
-        from datensee.validation import validate_output
+        from datensee.pixel.validation import validate_output
 
         console.print("\n[bold]Running output checks[/bold]")
         report = validate_output(Path(output), result.config)
@@ -405,8 +414,7 @@ def status(
     """
     from datetime import timedelta
 
-    from datensee.auth import get_access_token
-    from datensee.status import WatchdogConfig, WatchdogTriggered, poll_job
+    from datensee.status import WatchdogConfig, WatchdogTriggered
 
     if no_watchdog:
         watchdog = WatchdogConfig(max_runtime=None, max_failure_rate=None, idle_timeout=None)
@@ -428,13 +436,11 @@ def status(
             ),
         )
 
-    access_token = get_access_token()
     try:
-        final_state = poll_job(
-            job_id=job_id,
-            project=project,
-            region=region_gcp,
-            access_token=access_token,
+        final_state = api.poll(
+            job_id,
+            project,
+            region_gcp,
             watchdog=watchdog,
             tile_count=tile_count,
         )
@@ -500,64 +506,48 @@ def validate_cmd(
             readable=True,
         ),
     ],
-    checks: Annotated[
-        str | None,
-        typer.Option(
-            "--checks",
-            "-e",
-            help="Comma-separated check IDs to run (e.g. E01,E03,E07). Default: all zero-cost.",
-        ),
-    ] = None,
-    sample: Annotated[
-        int,
-        typer.Option("--sample", help="Tile sample size for sampling-based checks."),
-    ] = 20,
-    reference: Annotated[
+    pixels: Annotated[
         bool,
         typer.Option(
-            "--reference",
-            help="Enable E07 pixel accuracy check (costs EECUs).",
+            "--pixels",
+            help="Also re-fetch sampled tiles from the EE HV API and compare "
+            "every pixel (costs EECUs; ~1 EECU-s per sampled tile).",
         ),
     ] = False,
+    sample: Annotated[
+        int,
+        typer.Option("--sample", help="Tile sample size for the --pixels check."),
+    ] = 20,
     gee_project: Annotated[
         str | None,
-        typer.Option("--gee-project", help="GCP project for E07 reference fetches."),
+        typer.Option(
+            "--gee-project",
+            help="GCP project for --pixels re-fetches. Defaults to the config's gee_project.",
+        ),
     ] = None,
     json_output: Annotated[
         Path | None,
         typer.Option("--json", help="Write machine-readable JSON report to this file."),
     ] = None,
 ) -> None:
-    """Validate pipeline output with the DatensEE check suite.
+    """Validate pipeline output.
 
-    Runs structural, spatial, and pixel-level integration checks against
-    exported tiles. By default runs all zero-cost checks (E01-E06, E08-E10).
-    Use --reference to also run E07 (pixel value comparison against EE HV API).
+    Two checks: ``integrity`` (zero-cost — every expected output COG
+    exists or is journaled, with the right dimensions, CRS, and origin)
+    always runs; ``--pixels`` additionally re-fetches sampled tiles from
+    the EE HV API and compares every band, which verifies the entire
+    pipeline chain at the cost of a few EECU-seconds.
     """
-    from datensee.validation import CheckID, validate_output, zero_cost_checks
+    from datensee.pixel.validation import validate_output
 
     config = PipelineConfig.read_json(config_file)
-
-    # Parse check IDs
-    check_ids: list[CheckID] | None = None
-    if checks:
-        check_ids = [CheckID(e.strip().upper()) for e in checks.split(",")]
-    elif reference:
-        check_ids = zero_cost_checks() + [CheckID.E07]
-
-    # E07 requires a project
-    if check_ids and CheckID.E07 in check_ids and not gee_project:
-        project = config.gee_project
-        console.print(f"[dim]Using gee_project from config: {project}[/dim]")
-    else:
-        project = gee_project
 
     report = validate_output(
         output_path,
         config,
-        checks=check_ids,
-        sample_size=sample,
-        gee_project=project,
+        pixels=pixels,
+        sample=sample,
+        gee_project=gee_project,
     )
 
     console.print(report.render())
@@ -640,7 +630,7 @@ def retry_cmd(
         int | None,
         typer.Option(
             "--output-tile-size",
-            help="M6 output tile size. Reads from meta when omitted.",
+            help="two-tier output tile size. Reads from meta when omitted.",
         ),
     ] = None,
     runner: Annotated[
@@ -655,10 +645,6 @@ def retry_cmd(
         str | None,
         typer.Option("--temp-location", help="GCS URI for Dataflow temp files."),
     ] = None,
-    max_qps: Annotated[
-        int,
-        typer.Option("--max-qps", help="Max QPS to the EE HV API.", min=1),
-    ] = 100,
     max_depth: Annotated[
         int,
         typer.Option(
@@ -677,6 +663,32 @@ def retry_cmd(
         bool,
         typer.Option("--dry-run", help="Plan the retry but don't submit."),
     ] = False,
+    until_done: Annotated[
+        bool,
+        typer.Option(
+            "--until-done",
+            help="Loop retry rounds until the journal has no retryable "
+            "work (or --max-rounds is hit). Between rounds, Dataflow "
+            "jobs are polled to completion.",
+        ),
+    ] = False,
+    max_rounds: Annotated[
+        int,
+        typer.Option(
+            "--max-rounds",
+            help="Round budget for --until-done.",
+            min=1,
+            max=25,
+        ),
+    ] = 5,
+    round_backoff: Annotated[
+        float,
+        typer.Option(
+            "--round-backoff",
+            help="Seconds to wait between --until-done rounds (lets EE transients clear).",
+            min=0.0,
+        ),
+    ] = 30.0,
 ) -> None:
     """Re-submit failed tiles from a journal, splitting where appropriate.
 
@@ -700,9 +712,81 @@ def retry_cmd(
     existing ones.
     """
     from datensee.api import retry as run_retry
+    from datensee.api import retry_until_done
     from datensee.meta import ExportMetaMismatch
 
     ee_expression = expression_file.read_text().strip() if expression_file else None
+
+    if until_done and dry_run:
+        console.print("[red]--until-done cannot be combined with --dry-run.[/red]")
+        raise typer.Exit(code=1)
+
+    if until_done:
+
+        def _report_round(round_index: int, round_result) -> None:
+            if round_result.next_tiles_count == 0:
+                console.print(
+                    f"[bold]Round {round_index}[/bold]: nothing left to retry "
+                    f"({round_result.carryover_count} record(s) carried over)"
+                )
+                return
+            fresh = round_result.tiles_failed_this_round
+            console.print(
+                f"[bold]Round {round_index}[/bold]: submitted "
+                f"{round_result.next_tiles_count} tiles, "
+                f"{fresh if fresh is not None else '?'} fresh failures, "
+                f"{round_result.carryover_count} carried over"
+            )
+
+        try:
+            loop_result = retry_until_done(
+                output=output,
+                runner=runner,  # type: ignore[arg-type]
+                region_gcp=region_gcp,
+                max_rounds=max_rounds,
+                round_backoff_seconds=round_backoff,
+                round_callback=_report_round,
+                journal=journal,
+                ee_expression=ee_expression,
+                project=project,
+                scale=scale,
+                crs=crs,
+                tile_size=tile_size,
+                output_tile_size=output_tile_size,
+                temp_location=temp_location,
+                jar=jar,
+                max_depth=max_depth,
+            )
+        except (ExportMetaMismatch, FileNotFoundError, ValueError) as exc:
+            console.print(f"[red]Error:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+
+        last = loop_result.rounds[-1]
+        if loop_result.stopped == "no_retryable_work":
+            if last.carryover_count == 0:
+                console.print(
+                    f"[green]Journal clear after {len(loop_result.rounds)} round(s) — "
+                    "all tiles recovered.[/green]"
+                )
+            else:
+                console.print(
+                    f"[yellow]{last.carryover_count} record(s) remain stuck "
+                    f"(terminal or depth-capped) after {len(loop_result.rounds)} "
+                    "round(s). Inspect _failures.json; bumping --max-depth may "
+                    "rescue depth-capped tiles.[/yellow]"
+                )
+        elif loop_result.stopped == "max_rounds":
+            console.print(
+                f"[yellow]Round budget ({max_rounds}) exhausted with retryable "
+                "work remaining — re-run to continue.[/yellow]"
+            )
+            raise typer.Exit(code=1)
+        else:
+            console.print(
+                f"[red]Stopped: {loop_result.stopped}. Fix the job failure, then re-run.[/red]"
+            )
+            raise typer.Exit(code=1)
+        return
 
     try:
         result = run_retry(
@@ -717,7 +801,6 @@ def retry_cmd(
             runner=runner,  # type: ignore[arg-type]
             region_gcp=region_gcp,
             temp_location=temp_location,
-            max_qps=max_qps,
             jar=jar,
             max_depth=max_depth,
             dry_run=dry_run,

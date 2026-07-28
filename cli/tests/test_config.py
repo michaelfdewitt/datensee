@@ -8,13 +8,11 @@ from pydantic import ValidationError
 
 from datensee.config import (
     AffineTransform,
-    CogParameters,
     DataflowRunnerConfig,
     GridDimensions,
     OutputConfig,
     PipelineConfig,
     PixelGrid,
-    RateLimitConfig,
     RunnerConfig,
     TileCoordinate,
     TileGrid,
@@ -100,11 +98,8 @@ def test_dataflow_mode_requires_dataflow_config() -> None:
         RunnerConfig(mode="dataflow", dataflow=None)
 
 
-def test_cog_defaults_are_sensible() -> None:
-    cog = CogParameters()
-    assert cog.blocksize == 512
-    assert cog.compress == "deflate"
-    assert 2 in cog.overview_levels
+def test_compression_default_is_deflate() -> None:
+    assert OutputConfig(output_path="/tmp/x").compression == "deflate"
 
 
 def test_tile_grid_default_tile_size() -> None:
@@ -173,9 +168,11 @@ def test_dataflow_runner_config_with_labels() -> None:
 
 
 def test_local_output_path_accepted() -> None:
-    config = _minimal_config().model_copy(
+    base = _minimal_config()
+    new_pixel = base.pixel.model_copy(
         update={"output": OutputConfig(output_path="/tmp/datensee-output")}
     )
+    config = base.model_copy(update={"pixel": new_pixel})
     assert config.output.output_path == "/tmp/datensee-output"
 
 
@@ -205,9 +202,11 @@ def test_data_type_default() -> None:
 
 
 def test_multiband_config() -> None:
-    config = _minimal_config().model_copy(
+    base = _minimal_config()
+    new_pixel = base.pixel.model_copy(
         update={"output": OutputConfig(output_path="/tmp/out", band_count=3, data_type="uint8")}
     )
+    config = base.model_copy(update={"pixel": new_pixel})
     assert config.output.band_count == 3
     assert config.output.data_type == "uint8"
 
@@ -222,23 +221,8 @@ def test_invalid_data_type_raises() -> None:
         OutputConfig(output_path="/tmp/out", data_type="complex128")
 
 
-def test_rate_limit_defaults() -> None:
-    config = _minimal_config()
-    assert config.rate_limit.max_qps == 100
-
-
-def test_rate_limit_custom() -> None:
-    config = _minimal_config().model_copy(update={"rate_limit": RateLimitConfig(max_qps=50)})
-    assert config.rate_limit.max_qps == 50
-
-
-def test_rate_limit_invalid_zero() -> None:
-    with pytest.raises(ValidationError):
-        RateLimitConfig(max_qps=0)
-
-
 # ---------------------------------------------------------------------------
-# expected_output_tile_count: M6 two-tier accounting
+# expected_output_tile_count: two-tier accounting
 # ---------------------------------------------------------------------------
 
 

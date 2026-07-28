@@ -8,10 +8,10 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from datensee.config import PipelineConfig, TileGrid
+    from datensee.config import PipelineConfig
     from datensee.status import JobInfo, JobState
 
 
@@ -129,7 +129,7 @@ def ensure_jar() -> Path:
 
 _STATUS_HTML_TEMPLATE = """\
 <div style="font-family: monospace; padding: 8px; border: 1px solid #ddd; border-radius: 4px;">
-  <table style="border-collapse: collapse; width: 100%%;">
+  <table style="border-collapse: collapse; width: 100%;">
     <tr><td style="padding: 4px 8px; font-weight: bold;">Job</td>
         <td style="padding: 4px 8px;">{job_id}</td></tr>
     <tr><td style="padding: 4px 8px; font-weight: bold;">State</td>
@@ -247,7 +247,8 @@ def display_export_summary(config: PipelineConfig) -> None:
     """
     from IPython.display import HTML, display
 
-    from datensee.display import _format_bytes
+    from datensee.cost import estimate_cost
+    from datensee.display import _format_bytes, _format_usd
 
     grid = config.tile_grid
     tile_px = grid.tile_size_pixels
@@ -261,15 +262,52 @@ def display_export_summary(config: PipelineConfig) -> None:
 
     if config.runner.mode == "dataflow" and config.runner.dataflow is not None:
         df = config.runner.dataflow
-        rows.append((
-            "Runner",
+        rows.append(
             (
-                f"dataflow ({df.machine_type}, {df.num_workers}–{df.max_workers} workers, "
-                f"{df.number_of_worker_harness_threads} threads/worker)"
-            ),
-        ))
+                "Runner",
+                (
+                    f"dataflow ({df.machine_type}, {df.num_workers}–{df.max_workers} workers, "
+                    f"{df.number_of_worker_harness_threads} threads/worker)"
+                ),
+            )
+        )
     else:
         rows.append(("Runner", "local (DirectRunner)"))
+
+    estimate = estimate_cost(config)
+    if estimate.tile_count == 0:
+        rows.append(("Est. cost", "unavailable &mdash; tile count unknown (tiles externalized)"))
+    else:
+        rows.append(
+            (
+                "Est. EECU",
+                f"{estimate.eecu_seconds_low:,.0f}&ndash;{estimate.eecu_seconds_high:,.0f} "
+                f"EECU-s ({estimate.eecu_hours_low:,.2f}&ndash;{estimate.eecu_hours_high:,.2f} "
+                "EECU-h) &mdash; free for non-commercial EE use",
+            )
+        )
+        if estimate.dataflow_usd_low is None or estimate.dataflow_usd_high is None:
+            rows.append(("Est. Dataflow", "none (local runner)"))
+        else:
+            rows.append(
+                (
+                    "Est. Dataflow",
+                    f"{_format_usd(estimate.dataflow_usd_low)}&ndash;"
+                    f"{_format_usd(estimate.dataflow_usd_high)}",
+                )
+            )
+        if estimate.shuffle_usd is not None:
+            rows.append(
+                ("Est. shuffle", f"{_format_usd(estimate.shuffle_usd)} (two-tier GroupByKey)")
+            )
+        rows.append(("Est. storage", f"{_format_usd(estimate.storage_usd_per_month)}/month"))
+        rows.append(
+            (
+                "",
+                '<span style="color: #888;">rough estimate; '
+                "EECU usage is expression-dependent</span>",
+            )
+        )
 
     row_html = "\n".join(
         f'<tr><td style="padding: 4px 12px; font-weight: bold;">{label}</td>'
@@ -286,124 +324,3 @@ def display_export_summary(config: PipelineConfig) -> None:
         f"</div>"
     )
     display(HTML(html))
-
-
-def display_tile_grid(grid: TileGrid, region: dict[str, Any]) -> None:
-    """Show tile outlines and region polygon with matplotlib.
-
-    Args:
-        grid: TileGrid from decompose_region() or api.tile().
-        region: Original GeoJSON region geometry dict.
-    """
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Rectangle
-    from shapely.geometry import shape
-
-    from datensee.tiling import tile_bbox
-
-    fig, ax = plt.subplots(1, 1, figsize=(10, 8))
-
-    # Draw tiles
-    if grid.tiles:
-        for t in grid.tiles:
-            x_min, y_min, x_max, y_max = tile_bbox(grid.pixel_grid, t)
-            rect = Rectangle(
-                (x_min, y_min),
-                x_max - x_min,
-                y_max - y_min,
-                linewidth=0.5,
-                edgecolor="#0077cc",
-                facecolor="#0077cc",
-                alpha=0.1,
-            )
-            ax.add_patch(rect)
-
-    # Draw region outline
-    geom = shape(region)
-    if hasattr(geom, "exterior"):
-        xs, ys = geom.exterior.xy
-        ax.plot(xs, ys, color="#cc0000", linewidth=2, label="Region")
-    elif hasattr(geom, "geoms"):
-        for i, poly in enumerate(geom.geoms):
-            xs, ys = poly.exterior.xy
-            ax.plot(xs, ys, color="#cc0000", linewidth=2, label="Region" if i == 0 else None)
-
-    ax.set_xlabel(f"X ({grid.crs})")
-    ax.set_ylabel(f"Y ({grid.crs})")
-    ax.set_title(f"{len(grid.tiles or [])} tiles @ {grid.pixel_size:g} {grid.crs} units/px")
-    ax.legend()
-    ax.set_aspect("equal")
-    ax.autoscale()
-    plt.tight_layout()
-    plt.show()
-
-
-def preview_tiles(
-    output: str,
-    config: PipelineConfig,
-    n: int = 4,
-) -> None:
-    """Download and display N sample tiles as matplotlib images.
-
-    For GCS paths, downloads tile bytes via google-cloud-storage. For local
-    paths, reads directly. Requires rasterio (datensee[validation] extra).
-
-    Args:
-        output: Output path (GCS URI or local directory).
-        config: Pipeline config that produced the output.
-        n: Number of tiles to preview.
-    """
-    import matplotlib.pyplot as plt
-    import rasterio
-
-    tiles = config.tile_grid.tiles
-    if not tiles:
-        return
-
-    # Sample tiles (evenly spaced)
-    step = max(1, len(tiles) // n)
-    sample = tiles[::step][:n]
-
-    fig, axes = plt.subplots(1, len(sample), figsize=(4 * len(sample), 4))
-    if len(sample) == 1:
-        axes = [axes]
-
-    for ax, t in zip(axes, sample, strict=True):
-        tile_name = f"tile_r{t.row:04d}_c{t.col:04d}.tif"
-
-        if output.startswith("gs://"):
-            from google.cloud import storage
-
-            parts = output.replace("gs://", "").split("/", 1)
-            bucket_name = parts[0]
-            prefix = parts[1] if len(parts) > 1 else ""
-            blob_path = f"{prefix.rstrip('/')}/{tile_name}" if prefix else tile_name
-
-            client = storage.Client()
-            bucket = client.bucket(bucket_name)
-            blob = bucket.blob(blob_path)
-            data = blob.download_as_bytes()
-
-            import tempfile
-
-            with tempfile.NamedTemporaryFile(suffix=".tif") as tmp:
-                tmp.write(data)
-                tmp.flush()
-                with rasterio.open(tmp.name) as src:
-                    band = src.read(1)
-        else:
-            tile_path = Path(output) / tile_name
-            if not tile_path.exists():
-                ax.set_title(f"{tile_name}\n(missing)")
-                ax.axis("off")
-                continue
-            with rasterio.open(tile_path) as src:
-                band = src.read(1)
-
-        ax.imshow(band, cmap="viridis")
-        ax.set_title(f"r{t.row} c{t.col}")
-        ax.axis("off")
-
-    plt.suptitle("Tile Preview")
-    plt.tight_layout()
-    plt.show()

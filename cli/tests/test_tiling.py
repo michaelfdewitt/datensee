@@ -1,4 +1,4 @@
-"""Tests for region → tile grid decomposition (M11 PixelGrid shape)."""
+"""Tests for region → tile grid decomposition (PixelGrid shape)."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from datensee.config import (
     PixelGrid,
     TileCoordinate,
 )
-from datensee.tiling import (
+from datensee.pixel.tiling import (
     _METERS_PER_DEGREE_EQUATOR,
     _pixel_size_native,
     decompose_region,
@@ -188,7 +188,7 @@ class TestTilePixelGrid:
 
 class TestTileBbox:
     def test_nw_corner_tile(self) -> None:
-        # Worked example from m11-pixel-grid.md.
+        # Worked example: 20x20 px region, pixel_size=1, tile_size=10.
         parent = _parent_grid(scale=1.0, translate_x=10.0, translate_y=40.0, width=20, height=20)
         tile = TileCoordinate(col_px=0, row_px=0, width_px=10, height_px=10)
         assert tile_bbox(parent, tile) == (10.0, 30.0, 20.0, 40.0)
@@ -240,7 +240,7 @@ def test_parent_translate_is_global_snap() -> None:
 
 def test_grid_alignment_unconditional_across_latitudes() -> None:
     """Two exports at very different centroid latitudes must produce identical
-    pixel sizes and tile offsets — that's the whole point of M11. The parent
+    pixel sizes and tile offsets — that's the whole point of the canonical-grid design. The parent
     grid translate differs (different bbox) but the affine scale is the same,
     and shared tiles snap to the same multiple of (pixel_size * tile_size)."""
     region_low_lat = {
@@ -317,7 +317,7 @@ def test_adjacent_tiles_share_pixel_boundary() -> None:
 
 
 # ---------------------------------------------------------------------------
-# M6 two-tier tiling: out_row / out_col assignment
+# two-tier tiling: out_row / out_col assignment
 # ---------------------------------------------------------------------------
 
 
@@ -386,6 +386,68 @@ def test_invalid_output_tile_size_rejected() -> None:
             tile_size_pixels=64,
             output_tile_size_pixels=100,  # not a multiple of 64
         )
+
+
+# Region chosen so the compute-tile snap alone would put the parent origin
+# on an *odd* multiple of the tile size — i.e. NOT on an output-tile
+# boundary. Pre-fix, this produced groups whose local offsets disagreed
+# with the Java assembler's `(col_px // out) * out` origin snap.
+OFFSET_SQUARE = {
+    "type": "Polygon",
+    "coordinates": [
+        [
+            [0.52, 0.32],
+            [0.98, 0.32],
+            [0.98, 0.78],
+            [0.52, 0.78],
+            [0.52, 0.32],
+        ]
+    ],
+}
+
+
+def test_m6_parent_origin_snaps_to_output_tile_boundary() -> None:
+    """The assembler recovers each output tile's origin from local pixel
+    offsets, which is only sound when the parent origin sits on an
+    output-tile boundary. Pin that invariant for an awkward region."""
+    out_px = 200
+    grid = decompose_region(
+        OFFSET_SQUARE,
+        scale_meters=111.32,
+        crs="EPSG:4326",
+        tile_size_pixels=100,
+        output_tile_size_pixels=out_px,
+    )
+    p = grid.pixel_grid.affine_transform
+    origin_col_px = p.translate_x / p.scale_x
+    origin_row_px = -p.translate_y / p.scale_x
+    assert origin_col_px == pytest.approx(round(origin_col_px))
+    assert round(origin_col_px) % out_px == 0
+    assert round(origin_row_px) % out_px == 0
+
+
+def test_m6_out_indices_match_local_offset_arithmetic() -> None:
+    """out_row/out_col must equal (row_px // out, col_px // out) — the exact
+    arithmetic the Java assembler uses to place blocks and derive the
+    output tile's affine. Every tile must fall inside its output rect."""
+    out_px = 200
+    tile_px = 100
+    grid = decompose_region(
+        OFFSET_SQUARE,
+        scale_meters=111.32,
+        crs="EPSG:4326",
+        tile_size_pixels=tile_px,
+        output_tile_size_pixels=out_px,
+    )
+    assert len(grid.tiles) > 4  # multi-group case, not degenerate
+    for t in grid.tiles:
+        assert t.out_col == t.col_px // out_px
+        assert t.out_row == t.row_px // out_px
+        # Block index within the output tile is in range by construction.
+        bx = (t.col_px - t.out_col * out_px) // tile_px
+        by = (t.row_px - t.out_row * out_px) // tile_px
+        assert 0 <= bx < out_px // tile_px
+        assert 0 <= by < out_px // tile_px
 
 
 # ---------------------------------------------------------------------------

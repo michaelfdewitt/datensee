@@ -56,7 +56,7 @@ class ExportMeta(BaseModel):
     export's ``decompose_region`` call. Retry needs it because tile
     ``col_px``/``row_px`` in the failures journal are *local* offsets
     into this grid; without it we can't reconstruct CRS coordinates.
-    Legacy meta written before M11 has ``pixel_grid=None``; retry falls
+    Legacy meta written before has ``pixel_grid=None``; retry falls
     back to a translate=0 grid in that case (best-effort — only correct
     for exports whose snapped bbox happened to start at the origin).
     """
@@ -70,6 +70,7 @@ class ExportMeta(BaseModel):
     ee_expression: str
     snapshot_time: int | None = None
     pixel_grid: PixelGrid | None = None
+    nodata: float | None = None
 
     @model_validator(mode="after")
     def _migrate_nanos_snapshot_time(self) -> ExportMeta:
@@ -116,6 +117,7 @@ def build_meta(
     ee_expression: str,
     snapshot_time: int | None = None,
     pixel_grid: PixelGrid | None = None,
+    nodata: float | None = None,
 ) -> ExportMeta:
     return ExportMeta(
         crs=crs,
@@ -126,6 +128,7 @@ def build_meta(
         ee_expression=ee_expression,
         snapshot_time=snapshot_time,
         pixel_grid=pixel_grid,
+        nodata=nodata,
     )
 
 
@@ -190,6 +193,7 @@ def verify_retry_compatibility(
     output_tile_size_pixels: int | None,
     gee_project: str,
     ee_expression: str,
+    nodata: float | None = None,
 ) -> None:
     """Raise :class:`ExportMetaMismatch` if any retry arg disagrees with ``meta``."""
     mismatches: list[str] = []
@@ -208,6 +212,8 @@ def verify_retry_compatibility(
         )
     if meta.gee_project != gee_project:
         mismatches.append(f"gee_project: original={meta.gee_project!r}, retry={gee_project!r}")
+    if meta.nodata != nodata:
+        mismatches.append(f"nodata: original={meta.nodata}, retry={nodata}")
     if meta.ee_expression != ee_expression:
         meta_hash = meta.ee_expression_sha256
         retry_hash = _hash_expression(ee_expression)

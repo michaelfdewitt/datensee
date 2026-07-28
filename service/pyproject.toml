@@ -6,6 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "datensee",
     "fastapi>=0.115",
+    "httpx>=0.27",
     "uvicorn[standard]>=0.32",
     "google-auth>=2.30",
     "google-cloud-spanner>=3.40",
@@ -23,7 +24,6 @@ datensee = { path = "../cli", editable = true }
 
 [dependency-groups]
 dev = [
-    "httpx>=0.27",
     "pytest>=9.0",
 ]
 

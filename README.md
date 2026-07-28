@@ -29,10 +29,51 @@ Earth Engine is great at computing things, but the built-in `Export.image.*` fun
 
 DatensEE doesn't recompile or interpret your computation — EE does that.
 We just call the [High Volume API](https://developers.google.com/earth-engine/reference/rest/v1/projects.image/computePixels)
-thousands of times in parallel, with proper tiling, retries, and rate limiting,
+thousands of times in parallel, with proper tiling, retries, and backoff,
 and stitch the results together.
 
 **EE is the computation engine. DatensEE is the parallelism engine.**
+
+### Why isn't this fifty lines?
+
+A fair question — "call `computePixels` in parallel and stitch the results" sounds
+like a `ThreadPoolExecutor` and rasterio. That version exists, and it's the right
+tool up to roughly a few GB of output on one machine. DatensEE is what's left after
+committing to the regime where it falls over: terabyte-scale exports, thousands of
+concurrent workers, and hours-long jobs where partial failure is the normal case,
+not the exceptional one. Nearly all of the code is the consequence of three
+commitments:
+
+1. **No native dependencies on workers.** Dataflow workers don't ship GDAL, and we
+   didn't want custom containers or native-library versioning. So COG output is a
+   pure-Java TIFF transcoder (`CogTranscoder`), and stitching thousands of tiles
+   into multi-block COGs — including merging retried tiles into *existing* COGs —
+   is a streaming assembler (`AssembledCogWriter`), not an in-memory mosaic.
+
+2. **Partial failure is the steady state.** When 50 of 10,000 fetches fail,
+   abort-and-rerun is not an answer. That buys: 429-driven exponential backoff,
+   classification of EE's error signatures (transient vs. too-complex vs.
+   terminal), a structured failures journal, quadtree splitting of tiles EE
+   rejects as too expensive, and a `retry --until-done` loop that converges
+   instead of retrying into the same wall forever. The naive version's answer to
+   failure is "run it again" — at this scale that's hours and real money.
+
+3. **Precision guarantees that are invisible until violated.** Every tile is an
+   integer pixel rectangle in one canonical grid, so a retried sub-tile lands
+   pixel-exact in an existing COG by arithmetic, not float tolerance. And every
+   worker sees the same snapshot of every EE asset (snapshot pinning) — without
+   it, a collection that mutates mid-export gives tile A and tile B different
+   worlds, and the output is silently wrong. Both bugs exist in the naive version;
+   nobody notices until they diff outputs.
+
+The rest is deliberate product surface — job submission and polling, cost
+estimation before you spend money, Colab auth, progress display — because the API
+is the product and EE users aren't infra engineers. The tests outnumber the source;
+that's the price of the word "pixel-exact" above.
+
+If your exports fit comfortably on one machine, use
+[xee](https://github.com/google/xee) or `ee.batch.Export` and be happy. DatensEE
+exists for when they stop fitting.
 
 ## How it works
 
@@ -60,8 +101,9 @@ and stitch the results together.
    tile grid, and submits a Dataflow job (or runs locally for small regions)
 3. **Java Beam pipeline** fans out across workers — each fetches tiles via the
    HV API with exponential backoff and retries
-4. **Output** lands as Cloud Optimized GeoTIFF(s) on GCS, or as local GeoTIFFs
-   with a VRT mosaic for the direct runner
+4. **Output** lands as a directory of self-describing Cloud Optimized GeoTIFFs —
+   on GCS for Dataflow, or a local directory for the direct runner. No manifest
+   files; any modern GIS tool opens them directly
 
 ## Quick start
 
@@ -90,38 +132,57 @@ datensee demo --project my-gcp-project --output ./ndvi-output
 ```
 
 This fetches a small Landsat 9 NDVI composite (~4 tiles at 30m) using the
-local direct runner. Output is individual GeoTIFFs plus a `mosaic.vrt`.
+local direct runner. Output is a directory of Cloud Optimized GeoTIFFs
+(`tile_r0000_c0000.tif`, …) — self-describing files that QGIS, rasterio, or
+any modern GIS opens directly, no manifest needed.
 
-Convert to a single Cloud Optimized GeoTIFF:
+Want a single big COG instead of many small ones? Use two-tier tiling:
+pass `--output-tile-size` (a multiple of `--tile-size`, large enough to
+cover the region) and the pipeline assembles compute tiles into one
+multi-block COG per output tile.
 
-```bash
-gdal_translate -of COG -co COMPRESS=LZW ndvi-output/mosaic.vrt ndvi.tif
-```
+### Full export — swap the `Export` call
 
-### Full export
+If you already have an `ee.Image` in Python, DatensEE is a drop-in
+replacement for `Export.image.toCloudStorage` — hand it the live object
+and your region; no serializer incantations:
 
-```bash
-# Serialize your EE expression
-python -c "
-import ee, json
+```python
+import ee, datensee
 ee.Initialize()
+
 image = (ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
          .filterDate('2023-06-01', '2023-09-01')
          .median()
          .normalizedDifference(['SR_B5', 'SR_B4']))
-with open('expr.json', 'w') as f:
-    json.dump(ee.serializer.encode(image, for_cloud_api=True), f)
-"
+region = ee.Geometry.Rectangle([-122.6, 37.2, -121.8, 38.0])
 
-# Export at 10m in UTM, multi-band
+# before: Export.image.toCloudStorage(image, region=region, scale=10, ...)
+result = datensee.export(
+    image, region,
+    project="my-gcp-project",
+    output="gs://my-bucket/exports/ndvi",
+    scale=10, crs="EPSG:32610",
+    temp_location="gs://my-bucket/tmp",
+)
+```
+
+`region` also accepts a GeoJSON dict or a shapely geometry, and
+`datensee` never imports `ee` itself — your installed client does the
+serialization. From the shell, the same export takes a serialized
+expression file + GeoJSON region:
+
+```bash
 datensee export expr.json region.geojson \
   --project my-gcp-project \
   --output gs://my-bucket/exports/ndvi \
-  --scale 10 \
-  --crs EPSG:32610 \
-  --runner dataflow \
-  --temp-location gs://my-bucket/tmp
+  --scale 10 --crs EPSG:32610 \
+  --runner dataflow --temp-location gs://my-bucket/tmp
 ```
+
+Coming from the Code Editor (JavaScript)? See
+[`docs/task-import.md`](docs/task-import.md) for the planned
+copy-the-job-description path.
 
 ## Notebook / Colab
 
@@ -134,7 +195,6 @@ from datensee import notebook
 notebook.ensure_auth()  # triggers Colab OAuth flow, exports ADC for Java
 
 grid = datensee.tile(region, scale=30.0)
-notebook.display_tile_grid(grid, region)       # matplotlib preview
 
 result = datensee.export(expression, region, project="...", output="gs://...", runner="dataflow", temp_location="gs://...")
 notebook.display_job_progress(result.job_id, project="...")  # HTML status polling
@@ -161,12 +221,15 @@ This guarantees:
 
 - **Pixel-perfect alignment** — two independent exports at the same scale and
   CRS produce identical pixel grids in any overlapping area
-- **Edge clipping** — the EE expression is automatically wrapped in
-  `Image.clip(region)` so edge tiles return nodata outside the boundary
-  instead of wasting EECUs on out-of-bounds pixels. The tile *grid* stays
-  full-size for alignment; only the *computation* is clipped.
-- **Adjacent tile contiguity** — `tile[i].x_max == tile[i+1].x_min` exactly,
-  with no floating-point gaps or overlaps
+- **Region-aware tiling, no clipping** — tiles that don't intersect the
+  region are dropped at decompose time, so out-of-region areas never cost
+  EECUs. The EE expression itself is *not* modified — DatensEE deliberately
+  does not wrap it in `Image.clip()`. (Call `.clip()` on your image
+  yourself if you want EE-side masking explicitly.)
+- **Adjacent tile contiguity** — tiles are integer pixel rectangles
+  (`col_px`, `row_px`, `width_px`, `height_px`) inside one parent
+  `PixelGrid`, so adjacency is exact by construction — no floating-point
+  gaps or overlaps
 
 This is tested via integration tests that shift a region by N pixels, fetch
 tiles from both grids, and assert pixel-by-pixel equality in the overlap.
@@ -177,19 +240,31 @@ The pipeline config is a JSON contract between the Python CLI and the Java pipel
 
 ```jsonc
 {
-  "ee_expression": "{ ... }",       // opaque — EE evaluates this, we don't touch it
+  "pipeline_kind": "pixel",          // discriminator; future: "vector"
+  "ee_expression": "{ ... }",        // opaque — EE evaluates this, we don't touch it
   "gee_project": "my-project",
-  "tile_grid": {
-    "crs": "EPSG:32610",
-    "scale_meters": 10.0,
-    "tile_size_pixels": 512,
-    "tiles": [ ... ]
-  },
-  "output": {
-    "output_path": "gs://bucket/prefix",
-    "band_count": 3,
-    "data_type": "uint8",            // float32, float64, int16, int32, uint8, uint16
-    "cog": { "compress": "lzw", "blocksize": 512 }
+  "snapshot_time": 1715000000000000, // Unix µs — asset versions pinned to this moment
+  "pixel": {
+    "tile_grid": {
+      "pixel_grid": {                // canonical export grid, sent verbatim to computePixels
+        "crs_code": "EPSG:32610",
+        "affine_transform": { "scale_x": 10.0, "translate_x": 500000.0,
+                              "scale_y": -10.0, "translate_y": 4200000.0,
+                              "shear_x": 0, "shear_y": 0 },
+        "dimensions": { "width": 4096, "height": 4096 }
+      },
+      "tile_size_pixels": 512,
+      "tiles": [                     // integer pixel rects inside the parent grid
+        { "col_px": 0, "row_px": 0, "width_px": 512, "height_px": 512, "row": 0, "col": 0 }
+      ]
+    },
+    "output": {
+      "output_path": "gs://bucket/prefix",
+      "band_count": 3,
+      "data_type": "uint8",          // float32, float64, int16, int32, uint8, uint16
+      "output_tile_size_pixels": 2048, // optional two-tier tiling
+      "cog": { "compress": "deflate" } // or "none"
+    }
   },
   "runner": {
     "mode": "dataflow",              // or "local"
@@ -206,20 +281,25 @@ Full schema: [`contract/pipeline-config.schema.json`](contract/pipeline-config.s
 datensee/
 ├── cli/                 Python CLI + library (Typer + Pydantic)
 │   ├── src/datensee/
-│   │   ├── api.py       Public Python API (export, demo, poll, tile)
+│   │   ├── api.py       Public Python API (export, demo, poll, tile, retry)
 │   │   ├── notebook.py  Colab/Jupyter detection, auth, HTML displays
 │   │   ├── main.py      CLI entrypoint (thin wrapper around api.py)
-│   │   ├── config.py    Pipeline config models
-│   │   ├── tiling.py    Region → globally-aligned tile grid
-│   │   ├── assemble.py  VRT mosaic assembly (multi-band, any data type)
+│   │   ├── config.py    PipelineConfig envelope (kind discriminator, runner, …)
 │   │   ├── submit.py    Dataflow job submission
-│   │   └── validation/  Output validation: 10 checks (structural, spatial, pixel-level)
+│   │   ├── status.py    Job polling + watchdog cost controls
+│   │   ├── meta.py      _export_meta.json sidecar (used by retry)
+│   │   ├── pinning.py   EE snapshot-time pinning
+│   │   └── pixel/       Pixel-pipeline subpackage
+│   │       ├── config.py     PixelGrid, TileGrid, OutputConfig
+│   │       ├── tiling.py     Region → globally-aligned tile grid
+│   │       ├── retry.py      Quadtree splitter + failures-journal I/O
+│   │       └── validation/   Output validation (structural, spatial, pixel-level)
 │   └── tests/           Unit + EE HV API integration + output-validation tests
 ├── pipelines/           Java Beam pipeline (Gradle)
 │   └── src/main/java/com/datensee/
-│       ├── DatensEEPipeline.java
-│       ├── fetch/       HV API client, retry, rate limiting
-│       └── io/          COG writer
+│       ├── DatensEEPipeline.java   Kind-agnostic pipeline shell
+│       ├── fetch/       Shared EE HV primitives (auth, error classification)
+│       └── pixel/       Pixel pipeline: fetch DoFns + COG writers (io/)
 ├── notebooks/           Colab/Jupyter examples
 ├── contract/            JSON schema + examples
 └── CLAUDE.md            Development guide

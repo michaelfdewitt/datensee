@@ -3,6 +3,11 @@
 Polls the Dataflow REST API to surface job state, elapsed time, and
 tile-level progress metrics. Dataflow metrics lag ~30-60s behind reality.
 
+Auth is credential-object based: the poller holds a
+:class:`google.auth.credentials.Credentials` and refreshes it whenever it
+goes stale (proactively via ``credentials.valid``, reactively on a 401),
+so multi-hour polls survive the ~1 h bearer-token lifetime.
+
 The poll loop also enforces a configurable :class:`WatchdogConfig` —
 hard wall-clock cap, failure-rate circuit breaker, and idle-progress
 detector. Any breach cancels the Dataflow job and raises
@@ -20,7 +25,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
+import google.auth.exceptions
+import google.auth.transport.requests
 import httpx
+from google.auth.credentials import Credentials
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
@@ -33,15 +41,25 @@ _DATAFLOW_API = (
 
 
 class JobState(StrEnum):
+    # Non-terminal states.
     PENDING = "JOB_STATE_PENDING"
+    QUEUED = "JOB_STATE_QUEUED"
     RUNNING = "JOB_STATE_RUNNING"
+    DRAINING = "JOB_STATE_DRAINING"
+    CANCELLING = "JOB_STATE_CANCELLING"
+    STOPPED = "JOB_STATE_STOPPED"
+    UNKNOWN = "JOB_STATE_UNKNOWN"
+    # Terminal states.
     DONE = "JOB_STATE_DONE"
     FAILED = "JOB_STATE_FAILED"
     CANCELLED = "JOB_STATE_CANCELLED"
-    UNKNOWN = "JOB_STATE_UNKNOWN"
+    DRAINED = "JOB_STATE_DRAINED"
+    UPDATED = "JOB_STATE_UPDATED"
 
 
-TERMINAL_STATES = {JobState.DONE, JobState.FAILED, JobState.CANCELLED}
+TERMINAL_STATES = frozenset(
+    {JobState.DONE, JobState.FAILED, JobState.CANCELLED, JobState.DRAINED, JobState.UPDATED}
+)
 
 
 @dataclass
@@ -76,11 +94,13 @@ class WatchdogConfig:
     """
 
     max_runtime: timedelta | None = field(default=timedelta(hours=12))
-    """Hard wall-clock cap on total job runtime. The poller cancels the
-    Dataflow job and raises :class:`WatchdogTriggered` if exceeded.
-    Catches every kind of stall (rate-limit loop, hung worker, autoscaler
-    spiral) without needing each failure mode handled individually.
-    Default 12 h. Set ``None`` to disable."""
+    """Hard wall-clock cap on total job runtime, measured from the job's
+    Dataflow ``createTime`` (so reattaching to an old job does not grant
+    it a fresh budget). The poller cancels the Dataflow job and raises
+    :class:`WatchdogTriggered` if exceeded. Catches every kind of stall
+    (rate-limit loop, hung worker, autoscaler spiral) without needing
+    each failure mode handled individually. Default 12 h. Set ``None``
+    to disable."""
 
     max_failure_rate: float | None = field(default=0.5)
     """Cancel if the ratio of dead-lettered tiles to total tiles exceeds
@@ -91,16 +111,16 @@ class WatchdogConfig:
     failure rates)."""
 
     failure_grace_period: timedelta = field(default=timedelta(minutes=10))
-    """Skip the failure-rate check for this long after job start. Gives
-    the autoscaler + worker pool time to ramp up before we judge whether
-    a high failure rate is structural vs. transient. Default 10 min."""
+    """Skip the failure-rate check for this long after job creation.
+    Gives the autoscaler + worker pool time to ramp up before we judge
+    whether a high failure rate is structural vs. transient. Default
+    10 min."""
 
     idle_timeout: timedelta | None = field(default=timedelta(minutes=20))
-    """Cancel if no progress is observed (no increase in
-    ``output_tiles_written`` *or* ``tiles_written``) for this long.
-    Catches stalls that aren't outright failures — e.g. a thread stuck
-    in an unbounded retry loop while everything else has finished.
-    Default 20 min. Set ``None`` to disable."""
+    """Cancel if no progress is observed on *any* progress counter for
+    this long. Catches stalls that aren't outright failures — e.g. a
+    thread stuck in an unbounded retry loop while everything else has
+    finished. Default 20 min. Set ``None`` to disable."""
 
 
 class WatchdogTriggered(RuntimeError):
@@ -113,18 +133,48 @@ class WatchdogTriggered(RuntimeError):
         self.info = info
 
 
+# JobInfo counters watched by the idle detector. Each is tracked
+# independently: an increase in ANY of them resets the stall timer.
+# A single max() over these is wrong — once the fetch phase completes,
+# elements_produced pins at ~tile_count and dominates the max, so a
+# slow-but-healthy two-tier assembly phase (output_tiles_written creeping up
+# in small numbers) would never register as progress.
+_PROGRESS_COUNTERS: tuple[str, ...] = (
+    "output_tiles_written",
+    "tiles_written",
+    "compute_tiles_assembled",
+    "elements_produced",
+    "failures_written",
+)
+
+
 @dataclass
 class _WatchdogState:
     """Mutable poll-loop state used by the watchdog policies."""
 
     started_at: float
     last_progress_at: float
-    last_progress_value: int
+    last_counter_values: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def fresh(cls) -> _WatchdogState:
         now = time.monotonic()
-        return cls(started_at=now, last_progress_at=now, last_progress_value=0)
+        return cls(started_at=now, last_progress_at=now)
+
+
+def _job_age_seconds(state: _WatchdogState, info: JobInfo) -> float:
+    """Job age in seconds, anchored to the job's Dataflow createTime.
+
+    ``info.elapsed_seconds`` is parsed from the API's ``createTime``, so
+    it reflects how long the *job* has existed — not how long this poll
+    session has been attached. Falls back to poll-session elapsed time
+    when the API response carried no createTime (e.g. degraded UNKNOWN
+    ticks), so the runtime cap still eventually fires even with a dead
+    API path.
+    """
+    if info.elapsed_seconds is not None:
+        return info.elapsed_seconds
+    return time.monotonic() - state.started_at
 
 
 def _watchdog_check(
@@ -139,96 +189,138 @@ def _watchdog_check(
     The runtime cap is the single hardest backstop; we surface it first
     so its message is the one the user sees in catastrophic stalls.
     """
-    elapsed = time.monotonic() - state.started_at
+    job_age = _job_age_seconds(state, info)
 
-    # 1. Hard wall-clock cap.
-    if config.max_runtime is not None and elapsed > config.max_runtime.total_seconds():
+    # 1. Hard wall-clock cap on job age (createTime-anchored, so
+    # reattaching to an 11-hour-old job does not grant another 12 h).
+    if config.max_runtime is not None and job_age > config.max_runtime.total_seconds():
         return (
-            f"max_runtime exceeded: job ran for {elapsed / 60:.1f} min, "
+            f"max_runtime exceeded: job has been running for {job_age / 60:.1f} min, "
             f"cap is {config.max_runtime.total_seconds() / 60:.1f} min"
         )
 
-    # 2. Failure-rate circuit breaker (after grace period).
+    # 2. Failure-rate circuit breaker (after grace period, also
+    # job-age-anchored — a reattach must not restart the grace clock).
     if (
         config.max_failure_rate is not None
         and tile_count
         and tile_count > 0
         and info.failures_written is not None
-        and elapsed > config.failure_grace_period.total_seconds()
+        and job_age > config.failure_grace_period.total_seconds()
     ):
         rate = info.failures_written / tile_count
         if rate > config.max_failure_rate:
             return (
                 f"max_failure_rate exceeded: {info.failures_written}/{tile_count} tiles "
-                f"({rate:.0%}) failed after {elapsed / 60:.1f} min, "
+                f"({rate:.0%}) failed after {job_age / 60:.1f} min, "
                 f"threshold is {config.max_failure_rate:.0%}"
             )
 
-    # 3. Idle-progress detector. Reset the stall timer whenever ANY
-    # progress signal increases — completed-output counters
-    # (output_tiles_written / tiles_written) AND the system-level fetch
-    # element count AND the dead-letter counter. The first two only
-    # move once the M6 GroupByKey has fired (i.e. after the entire
-    # fetch phase finishes), so a fetch-only-bound pipeline could look
-    # idle for hours under a counter-only check. ElementCount on the
-    # fetch step's output PCollection moves per successful fetch, and
-    # failures_written moves per dead-letter — between the four, real
-    # forward progress is always reflected somewhere.
+    # 3. Idle-progress detector. Each counter in _PROGRESS_COUNTERS is
+    # tracked against its own last-seen value; ANY counter increasing
+    # resets the stall timer. The completed-output counters
+    # (output_tiles_written / tiles_written) only move once the two-tier
+    # GroupByKey has fired (i.e. after the entire fetch phase finishes),
+    # while ElementCount on the fetch step's output PCollection moves per
+    # successful fetch and failures_written moves per dead-letter —
+    # between them, real forward progress is always reflected somewhere.
     if config.idle_timeout is not None:
-        progress = max(
-            info.output_tiles_written or 0,
-            info.tiles_written or 0,
-            info.elements_produced or 0,
-            info.failures_written or 0,
-        )
+        progressed = False
+        for counter in _PROGRESS_COUNTERS:
+            value: int | None = getattr(info, counter)
+            if value is None:
+                continue
+            if value > state.last_counter_values.get(counter, 0):
+                state.last_counter_values[counter] = value
+                progressed = True
         now = time.monotonic()
-        if progress > state.last_progress_value:
-            state.last_progress_value = progress
+        if progressed:
             state.last_progress_at = now
         elif (
             info.state == JobState.RUNNING
             and now - state.last_progress_at > config.idle_timeout.total_seconds()
-            and elapsed > config.failure_grace_period.total_seconds()
+            and job_age > config.failure_grace_period.total_seconds()
         ):
             stalled_min = (now - state.last_progress_at) / 60
             return (
                 f"idle_timeout exceeded: no progress for {stalled_min:.1f} min "
                 f"(threshold {config.idle_timeout.total_seconds() / 60:.0f} min); "
-                f"last counter value {state.last_progress_value}"
+                f"last counter values {state.last_counter_values or '{}'}"
             )
 
     return None
 
 
-def _cancel_job(job_id: str, project: str, region: str, access_token: str) -> None:
-    """Best-effort Dataflow job cancel. Logs and swallows transport errors —
-    the watchdog raises regardless, and the alternative (uncaught
-    exception in a poll loop after we've already detected runaway) is
-    worse than a stuck job we tried to cancel."""
+# ---------------------------------------------------------------------------
+# Authenticated transport
+# ---------------------------------------------------------------------------
+
+
+def _refresh(credentials: Credentials) -> None:
+    """Refresh the credential's access token via the google-auth transport."""
+    credentials.refresh(google.auth.transport.requests.Request())
+
+
+def _bearer_header(credentials: Credentials) -> dict[str, str]:
+    """Authorization header from the credential, refreshing it if stale."""
+    if not credentials.valid:
+        _refresh(credentials)
+    return {"Authorization": f"Bearer {credentials.token}"}
+
+
+def _authorized_request(
+    method: str,
+    url: str,
+    credentials: Credentials,
+    *,
+    params: dict[str, str] | None = None,
+    json: dict[str, object] | None = None,
+) -> httpx.Response:
+    """Issue an authenticated request, keeping the token fresh.
+
+    Refreshes proactively when the credential reports itself invalid or
+    expired, and reactively (refresh + retry exactly once) when the
+    server answers 401 — covering tokens revoked server-side before
+    their local expiry. Raises for any non-2xx final response.
+    """
+    with httpx.Client(timeout=30) as client:
+        response = client.request(
+            method, url, headers=_bearer_header(credentials), params=params, json=json
+        )
+        if response.status_code == 401:
+            _refresh(credentials)
+            response = client.request(
+                method, url, headers=_bearer_header(credentials), params=params, json=json
+            )
+        response.raise_for_status()
+        return response
+
+
+def _cancel_job(job_id: str, project: str, region: str, credentials: Credentials) -> bool:
+    """Best-effort Dataflow job cancel with a freshly-refreshed token.
+
+    Returns True if the cancel request was accepted, False otherwise.
+    Transport and auth errors are logged, not raised — the watchdog
+    raises regardless, and its message must reflect whether the cancel
+    actually landed."""
     url = _DATAFLOW_API.format(project=project, region=region, job_id=job_id)
     try:
-        with httpx.Client(timeout=30) as client:
-            response = client.put(
-                url,
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json",
-                },
-                json={"requestedState": "JOB_STATE_CANCELLED"},
-            )
-            response.raise_for_status()
-    except httpx.HTTPError as exc:
+        _authorized_request("PUT", url, credentials, json={"requestedState": "JOB_STATE_CANCELLED"})
+        return True
+    except (httpx.HTTPError, google.auth.exceptions.GoogleAuthError) as exc:
         console.print(
             f"[yellow]Warning: failed to cancel Dataflow job {job_id}: {exc}. "
-            f"Cancel manually with: gcloud dataflow jobs cancel {job_id}[/yellow]"
+            f"Cancel manually with: gcloud dataflow jobs cancel {job_id} "
+            f"--region={region}[/yellow]"
         )
+        return False
 
 
 def poll_job(
     job_id: str,
     project: str,
     region: str,
-    access_token: str,
+    credentials: Credentials,
     *,
     poll_interval_seconds: int = 15,
     status_callback: Callable[[JobInfo], None] | None = None,
@@ -241,7 +333,9 @@ def poll_job(
         job_id: Dataflow job ID.
         project: GCP project ID.
         region: Dataflow region (e.g. 'us-central1').
-        access_token: OAuth2 bearer token for the Dataflow API.
+        credentials: Google credentials for the Dataflow API. Refreshed
+            automatically whenever the access token goes stale, so polls
+            longer than a token lifetime (~1 h) keep working.
         poll_interval_seconds: How often to poll.
         status_callback: Optional callback(JobInfo) called on each poll tick.
             When provided, Rich Live display is suppressed.
@@ -256,22 +350,26 @@ def poll_job(
         Final JobState.
 
     Raises:
-        WatchdogTriggered: If a watchdog policy cancels the job.
+        WatchdogTriggered: If a watchdog policy cancels the job (or tries
+            to — when the cancel request itself fails, the exception
+            message says so instead of claiming the job was cancelled).
     """
     url = _DATAFLOW_API.format(project=project, region=region, job_id=job_id)
-    headers = {"Authorization": f"Bearer {access_token}"}
 
     config = watchdog if watchdog is not None else WatchdogConfig()
     state = _WatchdogState.fresh()
 
     def tick() -> JobInfo:
-        info = _fetch_job_info(url, headers)
+        info = _fetch_job_info(url, credentials)
         reason = _watchdog_check(config, state, info, tile_count)
         if reason is not None and info.state not in TERMINAL_STATES:
-            console.print(
-                f"\n[red]Watchdog cancelling job {job_id}:[/red] {reason}"
-            )
-            _cancel_job(job_id, project, region, access_token)
+            console.print(f"\n[red]Watchdog cancelling job {job_id}:[/red] {reason}")
+            if not _cancel_job(job_id, project, region, credentials):
+                reason += (
+                    "; cancel request FAILED — the job may still be running. "
+                    f"Cancel manually with: gcloud dataflow jobs cancel {job_id} "
+                    f"--region={region}"
+                )
             raise WatchdogTriggered(reason, job_id, info)
         return info
 
@@ -294,18 +392,17 @@ def poll_job(
     return info.state
 
 
-def _fetch_job_info(url: str, headers: dict[str, str]) -> JobInfo:
+def _fetch_job_info(url: str, credentials: Credentials) -> JobInfo:
     """Fetch job state and metrics from the Dataflow REST API.
 
     Uses ?view=JOB_VIEW_ALL to include metrics (element counts, workers).
-    Metrics lag ~30-60s behind reality.
+    Metrics lag ~30-60s behind reality. Degrades to UNKNOWN on transport,
+    auth, or parse errors — a single bad tick must not kill the poll loop.
     """
     try:
-        with httpx.Client(timeout=30) as client:
-            response = client.get(url, headers=headers, params={"view": "JOB_VIEW_ALL"})
-            response.raise_for_status()
-            data = response.json()
-    except (httpx.HTTPError, KeyError, ValueError):
+        response = _authorized_request("GET", url, credentials, params={"view": "JOB_VIEW_ALL"})
+        data = response.json()
+    except (httpx.HTTPError, google.auth.exceptions.GoogleAuthError, KeyError, ValueError):
         return JobInfo(state=JobState.UNKNOWN)
 
     raw_state = data.get("currentState", "JOB_STATE_UNKNOWN")
@@ -314,7 +411,7 @@ def _fetch_job_info(url: str, headers: dict[str, str]) -> JobInfo:
     except ValueError:
         state = JobState.UNKNOWN
 
-    # Elapsed time from currentStateTime (or createTime as fallback)
+    # Elapsed time from job createTime.
     elapsed = _parse_elapsed(data)
 
     # Parse metrics for element counts + datensee user counters.
@@ -399,7 +496,7 @@ def _parse_metrics(data: dict) -> _ParsedMetrics:
         # (not `elements_produced` — that name was the pre-Runner-v2
         # spelling). We track the maximum across all output_user_name
         # contexts as a coarse "is the pipeline doing anything?" signal,
-        # which lets the watchdog detect M6 fetch-phase progress before
+        # which lets the watchdog detect two-tier fetch-phase progress before
         # GroupByKey lets the per-output-tile counters move.
         if name == "ElementCount" and ctx.get("output_user_name"):
             if out.elements_produced is None or value > out.elements_produced:
@@ -417,10 +514,16 @@ def _render_status_table(job_id: str, info: JobInfo) -> Table:
     """Render a Rich Table showing current job state and metrics."""
     color_map: dict[JobState, str] = {
         JobState.PENDING: "yellow",
+        JobState.QUEUED: "yellow",
         JobState.RUNNING: "cyan",
+        JobState.DRAINING: "magenta",
+        JobState.CANCELLING: "magenta",
+        JobState.STOPPED: "yellow",
         JobState.DONE: "green",
         JobState.FAILED: "red",
         JobState.CANCELLED: "magenta",
+        JobState.DRAINED: "magenta",
+        JobState.UPDATED: "green",
         JobState.UNKNOWN: "dim",
     }
     color = color_map.get(info.state, "white")

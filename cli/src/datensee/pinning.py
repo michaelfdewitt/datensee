@@ -30,6 +30,7 @@ unconditionally rejected.
 from __future__ import annotations
 
 import json
+import warnings
 from datetime import UTC, datetime
 from typing import Any
 
@@ -64,7 +65,11 @@ class BigQueryNotPinnedError(ValueError):
 
 
 class SnapshotTimeOutOfRangeError(ValueError):
-    """A ``snapshot_time_micros`` value is in EE's INTERNAL-crash range."""
+    """A ``snapshot_time_micros`` value is outside the pinnable range."""
+
+
+class UnpinnableLoadWarning(UserWarning):
+    """The expression loads data through a mechanism pinning can't cover."""
 
 
 def pin_expression(expression: str, snapshot_time_micros: int) -> str:
@@ -111,6 +116,15 @@ def pin_expression(expression: str, snapshot_time_micros: int) -> str:
             "consistent with a nanosecond timestamp. Divide by 1000 if "
             "you carried this from a pre-fix `_export_meta.json`."
         )
+    if snapshot_time_micros <= 0:
+        # -1 is EE's "latest version" sentinel — pinning to it would
+        # silently defeat snapshot consistency; 0 and below can never
+        # resolve to a real asset version.
+        raise SnapshotTimeOutOfRangeError(
+            f"snapshot_time_micros={snapshot_time_micros} must be a positive "
+            "microsecond Unix timestamp. Negative values (including EE's -1 "
+            "'latest' sentinel) would defeat snapshot pinning."
+        )
     tree = json.loads(expression)
     _pin_in_place(tree, snapshot_time_micros)
     # Match `ee.serializer.encode()`'s minified style — keeps the wire
@@ -136,6 +150,21 @@ def _maybe_pin_invocation(invocation: dict, snapshot_time_micros: int) -> None:
     if name in PINNABLE_LOAD_FUNCTIONS:
         args = invocation.setdefault("arguments", {})
         args.setdefault("version", {"constantValue": snapshot_time_micros})
+    elif isinstance(name, str) and "loadGeoTIFF" in name:
+        # GCS-backed loads have no version mechanism: if the object is
+        # overwritten mid-job, parallel tile fetches see different data —
+        # exactly the inconsistency pinning exists to prevent. Unlike the
+        # BigQuery cases we don't refuse (GCS objects are usually
+        # immutable in practice), but the gap must not be silent.
+        warnings.warn(
+            f"Expression calls {name!r}, which loads from GCS and cannot be "
+            "pinned to a snapshot version. If the object is overwritten "
+            "while the export runs, tiles may mix data from different "
+            "versions. Ensure the GCS object is immutable for the duration "
+            "of the export.",
+            UnpinnableLoadWarning,
+            stacklevel=4,
+        )
     elif name in UNSUPPORTED_BQ_FUNCTIONS:
         raise BigQueryNotPinnedError(
             f"Expression calls {name!r}, which has no point-in-time read "

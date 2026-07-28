@@ -1,0 +1,284 @@
+"""DatensEE output validation — two checks against pipeline output.
+
+- ``integrity`` (zero-cost, always runs): every expected output unit
+  exists (or is fully journaled in ``_failures.json``), has TIFF magic
+  and plausible size, and — with rasterio — the expected dimensions,
+  band count, dtype, CRS, and affine origin; unexpected tile-named
+  files are flagged. Degrades gracefully without rasterio.
+- ``pixels`` (opt-in, costs EECUs): re-fetches sampled compute tiles
+  from the EE HV API and compares every band pixel-for-pixel against
+  the on-disk output. If this passes, the whole chain is correct.
+
+Usage: ``validate_output("./output", config, pixels=True).all_passed``
+"""
+
+from __future__ import annotations
+
+import importlib.util
+from collections.abc import Callable
+from enum import StrEnum
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel
+from rich.panel import Panel
+from rich.table import Table
+
+from datensee.config import PipelineConfig
+from datensee.pixel.validation.units import (
+    TILES_FILE_SKIP_MESSAGE,
+    OutputUnit,
+    expected_output_units,
+    read_failure_keys,
+    unit_filename,
+    unit_keys_on_disk,
+)
+
+_MIN_TILE_BYTES = 1024
+_ORIGIN_TOLERANCE = 1e-6
+
+RASTERIO_MISSING_NOTE = (
+    "; metadata checks skipped (rasterio not installed — pip install datensee[validation])"
+)
+
+
+class CheckStatus(StrEnum):
+    """Outcome of a single check."""
+
+    PASSED = "passed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+    ERROR = "error"
+
+
+class CheckResult(BaseModel):
+    """Result of running one check."""
+
+    check_id: str
+    status: CheckStatus
+    message: str = ""
+    details: dict[str, Any] = {}
+
+
+class ValidationReport(BaseModel):
+    """Aggregated results from :func:`validate_output`."""
+
+    results: list[CheckResult]
+    output_path: str
+    config: PipelineConfig
+
+    @property
+    def all_passed(self) -> bool:
+        """True when no check FAILED or ERRORed (SKIPPED counts as passing)."""
+        return all(r.status in (CheckStatus.PASSED, CheckStatus.SKIPPED) for r in self.results)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the report to a JSON-compatible dict."""
+        return {
+            "output_path": self.output_path,
+            "all_passed": self.all_passed,
+            "results": [r.model_dump() for r in self.results],
+        }
+
+    def render(self) -> Panel:
+        """Render a Rich panel summarizing check results."""
+        style = {
+            CheckStatus.PASSED: "[green]PASS[/green]",
+            CheckStatus.FAILED: "[red]FAIL[/red]",
+            CheckStatus.SKIPPED: "[dim]SKIP[/dim]",
+            CheckStatus.ERROR: "[yellow]ERR[/yellow]",
+        }
+        table = Table(show_edge=False, pad_edge=False)
+        table.add_column("Check", style="bold", min_width=9)
+        table.add_column("Status", min_width=8)
+        table.add_column("Message")
+        for r in self.results:
+            table.add_row(r.check_id, style[r.status], r.message)
+
+        n_ok = sum(1 for r in self.results if r.status != CheckStatus.FAILED)
+        title = f"Validation results — {n_ok}/{len(self.results)} passed"
+        return Panel(table, title=title, border_style="green" if self.all_passed else "red")
+
+
+def _has_rasterio() -> bool:
+    return importlib.util.find_spec("rasterio") is not None
+
+
+def _tiff_magic_ok(path: Path) -> bool:
+    """True when the file starts with TIFF magic bytes (``II`` or ``MM``)."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(2) in (b"II", b"MM")
+    except OSError:
+        return False
+
+
+def _crs_matches(actual: str, expected: str) -> bool:
+    """Compare CRS strings, falling back to pyproj normalization."""
+    if actual.strip().upper() == expected.strip().upper():
+        return True
+    try:
+        import pyproj
+
+        return pyproj.CRS.from_user_input(actual) == pyproj.CRS.from_user_input(expected)
+    except Exception:
+        return False
+
+
+def _metadata_issues(path: Path, unit: OutputUnit, config: PipelineConfig) -> list[str]:
+    """rasterio-backed metadata assertions for one output unit's COG."""
+    import rasterio
+
+    issues: list[str] = []
+    with rasterio.open(path) as ds:
+        if (ds.width, ds.height) != (unit.width_px, unit.height_px):
+            issues.append(
+                f"dimensions {ds.width}x{ds.height}, expected {unit.width_px}x{unit.height_px}"
+            )
+        if ds.count != config.output.band_count:
+            issues.append(f"bands={ds.count}, expected {config.output.band_count}")
+        if ds.dtypes[0] != config.output.data_type:
+            issues.append(f"dtype={ds.dtypes[0]}, expected {config.output.data_type}")
+
+        if ds.crs is None:
+            issues.append("file has no CRS")
+        elif not _crs_matches(str(ds.crs), config.tile_grid.crs):
+            issues.append(f"CRS '{ds.crs}' != expected '{config.tile_grid.crs}'")
+
+        # Expected NW-corner origin: parent translate + local origin px × scale
+        # (scale_y negative, so row 0 has the largest CRS y).
+        p = config.tile_grid.pixel_grid.affine_transform
+        expected_x = p.translate_x + unit.origin_col_px * p.scale_x
+        expected_y = p.translate_y + unit.origin_row_px * p.scale_y
+        if abs(ds.transform.c - expected_x) > _ORIGIN_TOLERANCE:
+            issues.append(f"origin X {ds.transform.c} != expected {expected_x}")
+        if abs(ds.transform.f - expected_y) > _ORIGIN_TOLERANCE:
+            issues.append(f"origin Y {ds.transform.f} != expected {expected_y}")
+    return issues
+
+
+def check_integrity(output_dir: Path, config: PipelineConfig) -> CheckResult:
+    """Zero-cost structural check over ALL expected output units.
+
+    Folds together file existence, journal accounting, TIFF magic/size
+    plausibility, and (with rasterio) dimension/band/dtype/CRS/origin
+    metadata. Metadata reads are cheap, so there is no sampling.
+    """
+    units = expected_output_units(config)
+    if units is None:
+        return CheckResult(
+            check_id="integrity", status=CheckStatus.SKIPPED, message=TILES_FILE_SKIP_MESSAGE
+        )
+
+    failed_keys = read_failure_keys(output_dir)
+    with_rasterio = _has_rasterio()
+
+    known_failed: list[str] = []
+    problems: list[dict[str, object]] = []
+    checked = 0
+
+    for unit in units:
+        # A unit whose member compute tiles ALL failed is legitimately
+        # absent from disk; a partially-failed unit must still exist.
+        if all((m.row, m.col) in failed_keys for m in unit.members):
+            known_failed.append(unit.filename)
+            continue
+
+        path = output_dir / unit.filename
+        if not path.exists():
+            problems.append({"unit": unit.filename, "issues": ["file missing"]})
+            continue
+
+        checked += 1
+        issues: list[str] = []
+        if not _tiff_magic_ok(path):
+            issues.append("not a TIFF (bad magic bytes)")
+        elif path.stat().st_size < _MIN_TILE_BYTES:
+            issues.append(f"implausibly small ({path.stat().st_size} B < {_MIN_TILE_BYTES} B)")
+        elif with_rasterio:
+            try:
+                issues.extend(_metadata_issues(path, unit, config))
+            except Exception as exc:
+                issues.append(f"unreadable: {exc}")
+        if issues:
+            problems.append({"unit": unit.filename, "issues": issues})
+
+    expected_keys = {u.key for u in units}
+    unexpected = [
+        unit_filename(r, c) for r, c in sorted(unit_keys_on_disk(output_dir) - expected_keys)
+    ]
+
+    details: dict[str, Any] = {
+        "problems": problems[:20],
+        "unexpected_files": unexpected[:20],
+        "known_failed": known_failed[:20],
+    }
+
+    if problems or unexpected:
+        parts: list[str] = []
+        if problems:
+            parts.append(
+                f"{len(problems)}/{len(units) - len(known_failed)} expected output files "
+                "have integrity issues"
+            )
+        if unexpected:
+            parts.append(f"{len(unexpected)} on-disk files match no expected unit")
+        return CheckResult(
+            check_id="integrity",
+            status=CheckStatus.FAILED,
+            message="; ".join(parts),
+            details=details,
+        )
+
+    suffix = f" ({len(known_failed)} known-failed, journaled)" if known_failed else ""
+    note = "" if with_rasterio else RASTERIO_MISSING_NOTE
+    return CheckResult(
+        check_id="integrity",
+        status=CheckStatus.PASSED,
+        message=f"All {checked} expected output files pass integrity checks{suffix}{note}",
+        details=details if known_failed else {},
+    )
+
+
+def validate_output(
+    output_path: str | Path,
+    config: PipelineConfig,
+    *,
+    pixels: bool = False,
+    sample: int = 20,
+    gee_project: str | None = None,
+) -> ValidationReport:
+    """Run output checks against pipeline output and return a structured report.
+
+    Args:
+        output_path: Directory containing the exported tile GeoTIFFs.
+        config: Pipeline config that produced the output.
+        pixels: Also run the ``pixels`` check (EE HV API re-fetch — costs EECUs).
+        sample: Max compute tiles the ``pixels`` check re-fetches.
+        gee_project: GCP project for reference fetches; defaults to the
+            config's ``gee_project``.
+
+    Returns:
+        ValidationReport with one result per check run.
+    """
+    output = Path(output_path)
+
+    def _run(check_id: str, runner: Callable[[], CheckResult]) -> CheckResult:
+        try:
+            return runner()
+        except Exception as exc:
+            return CheckResult(
+                check_id=check_id,
+                status=CheckStatus.ERROR,
+                message=f"Check raised {type(exc).__name__}: {exc}",
+            )
+
+    results = [_run("integrity", lambda: check_integrity(output, config))]
+    if pixels:
+        from datensee.pixel.validation.pixels import check_pixels
+
+        project = gee_project or config.gee_project
+        results.append(
+            _run("pixels", lambda: check_pixels(output, config, sample=sample, gee_project=project))
+        )
+    return ValidationReport(results=results, output_path=str(output), config=config)

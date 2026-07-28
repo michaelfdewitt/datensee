@@ -99,7 +99,7 @@ def test_meta_omits_full_expression_from_hash_property() -> None:
 
 
 def test_output_tile_size_none_round_trips(tmp_path: Path) -> None:
-    """A non-M6 export persists output_tile_size_pixels=None and read
+    """A non-two-tier export persists output_tile_size_pixels=None and read
     must surface it back as None — not a missing key, not zero."""
     args = dict(_ORIGINAL_KW)
     args["output_tile_size_pixels"] = None

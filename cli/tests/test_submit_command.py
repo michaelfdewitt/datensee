@@ -1,10 +1,15 @@
-"""Tests for submit.py command builders and Flex Template payload."""
+"""Tests for submit.py command builders, Flex Template payload, and CLI parsing."""
 
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock
+
+import pytest
+import typer
+from typer.testing import CliRunner
 
 from datensee.config import (
     AffineTransform,
@@ -224,3 +229,129 @@ def test_submit_dataflow_dispatches_via_flex(monkeypatch) -> None:
         payload["launchParameter"]["parameters"]["configFile"]
         == "gs://my-bucket/exports/test/_pipeline-config.json"
     )
+
+
+# ---------------------------------------------------------------------------
+# --snapshot-time parsing
+# ---------------------------------------------------------------------------
+
+_NOON_UTC_MICROS = int(datetime(2026, 4, 30, 12, 0, 0, tzinfo=UTC).timestamp() * 1_000_000)
+
+
+def test_parse_snapshot_time_none_passthrough() -> None:
+    from datensee.main import _parse_snapshot_time
+
+    assert _parse_snapshot_time(None) is None
+
+
+def test_parse_snapshot_time_unix_micros_literal() -> None:
+    from datensee.main import _parse_snapshot_time
+
+    assert _parse_snapshot_time("1715000000000000") == 1715000000000000
+
+
+def test_parse_snapshot_time_iso_z_suffix() -> None:
+    from datensee.main import _parse_snapshot_time
+
+    assert _parse_snapshot_time("2026-04-30T12:00:00Z") == _NOON_UTC_MICROS
+
+
+def test_parse_snapshot_time_naive_iso_is_utc() -> None:
+    """A naive ISO timestamp is UTC, as the --snapshot-time help promises.
+
+    Regression: it used to be interpreted in the machine's local timezone.
+    """
+    from datensee.main import _parse_snapshot_time
+
+    assert _parse_snapshot_time("2026-04-30T12:00:00") == _NOON_UTC_MICROS
+
+
+def test_parse_snapshot_time_explicit_offset_is_honored() -> None:
+    from datensee.main import _parse_snapshot_time
+
+    assert _parse_snapshot_time("2026-04-30T14:00:00+02:00") == _NOON_UTC_MICROS
+
+
+def test_parse_snapshot_time_rejects_garbage() -> None:
+    from datensee.main import _parse_snapshot_time
+
+    with pytest.raises(typer.BadParameter, match="neither Unix micros nor ISO-8601"):
+        _parse_snapshot_time("not-a-time")
+
+
+# ---------------------------------------------------------------------------
+# validate command — the two-check surface
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def validate_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Config file on disk + validate_output stub capturing its kwargs."""
+    import datensee.pixel.validation as validation_mod
+
+    config_file = tmp_path / "_pipeline-config.json"
+    config_file.write_text(_config(RunnerConfig(mode="local")).model_dump_json())
+
+    report = MagicMock()
+    report.render.return_value = "report rendered"
+    report.all_passed = True
+
+    captured: dict[str, object] = {"called": False}
+
+    def fake_validate_output(
+        output_path: object,
+        config: object,
+        *,
+        pixels: bool = False,
+        sample: int = 20,
+        gee_project: object = None,
+    ) -> MagicMock:
+        captured["called"] = True
+        captured["pixels"] = pixels
+        captured["sample"] = sample
+        captured["gee_project"] = gee_project
+        return report
+
+    monkeypatch.setattr(validation_mod, "validate_output", fake_validate_output)
+    return {
+        "config_file": config_file,
+        "captured": captured,
+        "output_dir": tmp_path,
+        "report": report,
+    }
+
+
+def _invoke_validate(setup: dict[str, object], *extra: str) -> object:
+    from datensee.main import app
+
+    return CliRunner().invoke(
+        app,
+        [
+            "validate",
+            str(setup["output_dir"]),
+            "--config",
+            str(setup["config_file"]),
+            *extra,
+        ],
+    )
+
+
+def test_validate_defaults_to_integrity_only(validate_setup: dict) -> None:
+    result = _invoke_validate(validate_setup)
+    assert result.exit_code == 0
+    captured = validate_setup["captured"]  # type: ignore[assignment]
+    assert captured["pixels"] is False  # type: ignore[index]
+
+
+def test_validate_pixels_flag_enables_ee_comparison(validate_setup: dict) -> None:
+    result = _invoke_validate(validate_setup, "--pixels", "--sample", "7")
+    assert result.exit_code == 0
+    captured = validate_setup["captured"]  # type: ignore[assignment]
+    assert captured["pixels"] is True  # type: ignore[index]
+    assert captured["sample"] == 7  # type: ignore[index]
+
+
+def test_validate_failure_exits_nonzero(validate_setup: dict) -> None:
+    validate_setup["report"].all_passed = False  # type: ignore[index]
+    result = _invoke_validate(validate_setup)
+    assert result.exit_code == 1

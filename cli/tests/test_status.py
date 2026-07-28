@@ -1,10 +1,18 @@
 """Tests for datensee.status — Dataflow job status polling.
 
-Uses pytest-httpx to mock the Dataflow REST API.
+Uses pytest-httpx to mock the Dataflow REST API. Credentials are stubbed
+with an in-memory subclass of google.auth.credentials.Credentials whose
+refresh() mints deterministic tokens without touching the network (the
+google-auth refresh transport is `requests`-based, so pytest-httpx would
+not intercept a real refresh anyway).
 """
 
 from __future__ import annotations
 
+from datetime import timedelta
+
+import google.auth.credentials
+import pytest
 from pytest_httpx import HTTPXMock
 from rich.table import Table
 
@@ -12,26 +20,84 @@ from datensee.status import (
     TERMINAL_STATES,
     JobInfo,
     JobState,
+    WatchdogConfig,
+    WatchdogTriggered,
+    _cancel_job,
     _fetch_job_info,
     _parse_elapsed,
     _parse_metrics,
     _render_status_table,
+    _watchdog_check,
+    _WatchdogState,
     poll_job,
 )
 
 _BASE_URL = (
     "https://dataflow.googleapis.com/v1b3/projects/test-project/locations/us-central1/jobs/job-123"
 )
-_HEADERS = {"Authorization": "Bearer fake-token"}
+
+
+class FakeCredentials(google.auth.credentials.Credentials):
+    """In-memory Credentials: refresh() mints a deterministic new token.
+
+    Inherits the real ``.valid`` / ``.expired`` properties — a ``None``
+    token makes the credential invalid, forcing a proactive refresh.
+    """
+
+    def __init__(self, token: str | None = "fake-token") -> None:
+        super().__init__()
+        self.token = token
+        self.refresh_count = 0
+
+    def refresh(self, request: object) -> None:  # noqa: ARG002 — google-auth interface
+        self.refresh_count += 1
+        self.token = f"refreshed-token-{self.refresh_count}"
 
 
 class TestJobState:
     def test_terminal_states(self) -> None:
-        assert JobState.DONE in TERMINAL_STATES
-        assert JobState.FAILED in TERMINAL_STATES
-        assert JobState.CANCELLED in TERMINAL_STATES
-        assert JobState.RUNNING not in TERMINAL_STATES
-        assert JobState.PENDING not in TERMINAL_STATES
+        assert TERMINAL_STATES == {
+            JobState.DONE,
+            JobState.FAILED,
+            JobState.CANCELLED,
+            JobState.DRAINED,
+            JobState.UPDATED,
+        }
+
+    @pytest.mark.parametrize(
+        "state",
+        [
+            JobState.PENDING,
+            JobState.QUEUED,
+            JobState.RUNNING,
+            JobState.DRAINING,
+            JobState.CANCELLING,
+            JobState.STOPPED,
+            JobState.UNKNOWN,
+        ],
+    )
+    def test_non_terminal_states(self, state: JobState) -> None:
+        assert state not in TERMINAL_STATES
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("JOB_STATE_PENDING", JobState.PENDING),
+            ("JOB_STATE_QUEUED", JobState.QUEUED),
+            ("JOB_STATE_RUNNING", JobState.RUNNING),
+            ("JOB_STATE_DRAINING", JobState.DRAINING),
+            ("JOB_STATE_CANCELLING", JobState.CANCELLING),
+            ("JOB_STATE_STOPPED", JobState.STOPPED),
+            ("JOB_STATE_DONE", JobState.DONE),
+            ("JOB_STATE_FAILED", JobState.FAILED),
+            ("JOB_STATE_CANCELLED", JobState.CANCELLED),
+            ("JOB_STATE_DRAINED", JobState.DRAINED),
+            ("JOB_STATE_UPDATED", JobState.UPDATED),
+            ("JOB_STATE_UNKNOWN", JobState.UNKNOWN),
+        ],
+    )
+    def test_all_dataflow_state_strings_map(self, raw: str, expected: JobState) -> None:
+        assert JobState(raw) is expected
 
 
 class TestFetchJobInfo:
@@ -43,7 +109,7 @@ class TestFetchJobInfo:
                 "createTime": "2026-03-17T10:00:00Z",
             },
         )
-        info = _fetch_job_info(_BASE_URL, _HEADERS)
+        info = _fetch_job_info(_BASE_URL, FakeCredentials())
         assert info.state == JobState.RUNNING
         assert info.elapsed_seconds is not None
         assert info.elapsed_seconds > 0
@@ -53,7 +119,7 @@ class TestFetchJobInfo:
             url=f"{_BASE_URL}?view=JOB_VIEW_ALL",
             json={"currentState": "JOB_STATE_DONE"},
         )
-        info = _fetch_job_info(_BASE_URL, _HEADERS)
+        info = _fetch_job_info(_BASE_URL, FakeCredentials())
         assert info.state == JobState.DONE
 
     def test_http_error_returns_unknown(self, httpx_mock: HTTPXMock) -> None:
@@ -61,7 +127,7 @@ class TestFetchJobInfo:
             url=f"{_BASE_URL}?view=JOB_VIEW_ALL",
             status_code=500,
         )
-        info = _fetch_job_info(_BASE_URL, _HEADERS)
+        info = _fetch_job_info(_BASE_URL, FakeCredentials())
         assert info.state == JobState.UNKNOWN
 
     def test_unknown_state_string(self, httpx_mock: HTTPXMock) -> None:
@@ -69,7 +135,7 @@ class TestFetchJobInfo:
             url=f"{_BASE_URL}?view=JOB_VIEW_ALL",
             json={"currentState": "JOB_STATE_BRAND_NEW"},
         )
-        info = _fetch_job_info(_BASE_URL, _HEADERS)
+        info = _fetch_job_info(_BASE_URL, FakeCredentials())
         assert info.state == JobState.UNKNOWN
 
     def test_with_metrics(self, httpx_mock: HTTPXMock) -> None:
@@ -99,10 +165,82 @@ class TestFetchJobInfo:
                 },
             },
         )
-        info = _fetch_job_info(_BASE_URL, _HEADERS)
+        info = _fetch_job_info(_BASE_URL, FakeCredentials())
         assert info.elements_produced == 42
         assert info.elements_total == 100
         assert info.current_workers == 5
+
+
+class TestCredentialRefresh:
+    """Fix 2: token staleness — the poller holds a Credentials object and
+    refreshes it proactively (``.valid``) and reactively (on 401)."""
+
+    def test_valid_token_sent_as_bearer_header(self, httpx_mock: HTTPXMock) -> None:
+        creds = FakeCredentials(token="fresh-token")
+        httpx_mock.add_response(
+            url=f"{_BASE_URL}?view=JOB_VIEW_ALL",
+            match_headers={"Authorization": "Bearer fresh-token"},
+            json={"currentState": "JOB_STATE_RUNNING"},
+        )
+        info = _fetch_job_info(_BASE_URL, creds)
+        assert info.state == JobState.RUNNING
+        assert creds.refresh_count == 0
+
+    def test_invalid_credentials_refreshed_before_request(self, httpx_mock: HTTPXMock) -> None:
+        creds = FakeCredentials(token=None)  # .valid is False
+        httpx_mock.add_response(
+            url=f"{_BASE_URL}?view=JOB_VIEW_ALL",
+            match_headers={"Authorization": "Bearer refreshed-token-1"},
+            json={"currentState": "JOB_STATE_DONE"},
+        )
+        info = _fetch_job_info(_BASE_URL, creds)
+        assert info.state == JobState.DONE
+        assert creds.refresh_count == 1
+
+    def test_401_refreshes_and_retries_once(self, httpx_mock: HTTPXMock) -> None:
+        """A token revoked server-side before local expiry: first response
+        is 401, the poller must refresh and retry with the new token."""
+        creds = FakeCredentials(token="stale-but-locally-valid")
+        httpx_mock.add_response(
+            url=f"{_BASE_URL}?view=JOB_VIEW_ALL",
+            match_headers={"Authorization": "Bearer stale-but-locally-valid"},
+            status_code=401,
+        )
+        httpx_mock.add_response(
+            url=f"{_BASE_URL}?view=JOB_VIEW_ALL",
+            match_headers={"Authorization": "Bearer refreshed-token-1"},
+            json={"currentState": "JOB_STATE_RUNNING"},
+        )
+        info = _fetch_job_info(_BASE_URL, creds)
+        assert info.state == JobState.RUNNING
+        assert creds.refresh_count == 1
+
+    def test_persistent_401_degrades_to_unknown(self, httpx_mock: HTTPXMock) -> None:
+        """Only one retry: a second 401 degrades the tick to UNKNOWN
+        instead of looping."""
+        creds = FakeCredentials()
+        httpx_mock.add_response(url=f"{_BASE_URL}?view=JOB_VIEW_ALL", status_code=401)
+        httpx_mock.add_response(url=f"{_BASE_URL}?view=JOB_VIEW_ALL", status_code=401)
+        info = _fetch_job_info(_BASE_URL, creds)
+        assert info.state == JobState.UNKNOWN
+        assert creds.refresh_count == 1
+
+    def test_cancel_refreshes_invalid_credentials(self, httpx_mock: HTTPXMock) -> None:
+        """The cancel path must use a fresh token, not the poll loop's
+        possibly-hours-old one."""
+        creds = FakeCredentials(token=None)
+        httpx_mock.add_response(
+            method="PUT",
+            url=_BASE_URL,
+            match_headers={"Authorization": "Bearer refreshed-token-1"},
+            json={"currentState": "JOB_STATE_CANCELLED"},
+        )
+        assert _cancel_job("job-123", "test-project", "us-central1", creds) is True
+        assert creds.refresh_count == 1
+
+    def test_cancel_failure_returns_false(self, httpx_mock: HTTPXMock) -> None:
+        httpx_mock.add_response(method="PUT", url=_BASE_URL, status_code=500)
+        assert _cancel_job("job-123", "test-project", "us-central1", FakeCredentials()) is False
 
 
 class TestParseElapsed:
@@ -187,9 +325,9 @@ class TestRenderStatusTable:
         table = _render_status_table("job-456", info)
         assert isinstance(table, Table)
 
-    def test_unknown_state(self) -> None:
-        info = JobInfo(state=JobState.UNKNOWN)
-        table = _render_status_table("job-789", info)
+    @pytest.mark.parametrize("state", list(JobState))
+    def test_every_state_renders(self, state: JobState) -> None:
+        table = _render_status_table("job-789", JobInfo(state=state))
         assert isinstance(table, Table)
 
 
@@ -204,7 +342,7 @@ class TestPollJob:
             "job-123",
             "test-project",
             "us-central1",
-            "fake-token",
+            FakeCredentials(),
             poll_interval_seconds=0,
         )
         assert state == JobState.DONE
@@ -223,7 +361,7 @@ class TestPollJob:
             "job-123",
             "test-project",
             "us-central1",
-            "fake-token",
+            FakeCredentials(),
             poll_interval_seconds=0,
         )
         assert state == JobState.DONE
@@ -237,10 +375,44 @@ class TestPollJob:
             "job-123",
             "test-project",
             "us-central1",
-            "fake-token",
+            FakeCredentials(),
             poll_interval_seconds=0,
         )
         assert state == JobState.FAILED
+
+    def test_poll_drained_job_terminates(self, httpx_mock: HTTPXMock) -> None:
+        """Fix 3: DRAINED is terminal — a drained job must not poll forever."""
+        httpx_mock.add_response(
+            url=f"{_BASE_URL}?view=JOB_VIEW_ALL",
+            json={"currentState": "JOB_STATE_DRAINED"},
+        )
+        state = poll_job(
+            "job-123",
+            "test-project",
+            "us-central1",
+            FakeCredentials(),
+            poll_interval_seconds=0,
+        )
+        assert state == JobState.DRAINED
+
+    def test_poll_draining_then_drained(self, httpx_mock: HTTPXMock) -> None:
+        """DRAINING is non-terminal; the loop keeps polling through it."""
+        httpx_mock.add_response(
+            url=f"{_BASE_URL}?view=JOB_VIEW_ALL",
+            json={"currentState": "JOB_STATE_DRAINING"},
+        )
+        httpx_mock.add_response(
+            url=f"{_BASE_URL}?view=JOB_VIEW_ALL",
+            json={"currentState": "JOB_STATE_DRAINED"},
+        )
+        state = poll_job(
+            "job-123",
+            "test-project",
+            "us-central1",
+            FakeCredentials(),
+            poll_interval_seconds=0,
+        )
+        assert state == JobState.DRAINED
 
 
 class TestWatchdog:
@@ -248,21 +420,15 @@ class TestWatchdog:
     ``_watchdog_check`` directly so the tests don't have to spin up a
     fake polling loop."""
 
-    def _state(self, started_seconds_ago: float = 0.0):
-        from datensee.status import _WatchdogState
-
+    def _state(self, started_seconds_ago: float = 0.0) -> _WatchdogState:
         s = _WatchdogState.fresh()
         # Adjust started_at backwards by N seconds so the check thinks
-        # the job has been running for a while.
+        # the poll session has been attached for a while.
         s.started_at -= started_seconds_ago
         s.last_progress_at -= started_seconds_ago
         return s
 
     def test_max_runtime_breach(self) -> None:
-        from datetime import timedelta
-
-        from datensee.status import WatchdogConfig, _watchdog_check
-
         cfg = WatchdogConfig(
             max_runtime=timedelta(minutes=5),
             max_failure_rate=None,
@@ -275,10 +441,6 @@ class TestWatchdog:
         assert "max_runtime" in reason
 
     def test_max_runtime_under_threshold_passes(self) -> None:
-        from datetime import timedelta
-
-        from datensee.status import WatchdogConfig, _watchdog_check
-
         cfg = WatchdogConfig(
             max_runtime=timedelta(hours=12),
             max_failure_rate=None,
@@ -289,20 +451,54 @@ class TestWatchdog:
         assert _watchdog_check(cfg, state, info, tile_count=10) is None
 
     def test_max_runtime_disabled_when_none(self) -> None:
-        from datensee.status import WatchdogConfig, _watchdog_check
-
-        cfg = WatchdogConfig(
-            max_runtime=None, max_failure_rate=None, idle_timeout=None
-        )
+        cfg = WatchdogConfig(max_runtime=None, max_failure_rate=None, idle_timeout=None)
         state = self._state(started_seconds_ago=10_000_000.0)
         info = JobInfo(state=JobState.RUNNING)
         assert _watchdog_check(cfg, state, info, tile_count=10) is None
 
+    def test_max_runtime_uses_job_age_not_poll_session(self) -> None:
+        """Fix 4: reattaching to an 11-hour-old job must not grant another
+        12 h. The poll session just started, but createTime says 13 h."""
+        cfg = WatchdogConfig(
+            max_runtime=timedelta(hours=12),
+            max_failure_rate=None,
+            idle_timeout=None,
+        )
+        state = self._state()  # fresh poll session
+        info = JobInfo(state=JobState.RUNNING, elapsed_seconds=13 * 3600.0)
+        reason = _watchdog_check(cfg, state, info, tile_count=10)
+        assert reason is not None
+        assert "max_runtime" in reason
+        # The message reports job age, not the ~0 min poll session.
+        assert f"{13 * 60:.1f} min" in reason
+
+    def test_max_runtime_young_job_old_poll_session_passes(self) -> None:
+        """Converse of the reattach case: a long-lived poll session against
+        a young job (job restarted, session reused) must not fire."""
+        cfg = WatchdogConfig(
+            max_runtime=timedelta(hours=12),
+            max_failure_rate=None,
+            idle_timeout=None,
+        )
+        state = self._state(started_seconds_ago=13 * 3600.0)
+        info = JobInfo(state=JobState.RUNNING, elapsed_seconds=3600.0)  # 1 h old
+        assert _watchdog_check(cfg, state, info, tile_count=10) is None
+
+    def test_max_runtime_falls_back_to_session_elapsed(self) -> None:
+        """When createTime is unavailable (degraded UNKNOWN ticks), the
+        poll-session clock still provides a backstop."""
+        cfg = WatchdogConfig(
+            max_runtime=timedelta(minutes=5),
+            max_failure_rate=None,
+            idle_timeout=None,
+        )
+        state = self._state(started_seconds_ago=400.0)
+        info = JobInfo(state=JobState.UNKNOWN, elapsed_seconds=None)
+        reason = _watchdog_check(cfg, state, info, tile_count=10)
+        assert reason is not None
+        assert "max_runtime" in reason
+
     def test_failure_rate_breach_after_grace(self) -> None:
-        from datetime import timedelta
-
-        from datensee.status import WatchdogConfig, _watchdog_check
-
         cfg = WatchdogConfig(
             max_runtime=None,
             max_failure_rate=0.5,
@@ -316,10 +512,6 @@ class TestWatchdog:
         assert "max_failure_rate" in reason
 
     def test_failure_rate_skipped_during_grace(self) -> None:
-        from datetime import timedelta
-
-        from datensee.status import WatchdogConfig, _watchdog_check
-
         cfg = WatchdogConfig(
             max_runtime=None,
             max_failure_rate=0.5,
@@ -331,11 +523,23 @@ class TestWatchdog:
         # In grace → no firing even at 80% failure rate.
         assert _watchdog_check(cfg, state, info, tile_count=100) is None
 
+    def test_failure_rate_grace_anchored_to_job_age(self) -> None:
+        """Fix 4: the grace period is relative to job creation, not poll
+        attach. Reattaching to a 20-minute-old failure storm fires
+        immediately despite the poll session being seconds old."""
+        cfg = WatchdogConfig(
+            max_runtime=None,
+            max_failure_rate=0.5,
+            failure_grace_period=timedelta(minutes=10),
+            idle_timeout=None,
+        )
+        state = self._state()  # fresh poll session
+        info = JobInfo(state=JobState.RUNNING, elapsed_seconds=1200.0, failures_written=80)
+        reason = _watchdog_check(cfg, state, info, tile_count=100)
+        assert reason is not None
+        assert "max_failure_rate" in reason
+
     def test_failure_rate_skipped_without_tile_count(self) -> None:
-        from datetime import timedelta
-
-        from datensee.status import WatchdogConfig, _watchdog_check
-
         cfg = WatchdogConfig(
             max_runtime=None,
             max_failure_rate=0.5,
@@ -348,10 +552,6 @@ class TestWatchdog:
         assert _watchdog_check(cfg, state, info, tile_count=None) is None
 
     def test_idle_timeout_breach(self) -> None:
-        from datetime import timedelta
-
-        from datensee.status import WatchdogConfig, _watchdog_check
-
         cfg = WatchdogConfig(
             max_runtime=None,
             max_failure_rate=None,
@@ -366,10 +566,6 @@ class TestWatchdog:
         assert "idle_timeout" in reason
 
     def test_idle_timer_resets_on_progress(self) -> None:
-        from datetime import timedelta
-
-        from datensee.status import WatchdogConfig, _watchdog_check
-
         cfg = WatchdogConfig(
             max_runtime=None,
             max_failure_rate=None,
@@ -385,14 +581,58 @@ class TestWatchdog:
         info_same = JobInfo(state=JobState.RUNNING, output_tiles_written=5)
         assert _watchdog_check(cfg, state, info_same, tile_count=100) is None
 
+    def test_idle_small_counter_progress_beside_large_pinned_counter(self) -> None:
+        """Fix 1: after the fetch phase, elements_produced pins at
+        ~tile_count while output_tiles_written creeps up in small numbers
+        during two-tier assembly. Any counter increasing must reset the stall
+        timer — the old max()-based check let the pinned large counter
+        mask the small one's progress and cancelled healthy jobs."""
+        cfg = WatchdogConfig(
+            max_runtime=None,
+            max_failure_rate=None,
+            failure_grace_period=timedelta(seconds=0),
+            idle_timeout=timedelta(minutes=5),
+        )
+        state = self._state()
+
+        # Tick 1: fetch phase done (1000 elements), assembly starting.
+        tick1 = JobInfo(state=JobState.RUNNING, elements_produced=1000, output_tiles_written=1)
+        assert _watchdog_check(cfg, state, tick1, tile_count=1000) is None
+
+        # 10 idle-minutes pass; assembly writes ONE more output tile.
+        state.last_progress_at -= 600.0
+        tick2 = JobInfo(state=JobState.RUNNING, elements_produced=1000, output_tiles_written=2)
+        assert _watchdog_check(cfg, state, tick2, tile_count=1000) is None
+
+        # Another 10 idle-minutes with NO counter movement → genuinely
+        # stalled, and only now does the watchdog fire.
+        state.last_progress_at -= 600.0
+        tick3 = JobInfo(state=JobState.RUNNING, elements_produced=1000, output_tiles_written=2)
+        reason = _watchdog_check(cfg, state, tick3, tile_count=1000)
+        assert reason is not None
+        assert "idle_timeout" in reason
+
+    def test_idle_each_counter_tracked_independently(self) -> None:
+        """A failures_written increase alone (dead-lettering is progress
+        toward termination) also resets the timer, even when every other
+        counter is pinned."""
+        cfg = WatchdogConfig(
+            max_runtime=None,
+            max_failure_rate=None,
+            failure_grace_period=timedelta(seconds=0),
+            idle_timeout=timedelta(minutes=5),
+        )
+        state = self._state()
+        tick1 = JobInfo(state=JobState.RUNNING, elements_produced=500, failures_written=3)
+        assert _watchdog_check(cfg, state, tick1, tile_count=None) is None
+        state.last_progress_at -= 600.0
+        tick2 = JobInfo(state=JobState.RUNNING, elements_produced=500, failures_written=4)
+        assert _watchdog_check(cfg, state, tick2, tile_count=None) is None
+
     def test_terminal_state_does_not_trigger_cancel(self) -> None:
         # The polling loop short-circuits on terminal states before
         # cancellation, but the policy itself should also be a no-op
         # so end-state inspections don't trip the watchdog.
-        from datetime import timedelta
-
-        from datensee.status import WatchdogConfig, _watchdog_check
-
         cfg = WatchdogConfig(
             max_runtime=None,
             max_failure_rate=None,
@@ -408,10 +648,6 @@ class TestWatchdogTriggered:
     """End-to-end: the poller should cancel the job and raise."""
 
     def test_max_runtime_cancels_and_raises(self, httpx_mock: HTTPXMock) -> None:
-        from datetime import timedelta
-
-        from datensee.status import WatchdogConfig, WatchdogTriggered
-
         # First poll returns a long-elapsed running job; the watchdog
         # should fire on that tick. We register *both* responses Beam
         # might issue (pytest-httpx auto-asserts that all registered
@@ -431,26 +667,57 @@ class TestWatchdogTriggered:
             json={"currentState": "JOB_STATE_CANCELLED"},
         )
 
-        # max_runtime=0s + failure_grace=0s + an "elapsed" wall clock
-        # well past the cap means the very first tick fires.
+        # max_runtime=0s + failure_grace=0s + a createTime years in the
+        # past means the very first tick fires.
         cfg = WatchdogConfig(
             max_runtime=timedelta(seconds=0),
             max_failure_rate=None,
             failure_grace_period=timedelta(seconds=0),
             idle_timeout=None,
         )
-        try:
+        with pytest.raises(WatchdogTriggered) as exc_info:
             poll_job(
                 "job-123",
                 "test-project",
                 "us-central1",
-                "fake-token",
+                FakeCredentials(),
                 poll_interval_seconds=0,
                 watchdog=cfg,
                 tile_count=100,
             )
-        except WatchdogTriggered as exc:
-            assert "max_runtime" in exc.reason
-            assert exc.job_id == "job-123"
-        else:
-            raise AssertionError("expected WatchdogTriggered")
+        assert "max_runtime" in exc_info.value.reason
+        assert exc_info.value.job_id == "job-123"
+        # Cancel succeeded → no failure disclaimer in the message.
+        assert "cancel request FAILED" not in exc_info.value.reason
+
+    def test_failed_cancel_is_reported_not_claimed(self, httpx_mock: HTTPXMock) -> None:
+        """Fix 2: when the cancel request fails, WatchdogTriggered must say
+        so instead of implying the job was cancelled."""
+        httpx_mock.add_response(
+            method="GET",
+            url=f"{_BASE_URL}?view=JOB_VIEW_ALL",
+            json={
+                "currentState": "JOB_STATE_RUNNING",
+                "createTime": "2020-01-01T00:00:00Z",
+            },
+        )
+        httpx_mock.add_response(method="PUT", url=_BASE_URL, status_code=500)
+
+        cfg = WatchdogConfig(
+            max_runtime=timedelta(seconds=0),
+            max_failure_rate=None,
+            failure_grace_period=timedelta(seconds=0),
+            idle_timeout=None,
+        )
+        with pytest.raises(WatchdogTriggered) as exc_info:
+            poll_job(
+                "job-123",
+                "test-project",
+                "us-central1",
+                FakeCredentials(),
+                poll_interval_seconds=0,
+                watchdog=cfg,
+                tile_count=100,
+            )
+        assert "cancel request FAILED" in exc_info.value.reason
+        assert "gcloud dataflow jobs cancel job-123" in exc_info.value.reason
