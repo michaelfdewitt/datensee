@@ -66,10 +66,14 @@ jobs:
         with:
           distribution: temurin
           java-version: "25"
+      # gradle-wrapper.jar is gitignored, so install the version the wrapper
+      # pins (gradle/wrapper/gradle-wrapper.properties) and call gradle directly.
       - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.4.0"
       - name: Build shadow JAR
         working-directory: pipelines
-        run: ./gradlew --no-daemon shadowJar
+        run: gradle --no-daemon shadowJar
       - name: Attach JAR to the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
