@@ -123,7 +123,7 @@ That's it. No `earthengine-api` dependency, no Java toolchain, no Gradle. The pa
 
 ### Where it lives
 
-DatensEE is published to PyPI as `datensee` and lives in the `earthengine` repo under `tools/datensee/`. It is **deliberately separate** from the `earthengine` package itself — installing `datensee` does **not** pull in `earthengine-api` or any other heavy GIS toolchain. Users who want to author EE expressions can `pip install earthengine-api` independently.
+DatensEE is published to PyPI as `datensee`; source lives at [github.com/michaelfdewitt/datensee](https://github.com/michaelfdewitt/datensee). It is **deliberately separate** from the `earthengine-api` package — installing `datensee` does **not** pull in `earthengine-api` or any other heavy GIS toolchain. Users who want to author EE expressions can `pip install earthengine-api` independently.
 
 ### Demo: Landsat 9 NDVI over SF Bay Area
 
@@ -131,7 +131,7 @@ DatensEE is published to PyPI as `datensee` and lives in the `earthengine` repo 
 datensee demo --project my-gcp-project --output ./ndvi-output
 ```
 
-This fetches a small Landsat 9 NDVI composite (~4 tiles at 30m) using the
+This fetches a small Landsat 9 NDVI composite (9 tiles of 512×512 px at 30 m) using the
 local direct runner. Output is a directory of Cloud Optimized GeoTIFFs
 (`tile_r0000_c0000.tif`, …) — self-describing files that QGIS, rasterio, or
 any modern GIS opens directly, no manifest needed.

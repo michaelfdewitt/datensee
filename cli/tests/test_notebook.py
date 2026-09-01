@@ -139,28 +139,19 @@ class TestRenderStatusHtml:
 
 
 class TestEnsureJar:
-    def test_returns_found_jar(self, tmp_path: object) -> None:
+    def test_delegates_to_jar_module(self, tmp_path: object) -> None:
         from datensee.notebook import ensure_jar
 
         jar = tmp_path / "test.jar"  # type: ignore[operator]
         jar.touch()
 
-        with patch("datensee.jar.find_jar", return_value=jar):
-            result = ensure_jar()
-            assert result == jar
+        with patch("datensee.jar.ensure_jar", return_value=jar):
+            assert ensure_jar() == jar
 
     def test_propagates_not_found(self) -> None:
-        """No JAR on disk → caller sees the build instructions error.
-
-        The legacy GitHub-Releases auto-download is gone (cloud mode
-        does not need a JAR; local mode requires ``datensee jar build``).
-        """
+        """No JAR on disk and no release asset → caller sees the options error."""
         from datensee.notebook import ensure_jar
 
-        with patch("datensee.jar.find_jar", side_effect=FileNotFoundError("nope")):
-            try:
+        with patch("datensee.jar.ensure_jar", side_effect=FileNotFoundError("nope")):
+            with pytest.raises(FileNotFoundError, match="nope"):
                 ensure_jar()
-            except FileNotFoundError as exc:
-                assert "nope" in str(exc)
-            else:
-                raise AssertionError("expected FileNotFoundError")

@@ -12,13 +12,14 @@ import subprocess
 from pathlib import Path
 from typing import Annotated
 
+import httpx
 import typer
 from rich.console import Console
 
 from datensee import __version__, api
 from datensee.config import PipelineConfig
 from datensee.display import render_export_summary, render_post_run_summary
-from datensee.jar import build_jar
+from datensee.jar import build_jar, download_jar
 
 app = typer.Typer(
     name="datensee",
@@ -470,8 +471,27 @@ def jar_path_cmd() -> None:
         console.print(str(path))
     else:
         console.print("[red]Pipeline JAR not found.[/red]")
-        console.print("Build it with: datensee jar build")
+        console.print("Fetch it with: datensee jar download  (or build: datensee jar build)")
         raise typer.Exit(code=1)
+
+
+@jar_app.command("download")
+def jar_download_cmd(
+    version: Annotated[
+        str | None,
+        typer.Option("--version", help="Release version to fetch (default: this package's)."),
+    ] = None,
+    force: Annotated[
+        bool, typer.Option("--force", help="Re-download even if already cached.")
+    ] = False,
+) -> None:
+    """Download the prebuilt pipeline JAR from GitHub Releases."""
+    try:
+        path = download_jar(version or __version__, force=force)
+        console.print(f"[green]JAR ready:[/green] {path}")
+    except (FileNotFoundError, httpx.HTTPError) as exc:
+        console.print(f"[red]Download failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
 
 
 @jar_app.command("build")

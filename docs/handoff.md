@@ -8,14 +8,14 @@ A reference for an agent picking up DatensEE for polish work. Read after `CLAUDE
 
 ## Deployment story (read first)
 
-DatensEE is being checked in to the **`earthengine` monorepo** under `tools/datensee/`. It is published to PyPI as **`datensee`**.
+DatensEE lives at **github.com/michaelfdewitt/datensee** and is published to PyPI as **`datensee`** (release flow: [`releasing.md`](releasing.md)).
 
 The two facts the next agent must internalize:
 
-1. **Users install with `pip install datensee`.** That's the well-lit path. The CLI auto-downloads the pipeline JAR on first run. No `gradle`, no `uv sync`, no Java installation, no manual JAR placement. The README's "Development setup" section is the only place where Gradle/uv appear, and it's labeled as such.
-2. **`datensee` does NOT depend on `earthengine-api`.** The two packages live in the same monorepo but are deliberately decoupled. We accept EE expressions as **opaque serialized JSON** — we never call `ee.serializer.encode` ourselves at runtime. Users who want to author expressions can install `earthengine-api` separately. **Do not add an `earthengine-api` dependency to `cli/pyproject.toml`** — that would balloon the install footprint and pin users to a specific EE client version.
+1. **Users install with `pip install datensee`.** That's the well-lit path. Cloud mode launches a Flex Template pinned to the package version; local mode auto-downloads the matching pipeline JAR from GitHub Releases on first run. No `gradle`, no `uv sync`, no Java installation, no manual JAR placement. The README's "Development setup" section is the only place where Gradle/uv appear, and it's labeled as such.
+2. **`datensee` does NOT depend on `earthengine-api`.** The two packages are deliberately decoupled. We accept EE expressions as **opaque serialized JSON** — we never call `ee.serializer.encode` ourselves at runtime. Users who want to author expressions can install `earthengine-api` separately. **Do not add an `earthengine-api` dependency to `cli/pyproject.toml`** — that would balloon the install footprint and pin users to a specific EE client version.
 
-Concretely the dep set is small: typer, pydantic, httpx, rich, jsonschema, pyproj, shapely, google-auth, google-cloud-storage, requests. One optional extra: `[validation]` adds rasterio. Keep it that way.
+Concretely the dep set is small: typer, pydantic, httpx, rich, pyproj, shapely, google-auth, google-cloud-storage. One optional extra: `[validation]` adds rasterio. Keep it that way.
 
 When you make changes that affect the install surface, update `cli/pyproject.toml` and the README's "Install" section in lockstep. The README is the source of truth for what users see; the handoff doc and CLAUDE.md are for developers.
 

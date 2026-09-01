@@ -5,7 +5,13 @@ plugins {
 }
 
 group = "com.datensee"
-version = "0.1.0a1"
+
+// Single-sourced from cli/pyproject.toml: the Python client pins itself to
+// the Flex Template / GitHub Release for its own version, so the JAR must
+// carry the same one. Bump the version in pyproject.toml only.
+version = file("../cli/pyproject.toml").readLines()
+    .first { it.trim().startsWith("version = ") }
+    .substringAfter('"').substringBefore('"')
 
 java {
     sourceCompatibility = JavaVersion.VERSION_25
