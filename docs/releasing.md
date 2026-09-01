@@ -48,7 +48,9 @@ PyPI versions are immutable — every test cut needs a new pre-release number
 testers pin the exact version: `pip install datensee==0.1.0a2` (an exact
 pre-release pin needs no `--pre`). **Avoid `pip install --pre datensee`** —
 `--pre` applies to every dependency in the resolve, not just `datensee`, and
-pulls in things like `httpx 1.0.devN`.
+pulls in things like `httpx 1.0.devN`. (`uv pip install` is stricter than
+pip and needs `--prerelease=allow` even for an exact pre-release pin; the
+`httpx<1` cap in `pyproject.toml` keeps that from dragging in httpx 1.0.)
 
 ## Smoke test
 
