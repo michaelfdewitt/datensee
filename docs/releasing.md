@@ -35,6 +35,9 @@ git commit -am "chore: release 0.1.0a2"
 
 # 2. stage the Flex Template BEFORE the wheel exists on PyPI
 scripts/release-template.sh 0.1.0a2
+#    (Python-only release, Java unchanged? copying the previous spec is enough:
+#     gcloud storage cp gs://datensee-templates/v0.1.0a1/datensee.json \
+#                       gs://datensee-templates/v0.1.0a2/datensee.json)
 
 # 3. tag → CI builds, tests, attaches the JAR, publishes to PyPI
 git tag v0.1.0a2 && git push origin master v0.1.0a2
@@ -42,12 +45,15 @@ git tag v0.1.0a2 && git push origin master v0.1.0a2
 
 PyPI versions are immutable — every test cut needs a new pre-release number
 (`a2`, `a3`, …). Pre-releases are invisible to a plain `pip install datensee`;
-testers use `pip install --pre datensee` or pin `datensee==0.1.0a2`.
+testers pin the exact version: `pip install datensee==0.1.0a2` (an exact
+pre-release pin needs no `--pre`). **Avoid `pip install --pre datensee`** —
+`--pre` applies to every dependency in the resolve, not just `datensee`, and
+pulls in things like `httpx 1.0.devN`.
 
 ## Smoke test
 
 ```bash
-python -m venv /tmp/dt && /tmp/dt/bin/pip install --pre datensee==0.1.0a2
+python -m venv /tmp/dt && /tmp/dt/bin/pip install datensee==0.1.0a2
 /tmp/dt/bin/datensee --version
 /tmp/dt/bin/datensee jar download            # exercises the release asset
 /tmp/dt/bin/datensee demo --project <gcp-project> --output /tmp/dt-demo
