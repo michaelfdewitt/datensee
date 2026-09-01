@@ -39,25 +39,31 @@ echo "Spec    : ${SPEC_GCS}"
 cd "${PIPELINES_DIR}"
 
 echo
-echo "[1/4] gradle shadowJar"
+echo "[1/5] gradle shadowJar"
 ./gradlew shadowJar
 
 echo
-echo "[2/4] docker build"
+echo "[2/5] docker build"
 docker build -t "${IMAGE}" -f Dockerfile .
 
 echo
-echo "[3/4] docker push"
+echo "[3/5] docker push"
 gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
 docker push "${IMAGE}"
 
 echo
-echo "[4/4] gcloud dataflow flex-template build"
+echo "[4/5] gcloud dataflow flex-template build"
 gcloud dataflow flex-template build "${SPEC_GCS}" \
     --image="${IMAGE}" \
     --sdk-language=JAVA \
     --metadata-file=metadata.json \
     --project="${PROJECT}"
+
+echo
+echo "[5/5] stage the public JAR fallback (datensee jar download)"
+JAR="${PIPELINES_DIR}/build/libs/datensee-pipeline.jar"
+shasum -a 256 "${JAR}" | awk '{print $1 "  datensee-pipeline.jar"}' > "${JAR}.sha256"
+gcloud storage cp "${JAR}" "${JAR}.sha256" "gs://${BUCKET}/v${VERSION}/"
 
 echo
 echo "Release complete."

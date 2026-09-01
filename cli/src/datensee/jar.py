@@ -23,6 +23,7 @@ sent to the download host.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -40,8 +41,15 @@ from rich.progress import (
 )
 
 from datensee._version import __version__
+from datensee.template import TEMPLATE_BUCKET
 
 JAR_FILENAME = "datensee-pipeline.jar"
+
+# Fallback host: the same public bucket that serves the Flex Template
+# specs. Versioned path — a new release writes a new prefix, so nothing
+# that can change under an existing install; a .sha256 sidecar pins the
+# bytes and is verified after download.
+_GCS_JAR_URL = f"https://storage.googleapis.com/{TEMPLATE_BUCKET}/v{{version}}/{JAR_FILENAME}"
 
 GITHUB_REPOSITORY = "michaelfdewitt/datensee"
 
@@ -169,8 +177,9 @@ def _resolve_private_asset_url(version: str, token: str) -> str:
 
 def _no_release_message(version: str) -> str:
     return (
-        f"No prebuilt pipeline JAR for v{version} at "
-        f"https://github.com/{GITHUB_REPOSITORY}/releases/tag/v{version}.\n"
+        f"No prebuilt pipeline JAR for v{version} — checked the GitHub Release "
+        f"(https://github.com/{GITHUB_REPOSITORY}/releases/tag/v{version}) and the "
+        f"fallback bucket ({_GCS_JAR_URL.format(version=version)}).\n"
         "Options:\n"
         "  --jar <path>            Use a JAR you already have\n"
         "  datensee jar build      Build from a repo checkout (Java 25+ and Gradle)\n"
@@ -180,12 +189,16 @@ def _no_release_message(version: str) -> str:
 
 
 def download_jar(version: str = __version__, *, force: bool = False) -> Path:
-    """Download the prebuilt pipeline JAR for ``version`` from GitHub Releases.
+    """Download the prebuilt pipeline JAR for ``version``.
+
+    Primary host is the GitHub Release for tag ``v<version>``; when that
+    is unreachable (asset missing, or a private repository without a
+    token) the public template bucket serves the same JAR from a
+    per-version path (``v<version>/datensee-pipeline.jar``) whose
+    ``.sha256`` sidecar is verified after download.
 
     The file lands at ``~/.datensee/jars/datensee-pipeline-<version>.jar``,
-    where :func:`find_jar` picks it up. Writes go through a ``.tmp``
-    sibling and are renamed on success, so an interrupted download never
-    leaves a truncated JAR in the search path.
+    where :func:`find_jar` picks it up.
 
     Args:
         version: Release version (tag ``v<version>``). Defaults to the
@@ -203,21 +216,72 @@ def download_jar(version: str = __version__, *, force: bool = False) -> Path:
     if destination.exists() and not force:
         return destination
 
-    token = _github_token()
-    url = (
-        _resolve_private_asset_url(version, token)
-        if token
-        else _GITHUB_RELEASE_ASSET_URL.format(version=version)
-    )
-
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    partial = destination.with_suffix(".tmp")
     console.print(f"Downloading pipeline JAR v{version}...")
 
     try:
+        token = _github_token()
+        url = (
+            _resolve_private_asset_url(version, token)
+            if token
+            else _GITHUB_RELEASE_ASSET_URL.format(version=version)
+        )
+        _stream_download(url, destination, not_found=_no_release_message(version))
+    except FileNotFoundError:
+        # The GitHub Release is unreachable (asset missing, or the
+        # repository is private and no token is set). Fall back to the
+        # public bucket, whose per-version path never changes once
+        # published and whose .sha256 sidecar pins the bytes.
+        console.print("  GitHub Release unavailable; trying the public bucket fallback.")
+        _download_from_bucket(version, destination)
+
+    console.print(f"  Saved to {destination}")
+    return destination
+
+
+def _download_from_bucket(version: str, destination: Path) -> None:
+    """Fetch the JAR from the public bucket and verify its .sha256 sidecar."""
+    url = _GCS_JAR_URL.format(version=version)
+    checksum_response = httpx.get(url + ".sha256", timeout=30)
+    expected: str | None = None
+    if checksum_response.status_code == 200:
+        expected = checksum_response.text.split()[0].strip().lower()
+    elif checksum_response.status_code != 404:
+        checksum_response.raise_for_status()
+
+    digest = _stream_download(url, destination, not_found=_no_release_message(version))
+
+    if expected is None:
+        console.print(
+            "  [yellow]No .sha256 sidecar published for this version; "
+            "skipping verification.[/yellow]"
+        )
+        return
+    if digest != expected:
+        destination.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Checksum mismatch for {url}: expected sha256 {expected}, got {digest}.\n"
+            "The bucket copy does not match its published sidecar — refusing the file. "
+            "Retry, or use `datensee jar build` / GITHUB_TOKEN for the release asset."
+        )
+    console.print("  sha256 verified.")
+
+
+def _stream_download(url: str, destination: Path, *, not_found: str) -> str:
+    """Stream ``url`` to ``destination`` with progress; returns the sha256 hex digest.
+
+    Writes go through a ``.tmp`` sibling and are renamed on success, so an
+    interrupted download never leaves a truncated JAR in the search path.
+
+    Raises:
+        FileNotFoundError: With ``not_found`` as the message, on HTTP 404.
+    """
+    partial = destination.with_suffix(".tmp")
+    digest = hashlib.sha256()
+    try:
         with httpx.stream("GET", url, follow_redirects=True, timeout=300) as response:
             if response.status_code == 404:
-                raise FileNotFoundError(_no_release_message(version))
+                raise FileNotFoundError(not_found)
             response.raise_for_status()
             total = int(response.headers.get("content-length", 0)) or None
             with (
@@ -234,14 +298,14 @@ def download_jar(version: str = __version__, *, force: bool = False) -> Path:
                 task = progress.add_task("Downloading", total=total)
                 for chunk in response.iter_bytes(chunk_size=1 << 16):
                     sink.write(chunk)
+                    digest.update(chunk)
                     progress.update(task, advance=len(chunk))
     except BaseException:
         partial.unlink(missing_ok=True)
         raise
 
     partial.replace(destination)
-    console.print(f"  Saved to {destination}")
-    return destination
+    return digest.hexdigest()
 
 
 def build_jar() -> Path:

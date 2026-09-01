@@ -124,3 +124,9 @@ Remote state: /root/datensee (repo), /root/datensee-venv, ~/.datensee/jars/daten
 - Branch `refactor/pixel-vector-seam` @ 1087ef9 (+ this log), PR #2 open against master, CI green.
 - Verified: 373 pytest, 82 JUnit, EE integration 22/22, local + Dataflow e2e on both runners with identical bytes, validate/status/retry surfaces exercised on a pip-only host.
 - Release: `v0.1.0a3` template staged; tagging `v0.1.0a3` publishes the wheel that works on pip-only hosts. Repo is private → `jar download` needs a token until it's public.
+
+## Phase 5 — public-but-unlisted distribution
+
+- [DESIGN] Repo stays private for now; the well-lit path must not depend on repo visibility. `datensee jar download` keeps the GitHub Release as the primary host and falls back to the public template bucket: `gs://datensee-templates/v<version>/datensee-pipeline.jar` + `.sha256` sidecar, verified after download. Versioned prefix → a new release never touches an old path; existing installs never re-fetch (versioned cache filename); a mutated bucket object fails the checksum and is refused. Staged by the template-release step (which already writes to that bucket with ADC) — no new CI credentials.
+- [STAGED] v0.1.0a3 JAR + sidecar uploaded (sha256 b8cf89f7dd66…).
+- [PASS] Fallback e2e on the LXC (no GITHUB_TOKEN, empty cache): `datensee jar download` → "GitHub Release unavailable; trying the public bucket fallback." → sha256 verified → cached as datensee-pipeline-0.1.0a3.jar, byte-identical to the built JAR; `datensee demo` runs on it (9 tiles, 14 s). Sidecar + JAR confirmed anonymously fetchable over plain HTTPS.

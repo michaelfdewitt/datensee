@@ -6,6 +6,7 @@ A release is three artifacts that must agree on one version:
 |---|---|---|
 | Flex Template spec `gs://datensee-templates/v<version>/datensee.json` + launcher image in Artifact Registry | `runner="dataflow"` — the wheel pins itself to this URI (`datensee/template.py`) | `scripts/release-template.sh <version>` (manual, needs `gcloud` + Docker) |
 | `datensee-pipeline.jar` on the GitHub Release `v<version>` | `runner="local"` — `datensee jar download` / auto-download on first local export | `.github/workflows/publish.yml`, job `jar` |
+| `datensee-pipeline.jar` + `.sha256` at `gs://datensee-templates/v<version>/` | public fallback for `jar download` when the GitHub Release is unreachable (private repo, no token); versioned path + verified sidecar | template staging (`scripts/release-template.sh` / `release_template_cloudbuild.py`) |
 | Wheel + sdist on PyPI | `pip install datensee` | `.github/workflows/publish.yml`, job `pypi` |
 
 The version is declared **once**, in `cli/pyproject.toml`. `datensee.__version__`,

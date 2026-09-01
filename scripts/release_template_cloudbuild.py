@@ -4,7 +4,10 @@
 Docker-less twin of ``release-template.sh``: Cloud Build builds and pushes the
 launcher image from a source tarball (``pipelines/Dockerfile`` + the shadow
 JAR), then the template spec JSON is written the way
-``gcloud dataflow flex-template build`` writes it. Needs only Application
+``gcloud dataflow flex-template build`` writes it, and the JAR (+ .sha256
+sidecar) is staged at ``gs://<bucket>/v<version>/`` — the public fallback
+``datensee jar download`` uses when the GitHub Release is unreachable.
+Needs only Application
 Default Credentials with Cloud Build + Artifact Registry + GCS permissions on
 the hosting project — it runs from a bare container or CI.
 
@@ -21,6 +24,7 @@ environment overrides as ``release-template.sh`` apply
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import os
@@ -186,7 +190,20 @@ def main(argv: list[str]) -> int:
     gcs.bucket(bucket).blob(spec_path).upload_from_string(
         json.dumps(spec, indent=2), content_type="application/json"
     )
-    print(f"[3/3] spec written: gs://{bucket}/{spec_path}")
+    print(f"[3/4] spec written: gs://{bucket}/{spec_path}")
+
+    # The public download fallback for `datensee jar download`: versioned
+    # path (a new release never touches an old prefix) + sha256 sidecar
+    # (the CLI verifies it, so a mutated object is refused, not run).
+    jar_sha = hashlib.sha256(JAR.read_bytes()).hexdigest()
+    jar_blob = f"v{version}/{JAR.name}"
+    gcs.bucket(bucket).blob(jar_blob).upload_from_filename(
+        str(JAR), content_type="application/java-archive", timeout=600
+    )
+    gcs.bucket(bucket).blob(jar_blob + ".sha256").upload_from_string(
+        jar_sha + "  " + JAR.name + "\n", content_type="text/plain"
+    )
+    print(f"[4/4] jar fallback staged: gs://{bucket}/{jar_blob} (sha256 {jar_sha[:12]}…)")
     print(
         f"\nRelease complete. Override at runtime: DATENSEE_TEMPLATE_SPEC=gs://{bucket}/{spec_path}"
     )

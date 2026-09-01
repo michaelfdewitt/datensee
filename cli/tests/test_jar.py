@@ -6,6 +6,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from pytest_httpx import HTTPXMock
 
 from datensee.jar import (
     JAR_FILENAME,
@@ -126,7 +127,9 @@ class TestDownloadJar:
         from pytest_httpx import HTTPXMock
 
         assert isinstance(httpx_mock, HTTPXMock)
-        httpx_mock.add_response(status_code=404)
+        # Matches every request: the GitHub asset AND the bucket fallback
+        # (jar + .sha256) all 404, so the combined not-found error surfaces.
+        httpx_mock.add_response(status_code=404, is_reusable=True)
         with pytest.raises(FileNotFoundError, match="releases/tag/v9.9.9") as excinfo:
             download_jar("9.9.9")
         assert "datensee jar build" in str(excinfo.value)
@@ -186,3 +189,62 @@ class TestEnsureJar:
         downloaded = empty_cache / versioned_jar_filename()
         monkeypatch.setattr("datensee.jar.download_jar", lambda *a, **k: downloaded)
         assert ensure_jar() == downloaded
+
+
+class TestBucketFallback:
+    """GitHub Release unreachable → the public bucket serves a pinned copy."""
+
+    _GITHUB_URL = (
+        "https://github.com/michaelfdewitt/datensee/releases/download/v9.9.9/datensee-pipeline.jar"
+    )
+    _BUCKET_URL = "https://storage.googleapis.com/datensee-templates/v9.9.9/datensee-pipeline.jar"
+
+    def _github_missing(self, httpx_mock: HTTPXMock) -> None:
+        httpx_mock.add_response(url=self._GITHUB_URL, status_code=404)
+
+    def test_falls_back_to_bucket_and_verifies_sha256(
+        self, empty_cache: Path, httpx_mock: HTTPXMock
+    ) -> None:
+        import hashlib
+
+        payload = b"jar-bytes"
+        self._github_missing(httpx_mock)
+        httpx_mock.add_response(
+            url=self._BUCKET_URL + ".sha256",
+            text=hashlib.sha256(payload).hexdigest() + "  datensee-pipeline.jar\n",
+        )
+        httpx_mock.add_response(url=self._BUCKET_URL, content=payload)
+
+        path = download_jar("9.9.9")
+        assert path.read_bytes() == payload
+        assert path.name == "datensee-pipeline-9.9.9.jar"
+
+    def test_checksum_mismatch_refuses_the_file(
+        self, empty_cache: Path, httpx_mock: HTTPXMock
+    ) -> None:
+        self._github_missing(httpx_mock)
+        httpx_mock.add_response(url=self._BUCKET_URL + ".sha256", text="0" * 64)
+        httpx_mock.add_response(url=self._BUCKET_URL, content=b"tampered")
+
+        with pytest.raises(RuntimeError, match="Checksum mismatch"):
+            download_jar("9.9.9")
+        assert not (empty_cache / "datensee-pipeline-9.9.9.jar").exists()
+
+    def test_missing_sidecar_downloads_with_warning(
+        self, empty_cache: Path, httpx_mock: HTTPXMock
+    ) -> None:
+        self._github_missing(httpx_mock)
+        httpx_mock.add_response(url=self._BUCKET_URL + ".sha256", status_code=404)
+        httpx_mock.add_response(url=self._BUCKET_URL, content=b"jar-bytes")
+
+        assert download_jar("9.9.9").read_bytes() == b"jar-bytes"
+
+    def test_both_hosts_missing_names_both_in_the_error(
+        self, empty_cache: Path, httpx_mock: HTTPXMock
+    ) -> None:
+        self._github_missing(httpx_mock)
+        httpx_mock.add_response(url=self._BUCKET_URL + ".sha256", status_code=404)
+        httpx_mock.add_response(url=self._BUCKET_URL, status_code=404)
+
+        with pytest.raises(FileNotFoundError, match="GitHub Release.*fallback bucket"):
+            download_jar("9.9.9")
