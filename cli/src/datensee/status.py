@@ -389,7 +389,72 @@ def poll_job(
                     break
                 time.sleep(poll_interval_seconds)
 
+    if info.state == JobState.FAILED:
+        for line in failure_summary(job_id, project, region, credentials):
+            console.print(f"[red]  {line}[/red]")
+
     return info.state
+
+
+_LAUNCHER_LOG_MARKER = "Console log from launcher will be available at "
+
+
+def failure_summary(
+    job_id: str,
+    project: str,
+    region: str,
+    credentials: Credentials,
+    *,
+    max_errors: int = 3,
+) -> list[str]:
+    """Explain a failed Dataflow job from its job messages.
+
+    Returns the distinct ERROR-importance messages (newest last, capped at
+    ``max_errors``) plus — when the failure happened inside the Flex
+    Template launcher, whose stack trace never reaches Cloud Logging —
+    the GCS path of the launcher's console log. Empty when the messages
+    endpoint is unreachable; the caller has already reported the state.
+    """
+    url = _DATAFLOW_API.format(project=project, region=region, job_id=job_id) + "/messages"
+    try:
+        response = _authorized_request(
+            "GET",
+            url,
+            credentials,
+            params={"minimumImportance": "JOB_MESSAGE_BASIC", "pageSize": "500"},
+        )
+        messages = response.json().get("jobMessages", [])
+    except (httpx.HTTPError, google.auth.exceptions.GoogleAuthError, ValueError):
+        return []
+
+    texts = [str(m.get("messageText", "")) for m in messages]
+    errors: list[str] = []
+    for text in (
+        t
+        for m, t in zip(messages, texts, strict=True)
+        if m.get("messageImportance") == "JOB_MESSAGE_ERROR"
+    ):
+        # Dataflow repeats e.g. the stockout message every 30 s with a new
+        # instance name; collapse on the first sentence.
+        head = text.split(". ", 1)[0]
+        if not any(e.startswith(head) for e in errors):
+            errors.append(text.strip())
+    lines = [f"Dataflow: {e}" for e in errors[-max_errors:]]
+
+    if any("launcher container" in e for e in errors):
+        launcher_log = next(
+            (
+                t[len(_LAUNCHER_LOG_MARKER) :].strip(" .")
+                for t in texts
+                if t.startswith(_LAUNCHER_LOG_MARKER)
+            ),
+            None,
+        )
+        if launcher_log:
+            lines.append(
+                f"Launcher stack trace (not in Cloud Logging): gcloud storage cat {launcher_log}"
+            )
+    return lines
 
 
 def _fetch_job_info(url: str, credentials: Credentials) -> JobInfo:

@@ -111,12 +111,14 @@ def demo(
     ] = None,
     dry_run: Annotated[
         bool,
-        typer.Option("--dry-run", help="Print the pipeline command without executing."),
+        typer.Option(
+            "--dry-run", help="Validate inputs and print the export summary without submitting."
+        ),
     ] = False,
 ) -> None:
     """Fetch Landsat 9 NDVI tiles over SF Bay Area locally.
 
-    Uses a hardcoded 0.25 x 0.25 degree region at 30 m/pixel (~4 tiles).
+    Uses a hardcoded 0.25 x 0.25 degree region at 30 m/pixel (9 tiles of 512×512 px).
     Output COGs are written to OUTPUT_DIR as ``tile_r{row}_c{col}.tif``;
     open them as a directory in QGIS or any GIS tool. To control output
     granularity (one big COG vs. many small COGs), use ``datensee export``
@@ -229,6 +231,25 @@ def export(
         str | None,
         typer.Option("--temp-location", help="GCS URI for Dataflow temp files."),
     ] = None,
+    machine_type: Annotated[
+        str | None,
+        typer.Option(
+            "--machine-type",
+            help=(
+                "Dataflow worker machine type (default n2-standard-4). Switch "
+                "families (e.g. e2-standard-4) when a zone reports "
+                "ZONE_RESOURCE_POOL_EXHAUSTED."
+            ),
+        ),
+    ] = None,
+    num_workers: Annotated[
+        int | None,
+        typer.Option("--num-workers", min=1, help="Initial Dataflow worker count."),
+    ] = None,
+    max_workers: Annotated[
+        int | None,
+        typer.Option("--max-workers", min=1, help="Dataflow autoscaling ceiling (default 100)."),
+    ] = None,
     jar: Annotated[
         Path | None,
         typer.Option("--jar", help="Path to the pipeline JAR (auto-detected if omitted)."),
@@ -247,7 +268,9 @@ def export(
     ] = None,
     dry_run: Annotated[
         bool,
-        typer.Option("--dry-run", help="Print the pipeline command without executing."),
+        typer.Option(
+            "--dry-run", help="Validate inputs and print the export summary without submitting."
+        ),
     ] = False,
     yes: Annotated[
         bool,
@@ -285,6 +308,9 @@ def export(
             runner=runner,  # type: ignore[arg-type]
             region_gcp=region_gcp,
             temp_location=temp_location,
+            machine_type=machine_type,
+            num_workers=num_workers,
+            max_workers=max_workers,
             jar=jar,
             snapshot_time=snapshot_time_micros,
             dry_run=dry_run,
@@ -302,6 +328,10 @@ def export(
 
     if result.job_id:
         console.print(f"[green]Job submitted:[/green] {result.job_id}")
+        console.print(
+            "  poll with: "
+            f"datensee status {result.job_id} --project {project} --region-gcp {region_gcp}"
+        )
 
     is_local_filesystem_output = runner == "local" and not output.startswith("gs://")
 
@@ -851,6 +881,10 @@ def retry_cmd(
 
     if result.job_id:
         console.print(f"[green]Job submitted:[/green] {result.job_id}")
+        console.print(
+            "  poll with: "
+            f"datensee status {result.job_id} --project {project} --region-gcp {region_gcp}"
+        )
 
     if result.tiles_failed_this_round is not None:
         succeeded = result.next_tiles_count - result.tiles_failed_this_round

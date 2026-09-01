@@ -159,6 +159,17 @@ Follow-up round (same review, next day):
 
 ---
 
+Remote e2e round (September 2026, bare Debian LXC with only ADC — full log in [`remote-e2e-log-2026-09-01.md`](remote-e2e-log-2026-09-01.md)):
+
+| Area | What was wrong → what changed |
+| --- | --- |
+| GCS client project | `storage.Client()` inferred the project from gcloud's `core/project`; a pip-only host (ADC, no gcloud) crashed before launch with "Project was not passed". `auth.gcs_client` resolves explicit → quota project → explicit `None`, and every GCS site uses it. |
+| Flex Template freshness | The published `0.1.0a1` launcher JAR predated the `pipeline_kind` envelope and failed inside the launcher (strict unknown-field rejection did its job). `v0.1.0a2` was re-staged. The worker harness is `beam-java21-batch`, so the JAR must stay Java 21 bytecode (`options.release = 21`). `scripts/release_template_cloudbuild.py` stages a release with Cloud Build + ADC only (no Docker, no gcloud). |
+| Failure visibility | `status` reported `JOB_STATE_FAILED` with no reason; launcher stack traces live in `<staging>/template_launches/<job>/console_logs`, not Cloud Logging. `status.failure_summary` prints the distinct ERROR job messages and that GCS path. `export` prints the `datensee status …` command after a Dataflow submit. |
+| Fan-out | The tile source (in-memory `Create` or one NDJSON file) is single-shard and Dataflow fused the fetch ParDo into it ("Parallelism will be set to 1"). `Reshuffle.viaRandomKey()` after the source. |
+| `validate gs://…` | `Path("gs://…")` made every unit "file missing". The prefix's COGs + journal are staged into a temp dir and the local checks run unchanged. |
+| Worker sizing | `--machine-type` / `--num-workers` / `--max-workers` exposed on the CLI (a `ZONE_RESOURCE_POOL_EXHAUSTED` stockout on n2-standard-4 needed `e2-standard-4`). |
+
 ## Adaptive retry — implemented
 
 The failures journal (`{output}/_failures.json`) is structured NDJSON of `FailedTileRecord` (superset of `TileCoordinate` with `error_kind`, `attempts`, timestamps, `lineage`). It carries **both** fetch failures and write-stage failures (transcode/assembly/upload, `error_kind=UNKNOWN`, message prefixed `write-stage:`). `EeErrorKind.classify(httpStatus, body)` (Java) populates the kind from the EE HV response — split-eligible signatures are gated to HTTP 400; the dead-letter side output is typed `FailedTileRecord`. `datensee retry --journal _failures.json` reads it back, splits split-eligible failures into 4 quadrant children (lineage extended with quadrant index 0–3, CRS-axis-order-independent), retries transient failures with the same bbox, and submits a fresh pipeline run via `tile_grid.tiles_file`. Default max depth is 2 (one root → 16 sub-tiles max).

@@ -15,6 +15,7 @@ Usage: ``validate_output("./output", config, pixels=True).all_passed``
 from __future__ import annotations
 
 import importlib.util
+import tempfile
 from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
@@ -26,6 +27,7 @@ from rich.table import Table
 
 from datensee.config import PipelineConfig
 from datensee.pixel.validation.units import (
+    TILE_FILENAME_RE,
     TILES_FILE_SKIP_MESSAGE,
     OutputUnit,
     expected_output_units,
@@ -98,6 +100,9 @@ class ValidationReport(BaseModel):
         n_ok = sum(1 for r in self.results if r.status != CheckStatus.FAILED)
         title = f"Validation results — {n_ok}/{len(self.results)} passed"
         return Panel(table, title=title, border_style="green" if self.all_passed else "red")
+
+
+FAILURES_FILENAME = "_failures.json"
 
 
 def _has_rasterio() -> bool:
@@ -261,7 +266,12 @@ def validate_output(
     Returns:
         ValidationReport with one result per check run.
     """
-    output = Path(output_path)
+    staged: tempfile.TemporaryDirectory[str] | None = None
+    if str(output_path).startswith("gs://"):
+        staged = _stage_gcs_output(str(output_path), config.gee_project)
+        output = Path(staged.name)
+    else:
+        output = Path(output_path)
 
     def _run(check_id: str, runner: Callable[[], CheckResult]) -> CheckResult:
         try:
@@ -273,12 +283,47 @@ def validate_output(
                 message=f"Check raised {type(exc).__name__}: {exc}",
             )
 
-    results = [_run("integrity", lambda: check_integrity(output, config))]
-    if pixels:
-        from datensee.pixel.validation.pixels import check_pixels
+    try:
+        results = [_run("integrity", lambda: check_integrity(output, config))]
+        if pixels:
+            from datensee.pixel.validation.pixels import check_pixels
 
-        project = gee_project or config.gee_project
-        results.append(
-            _run("pixels", lambda: check_pixels(output, config, sample=sample, gee_project=project))
-        )
-    return ValidationReport(results=results, output_path=str(output), config=config)
+            project = gee_project or config.gee_project
+            results.append(
+                _run(
+                    "pixels",
+                    lambda: check_pixels(output, config, sample=sample, gee_project=project),
+                )
+            )
+    finally:
+        if staged is not None:
+            staged.cleanup()
+    return ValidationReport(results=results, output_path=str(output_path), config=config)
+
+
+def _stage_gcs_output(gcs_prefix: str, project: str) -> tempfile.TemporaryDirectory[str]:
+    """Mirror a ``gs://`` output prefix into a temporary directory.
+
+    The checks are written against a local directory (``Path.exists``,
+    ``glob``, ``rasterio.open``); rather than teach every helper about
+    GCS, we stage the artifacts the checks read — output COGs and the
+    failures journal — and run the local code unchanged. Only the
+    prefix's own objects are copied, not nested "directories".
+
+    The caller owns the returned directory's lifetime.
+    """
+    from datensee.auth import gcs_client
+
+    bucket_name, _, prefix = gcs_prefix[len("gs://") :].partition("/")
+    prefix = prefix.rstrip("/")
+    listing_prefix = f"{prefix}/" if prefix else ""
+
+    staging = tempfile.TemporaryDirectory(prefix="datensee-validate-")
+    root = Path(staging.name)
+    client = gcs_client(project=project)
+    for blob in client.list_blobs(bucket_name, prefix=listing_prefix, delimiter="/"):
+        name = blob.name[len(listing_prefix) :]
+        if not name or not (TILE_FILENAME_RE.match(name) or name == FAILURES_FILENAME):
+            continue
+        blob.download_to_filename(str(root / name))
+    return staging

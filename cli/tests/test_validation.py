@@ -653,3 +653,38 @@ class TestValidateOutput:
         assert d["all_passed"] is True
         assert d["results"][0]["check_id"] == "integrity"
         assert d["results"][0]["status"] == "passed"
+
+
+# ---------------------------------------------------------------------------
+# gs:// output prefixes are staged locally, then validated with the same code
+# ---------------------------------------------------------------------------
+
+
+def test_validate_output_stages_gcs_prefix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A gs:// output is mirrored into a temp dir; the report keeps the URI."""
+    import tempfile
+
+    from datensee.pixel import validation
+
+    tiles = _make_tiles(1, 2)
+    config = _make_config(tiles, output_path="gs://bucket/exports/run")
+    mirror = tmp_path / "mirror"
+    mirror.mkdir()
+    for unit in _units(config):
+        _write_valid_unit(mirror, config, unit)
+
+    seen: dict[str, str] = {}
+
+    def fake_stage(gcs_prefix: str, project: str) -> tempfile.TemporaryDirectory[str]:
+        seen["prefix"], seen["project"] = gcs_prefix, project
+        staging = tempfile.TemporaryDirectory()
+        for path in mirror.iterdir():
+            (Path(staging.name) / path.name).write_bytes(path.read_bytes())
+        return staging
+
+    monkeypatch.setattr(validation, "_stage_gcs_output", fake_stage)
+    report = validation.validate_output("gs://bucket/exports/run", config)
+
+    assert seen == {"prefix": "gs://bucket/exports/run", "project": "test-project"}
+    assert report.output_path == "gs://bucket/exports/run"
+    assert report.all_passed, report.results[0].message

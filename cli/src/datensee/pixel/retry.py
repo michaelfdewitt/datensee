@@ -283,10 +283,10 @@ def read_journal(path: Path | str) -> list[dict]:
 
 def _download_gcs_text(gs_uri: str) -> str:
     """Download a GCS object as text (used for gs:// journals)."""
-    from google.cloud import storage as _gcs
+    from datensee.auth import gcs_client
 
     bucket_name, _, blob_path = gs_uri[len("gs://") :].partition("/")
-    client = _gcs.Client()
+    client = gcs_client()
     blob = client.bucket(bucket_name).blob(blob_path)
     if not blob.exists():
         raise FileNotFoundError(f"Journal not found: {gs_uri}")

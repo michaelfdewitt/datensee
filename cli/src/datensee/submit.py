@@ -237,6 +237,7 @@ def _submit_dataflow(
         config_uri,
         config_json.encode("utf-8"),
         credentials=credentials,
+        project=config.gee_project,
         content_type="application/json",
     )
 
@@ -423,7 +424,12 @@ def _maybe_externalize_tiles(
     console.print(f"[bold]Externalizing {config.tile_count} tiles[/bold] → {tiles_file_path}")
 
     if not dry_run:
-        _upload_tiles_ndjson(config.tile_grid.tiles, tiles_file_path, credentials=credentials)
+        _upload_tiles_ndjson(
+            config.tile_grid.tiles,
+            tiles_file_path,
+            credentials=credentials,
+            project=config.gee_project,
+        )
 
     new_grid = TileGrid(
         pixel_grid=config.tile_grid.pixel_grid,
@@ -449,13 +455,16 @@ def _upload_tiles_ndjson(
     tiles_file_path: str,
     *,
     credentials: Credentials | None = None,
+    project: str | None = None,
 ) -> None:
     """Write tile coordinates as NDJSON to local path or GCS."""
     lines = [json.dumps(tile.model_dump(), separators=(",", ":")) for tile in tiles]
     content = "\n".join(lines) + "\n"
 
     if tiles_file_path.startswith("gs://"):
-        _upload_to_gcs(tiles_file_path, content.encode("utf-8"), credentials=credentials)
+        _upload_to_gcs(
+            tiles_file_path, content.encode("utf-8"), credentials=credentials, project=project
+        )
     else:
         path = Path(tiles_file_path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -469,16 +478,17 @@ def _upload_to_gcs(
     data: bytes,
     *,
     credentials: Credentials | None = None,
+    project: str | None = None,
     content_type: str = "application/x-ndjson",
 ) -> None:
     """Upload bytes to a GCS URI using caller-supplied credentials, if any."""
-    from google.cloud import storage
+    from datensee.auth import gcs_client
 
     parts = gcs_uri.replace("gs://", "").split("/", 1)
     bucket_name = parts[0]
     blob_name = parts[1] if len(parts) > 1 else ""
 
-    client = storage.Client(credentials=credentials) if credentials else storage.Client()
+    client = gcs_client(credentials, project=project)
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
     blob.upload_from_string(data, content_type=content_type)
@@ -488,6 +498,13 @@ def _build_local_command(jar_path: Path, config_path: Path) -> list[str]:
     """Build the java invocation for the Direct runner."""
     return [
         "java",
+        # Beam's vendored protobuf/snappy touch restricted native APIs; on
+        # JDK 25 that is a WARNING per launch unless access is granted.
+        "--enable-native-access=ALL-UNNAMED",
+        # Log lines carry non-ASCII; without an explicit encoding a JVM on
+        # a host with no UTF-8 locale (bare containers) mangles them to '?'.
+        "-Dstdout.encoding=UTF-8",
+        "-Dstderr.encoding=UTF-8",
         "-jar",
         str(jar_path),
         f"--configFile={config_path}",

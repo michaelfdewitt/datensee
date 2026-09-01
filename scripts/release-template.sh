@@ -5,6 +5,8 @@
 # Usage: scripts/release-template.sh <version>
 #   e.g. scripts/release-template.sh 0.1.0a1
 #
+# Docker-less alternative (Cloud Build, ADC only): scripts/release_template_cloudbuild.py
+#
 # The version must match the [project] version in cli/pyproject.toml — the
 # Python client pins itself to gs://${BUCKET}/v${VERSION}/datensee.json by
 # default (see cli/src/datensee/template.py).

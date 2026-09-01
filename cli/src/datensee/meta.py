@@ -132,11 +132,11 @@ def build_meta(
     )
 
 
-def _gcs_blob(output_path: str, credentials: Credentials | None):
+def _gcs_blob(output_path: str, credentials: Credentials | None, project: str | None = None):
     """Resolve a GCS blob handle for the meta sidecar at ``output_path``."""
-    from google.cloud import storage as _gcs
+    from datensee.auth import gcs_client
 
-    client = _gcs.Client(credentials=credentials)
+    client = gcs_client(credentials, project=project)
     gs_uri = output_path[len("gs://") :]
     bucket_name, _, prefix = gs_uri.partition("/")
     prefix = prefix.rstrip("/")
@@ -149,6 +149,7 @@ def write_meta(
     meta: ExportMeta,
     *,
     credentials: Credentials | None = None,
+    project: str | None = None,
 ) -> None:
     """Write ``_export_meta.json`` to ``output_path``.
 
@@ -159,7 +160,7 @@ def write_meta(
     """
     payload = meta.model_dump_json(indent=2)
     if output_path.startswith("gs://"):
-        blob = _gcs_blob(output_path, credentials)
+        blob = _gcs_blob(output_path, credentials, project or meta.gee_project)
         blob.upload_from_string(payload, content_type="application/json")
         return
     out_dir = Path(output_path)

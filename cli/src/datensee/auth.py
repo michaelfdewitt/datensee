@@ -10,9 +10,14 @@ same ADC mechanism.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import google.auth
 import google.auth.credentials
 import google.auth.transport.requests
+
+if TYPE_CHECKING:
+    from google.cloud import storage
 
 _EE_SCOPE = "https://www.googleapis.com/auth/earthengine"
 _CLOUD_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
@@ -57,3 +62,25 @@ def get_access_token(scopes: list[str] | None = None) -> str:
     request = google.auth.transport.requests.Request()
     credentials.refresh(request)
     return credentials.token
+
+
+def gcs_client(
+    credentials: google.auth.credentials.Credentials | None = None,
+    project: str | None = None,
+) -> storage.Client:
+    """Build a GCS client that never relies on ambient project inference.
+
+    ``storage.Client()`` with no project falls back to the gcloud SDK's
+    ``core/project`` setting — which a host with only ADC (``pip install
+    datensee``, no gcloud) does not have, so it raises "Project was not
+    passed and could not be determined". Object reads and writes don't
+    need a project at all; we resolve one only for quota attribution.
+
+    Resolution order: explicit ``project`` → the credentials' quota
+    project (``gcloud auth application-default set-quota-project``) →
+    ``None`` (an explicit ``None`` opts out of inference).
+    """
+    from google.cloud import storage
+
+    resolved = project or getattr(credentials, "quota_project_id", None)
+    return storage.Client(project=resolved, credentials=credentials)

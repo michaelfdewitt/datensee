@@ -381,7 +381,8 @@ def export(
             submit time. Override only when you need a deterministic
             snapshot (e.g. reproducing a prior export). Workers see a
             consistent view of mutable assets across the whole job.
-        dry_run: If True, validate but don't submit.
+        dry_run: If True, validate but don't submit. The export
+            summary callback still fires; nothing is written or fetched.
         progress_callback: Optional callback(completed, total) for local
             mode progress. Ignored for Dataflow mode.
         confirm_callback: Optional callback(PipelineConfig) invoked after
@@ -615,7 +616,8 @@ def demo(
         project: GCP project ID with Earth Engine API enabled.
         output: Local directory for output tiles + VRT.
         jar: Path to the pipeline JAR (auto-detected if None).
-        dry_run: If True, validate but don't submit.
+        dry_run: If True, validate but don't submit. The export
+            summary callback still fires; nothing is written or fetched.
         progress_callback: Optional callback(completed, total) for progress.
         confirm_callback: See :func:`export`.
 
@@ -900,9 +902,9 @@ def retry(
             staged_uri = output.rstrip("/") + "/" + filename
             local_staging = Path(tempfile.mkdtemp()) / filename
             write(local_staging)
-            from google.cloud import storage as _gcs
+            from datensee.auth import gcs_client
 
-            client = _gcs.Client(credentials=credentials, project=project)
+            client = gcs_client(credentials, project=project)
             bucket_name, _, blob_path = staged_uri[len("gs://") :].partition("/")
             client.bucket(bucket_name).blob(blob_path).upload_from_filename(str(local_staging))
             return staged_uri
