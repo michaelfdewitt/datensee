@@ -355,3 +355,32 @@ def test_validate_failure_exits_nonzero(validate_setup: dict) -> None:
     validate_setup["report"].all_passed = False  # type: ignore[index]
     result = _invoke_validate(validate_setup)
     assert result.exit_code == 1
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ('openjdk version "25.0.4.1" 2026-08-18', 25),
+        ('openjdk version "21.0.4" 2024-07-16 LTS', 21),
+        ('java version "1.8.0_392"', 8),
+        ('openjdk version "17" 2021-09-14', 17),
+        ("The operation couldn't be completed. Unable to locate a Java Runtime.", None),
+    ],
+)
+def test_parse_java_major(output: str, expected: int | None) -> None:
+    from datensee.submit import _parse_java_major
+
+    assert _parse_java_major(output) == expected
+
+
+def test_require_java_rejects_old_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess
+
+    from datensee import submit as submit_mod
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr='openjdk version "11.0.2"')
+
+    monkeypatch.setattr(submit_mod.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match="Java 11 found .* needs Java 21"):
+        submit_mod._require_java()

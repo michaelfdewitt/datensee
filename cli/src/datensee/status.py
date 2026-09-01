@@ -24,6 +24,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from typing import Any
 
 import google.auth.exceptions
 import google.auth.transport.requests
@@ -77,6 +78,10 @@ class JobInfo:
     output_tiles_written: int | None = None
     tiles_written: int | None = None
     compute_tiles_assembled: int | None = None
+    # Why a FAILED job failed, from :func:`failure_summary`. Filled on the
+    # terminal tick only, so callback consumers (notebooks, services) get
+    # the reason structurally instead of as console output.
+    failure_reasons: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +366,8 @@ def poll_job(
 
     def tick() -> JobInfo:
         info = _fetch_job_info(url, credentials)
+        if info.state == JobState.FAILED:
+            info.failure_reasons = failure_summary(job_id, project, region, credentials)
         reason = _watchdog_check(config, state, info, tile_count)
         if reason is not None and info.state not in TERMINAL_STATES:
             console.print(f"\n[red]Watchdog cancelling job {job_id}:[/red] {reason}")
@@ -389,14 +396,12 @@ def poll_job(
                     break
                 time.sleep(poll_interval_seconds)
 
-    if info.state == JobState.FAILED:
-        for line in failure_summary(job_id, project, region, credentials):
-            console.print(f"[red]  {line}[/red]")
-
     return info.state
 
 
-_LAUNCHER_LOG_MARKER = "Console log from launcher will be available at "
+_LAUNCHER_FAILURE_MARKER = "launcher container"
+"""Unversioned Dataflow prose; the only in-band signal that a Flex Template
+launch (not a worker) failed. JobMessage carries no structured cause."""
 
 
 def failure_summary(
@@ -409,52 +414,80 @@ def failure_summary(
 ) -> list[str]:
     """Explain a failed Dataflow job from its job messages.
 
-    Returns the distinct ERROR-importance messages (newest last, capped at
-    ``max_errors``) plus — when the failure happened inside the Flex
-    Template launcher, whose stack trace never reaches Cloud Logging —
-    the GCS path of the launcher's console log. Empty when the messages
-    endpoint is unreachable; the caller has already reported the state.
+    Dataflow repeats some errors every 30 s with a fresh instance name
+    (worker-pool stockouts), and emits both a bare ``Workflow failed.``
+    and a ``Workflow failed. Causes: …`` — so messages are collapsed on
+    their first sentence, keeping the most detailed text per group.
+
+    Args:
+        job_id: Dataflow job ID.
+        project: GCP project the job ran in.
+        region: Dataflow region.
+        credentials: Credentials for the Dataflow API.
+        max_errors: Cap on distinct error lines returned (newest kept).
+
+    Returns:
+        ``"Dataflow: <message>"`` lines, newest last, plus — when the job
+        died inside the Flex Template launcher, whose stack trace never
+        reaches Cloud Logging — the GCS path of the launcher console log.
+        Empty when the API is unreachable; the caller already knows the
+        state.
     """
-    url = _DATAFLOW_API.format(project=project, region=region, job_id=job_id) + "/messages"
+    base = _DATAFLOW_API.format(project=project, region=region, job_id=job_id)
     try:
-        response = _authorized_request(
-            "GET",
-            url,
-            credentials,
-            params={"minimumImportance": "JOB_MESSAGE_BASIC", "pageSize": "500"},
-        )
-        messages = response.json().get("jobMessages", [])
+        messages = _all_job_messages(base, credentials, minimum_importance="JOB_MESSAGE_ERROR")
     except (httpx.HTTPError, google.auth.exceptions.GoogleAuthError, ValueError):
         return []
 
-    texts = [str(m.get("messageText", "")) for m in messages]
-    errors: list[str] = []
-    for text in (
-        t
-        for m, t in zip(messages, texts, strict=True)
-        if m.get("messageImportance") == "JOB_MESSAGE_ERROR"
-    ):
-        # Dataflow repeats e.g. the stockout message every 30 s with a new
-        # instance name; collapse on the first sentence.
-        head = text.split(". ", 1)[0]
-        if not any(e.startswith(head) for e in errors):
-            errors.append(text.strip())
+    grouped: dict[str, str] = {}
+    for message in messages:
+        text = str(message.get("messageText", "")).strip()
+        if not text:
+            continue
+        key = text.split(". ", 1)[0].rstrip(".")
+        if len(text) >= len(grouped.get(key, "")):
+            grouped[key] = text
+    errors = list(grouped.values())
     lines = [f"Dataflow: {e}" for e in errors[-max_errors:]]
 
-    if any("launcher container" in e for e in errors):
-        launcher_log = next(
-            (
-                t[len(_LAUNCHER_LOG_MARKER) :].strip(" .")
-                for t in texts
-                if t.startswith(_LAUNCHER_LOG_MARKER)
-            ),
-            None,
-        )
-        if launcher_log:
+    if any(_LAUNCHER_FAILURE_MARKER in e for e in errors):
+        staging = _staging_location(base, credentials)
+        if staging:
             lines.append(
-                f"Launcher stack trace (not in Cloud Logging): gcloud storage cat {launcher_log}"
+                "Launcher stack trace (not in Cloud Logging): gcloud storage cat "
+                f"{staging.rstrip('/')}/template_launches/{job_id}/console_logs"
             )
     return lines
+
+
+def _all_job_messages(
+    base_url: str, credentials: Credentials, *, minimum_importance: str
+) -> list[dict[str, Any]]:
+    """Page through ``jobs.messages.list`` (ascending time) and return every message."""
+    messages: list[dict[str, Any]] = []
+    page_token: str | None = None
+    while True:
+        params = {"minimumImportance": minimum_importance, "pageSize": "100"}
+        if page_token:
+            params["pageToken"] = page_token
+        body = _authorized_request("GET", base_url + "/messages", credentials, params=params).json()
+        messages.extend(body.get("jobMessages", []))
+        page_token = body.get("nextPageToken")
+        if not page_token:
+            return messages
+
+
+def _staging_location(base_url: str, credentials: Credentials) -> str | None:
+    """The job's ``stagingLocation`` pipeline option — where the launcher writes its log."""
+    try:
+        job = _authorized_request(
+            "GET", base_url, credentials, params={"view": "JOB_VIEW_ALL"}
+        ).json()
+    except (httpx.HTTPError, google.auth.exceptions.GoogleAuthError, ValueError):
+        return None
+    options = ((job.get("environment") or {}).get("sdkPipelineOptions") or {}).get("options") or {}
+    value = options.get("stagingLocation")
+    return str(value) if value else None
 
 
 def _fetch_job_info(url: str, credentials: Credentials) -> JobInfo:
@@ -618,4 +651,6 @@ def _render_status_table(job_id: str, info: JobInfo) -> Table:
     if info.failures_written is not None and info.failures_written > 0:
         table.add_row("Failures", f"[yellow]{info.failures_written}[/yellow]")
 
+    for line in info.failure_reasons:
+        table.add_row("Reason", f"[red]{line}[/red]")
     return table

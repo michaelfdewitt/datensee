@@ -83,6 +83,10 @@ tasks.shadowJar {
     mergeServiceFiles()
     manifest {
         attributes["Main-Class"] = "com.datensee.DatensEEPipeline"
+        // Beam's vendored protobuf/snappy call restricted native APIs; on
+        // JDK 24+ that is a per-launch WARNING unless the JAR grants
+        // access here. Ignored by the Java 21 Dataflow workers.
+        attributes["Enable-Native-Access"] = "ALL-UNNAMED"
     }
 }
 

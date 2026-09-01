@@ -675,8 +675,10 @@ def test_validate_output_stages_gcs_prefix(tmp_path: Path, monkeypatch: pytest.M
 
     seen: dict[str, str] = {}
 
-    def fake_stage(gcs_prefix: str, project: str) -> tempfile.TemporaryDirectory[str]:
-        seen["prefix"], seen["project"] = gcs_prefix, project
+    def fake_stage(
+        gcs_prefix: str, *, credentials: object, max_bytes: int
+    ) -> tempfile.TemporaryDirectory[str]:
+        seen["prefix"], seen["max_bytes"] = gcs_prefix, max_bytes
         staging = tempfile.TemporaryDirectory()
         for path in mirror.iterdir():
             (Path(staging.name) / path.name).write_bytes(path.read_bytes())
@@ -685,6 +687,40 @@ def test_validate_output_stages_gcs_prefix(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.setattr(validation, "_stage_gcs_output", fake_stage)
     report = validation.validate_output("gs://bucket/exports/run", config)
 
-    assert seen == {"prefix": "gs://bucket/exports/run", "project": "test-project"}
+    assert seen == {
+        "prefix": "gs://bucket/exports/run",
+        "max_bytes": validation.DEFAULT_MAX_STAGE_BYTES,
+    }
     assert report.output_path == "gs://bucket/exports/run"
     assert report.all_passed, report.results[0].message
+
+
+def test_validate_output_skips_gcs_staging_when_tiles_are_externalized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both checks SKIP for tiles_file configs — so nothing must be downloaded."""
+    from datensee.pixel import validation
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise AssertionError("staging must not run")
+
+    monkeypatch.setattr(validation, "_stage_gcs_output", boom)
+    report = validation.validate_output(
+        "gs://bucket/big", _make_tiles_file_config("gs://bucket/big"), pixels=True
+    )
+    assert [r.status for r in report.results] == [CheckStatus.SKIPPED, CheckStatus.SKIPPED]
+
+
+def test_validate_output_reports_staging_failure_as_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datensee.pixel import validation
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise PermissionError("403 storage.objects.list denied")
+
+    monkeypatch.setattr(validation, "_stage_gcs_output", forbidden)
+    report = validation.validate_output("gs://bucket/run", _make_config(_make_tiles(1, 1)))
+    assert report.results[0].status == CheckStatus.ERROR
+    assert "403" in report.results[0].message
+    assert not report.all_passed

@@ -36,7 +36,8 @@ git commit -am "chore: release 0.1.0a2"
 # 2. stage the Flex Template BEFORE the wheel exists on PyPI
 scripts/release-template.sh 0.1.0a2
 #    (no Docker/gcloud at hand? scripts/release_template_cloudbuild.py 0.1.0a2
-#     does the same via Cloud Build with just ADC — ~60 s)
+#     does the same via Cloud Build with just ADC — ~60 s; it refuses a
+#     version that differs from pyproject unless --allow-version-mismatch)
 #    (Python-only release, Java unchanged? copying the previous spec is enough:
 #     gcloud storage cp gs://datensee-templates/v0.1.0a1/datensee.json \
 #                       gs://datensee-templates/v0.1.0a2/datensee.json)

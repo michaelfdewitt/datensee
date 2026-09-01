@@ -87,6 +87,14 @@ def main(
 # ---------------------------------------------------------------------------
 
 
+def _announce_job(job_id: str, project: str, region_gcp: str) -> None:
+    """Print the submitted job id and the exact command that polls it."""
+    console.print(f"[green]Job submitted:[/green] {job_id}")
+    console.print(
+        f"  poll with: datensee status {job_id} --project {project} --region-gcp {region_gcp}"
+    )
+
+
 @app.command()
 def demo(
     project: Annotated[
@@ -327,11 +335,7 @@ def export(
         return
 
     if result.job_id:
-        console.print(f"[green]Job submitted:[/green] {result.job_id}")
-        console.print(
-            "  poll with: "
-            f"datensee status {result.job_id} --project {project} --region-gcp {region_gcp}"
-        )
+        _announce_job(result.job_id, project, region_gcp)
 
     is_local_filesystem_output = runner == "local" and not output.startswith("gs://")
 
@@ -540,6 +544,30 @@ def jar_build_cmd() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _load_pipeline_config(reference: str) -> PipelineConfig:
+    """Load a pipeline config from a local path or a ``gs://`` URI."""
+    if reference.startswith("gs://"):
+        from datensee.auth import gcs_client, split_gcs_uri
+
+        bucket, blob_name = split_gcs_uri(reference)
+        blob = gcs_client().bucket(bucket).blob(blob_name)
+        if not blob.exists():
+            raise FileNotFoundError(
+                f"No pipeline config at {reference}. Pass --config with the file the export "
+                "wrote (Dataflow mode stages it next to the output; local mode writes it "
+                "into the output directory)."
+            )
+        return PipelineConfig.model_validate_json(blob.download_as_text())
+    path = Path(reference)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"No pipeline config at {path}. Pass --config with the file the export wrote "
+            "(local mode writes OUTPUT/_pipeline-config.json; older outputs need the "
+            "temp-file path printed at submit time)."
+        )
+    return PipelineConfig.read_json(path)
+
+
 @app.command("validate")
 def validate_cmd(
     output_path: Annotated[
@@ -547,15 +575,14 @@ def validate_cmd(
         typer.Argument(help="Output directory (local) or GCS prefix to validate."),
     ],
     config_file: Annotated[
-        Path,
+        str | None,
         typer.Option(
             "--config",
             "-c",
-            help="Pipeline config JSON file that produced the output.",
-            exists=True,
-            readable=True,
+            help="Pipeline config JSON that produced the output (local path or gs:// URI). "
+            "Defaults to OUTPUT_PATH/_pipeline-config.json, which both runners write.",
         ),
-    ],
+    ] = None,
     pixels: Annotated[
         bool,
         typer.Option(
@@ -589,8 +616,14 @@ def validate_cmd(
     pipeline chain at the cost of a few EECU-seconds.
     """
     from datensee.pixel.validation import validate_output
+    from datensee.submit import PIPELINE_CONFIG_FILENAME
 
-    config = PipelineConfig.read_json(config_file)
+    config_ref = config_file or f"{output_path.rstrip('/')}/{PIPELINE_CONFIG_FILENAME}"
+    try:
+        config = _load_pipeline_config(config_ref)
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=2) from exc
 
     report = validate_output(
         output_path,
@@ -694,6 +727,22 @@ def retry_cmd(
     temp_location: Annotated[
         str | None,
         typer.Option("--temp-location", help="GCS URI for Dataflow temp files."),
+    ] = None,
+    machine_type: Annotated[
+        str | None,
+        typer.Option(
+            "--machine-type",
+            help="Dataflow worker machine type (default n2-standard-4); e.g. e2-standard-4 "
+            "when a zone reports ZONE_RESOURCE_POOL_EXHAUSTED.",
+        ),
+    ] = None,
+    num_workers: Annotated[
+        int | None,
+        typer.Option("--num-workers", min=1, help="Initial Dataflow worker count."),
+    ] = None,
+    max_workers: Annotated[
+        int | None,
+        typer.Option("--max-workers", min=1, help="Dataflow autoscaling ceiling (default 100)."),
     ] = None,
     max_depth: Annotated[
         int,
@@ -804,6 +853,9 @@ def retry_cmd(
                 tile_size=tile_size,
                 output_tile_size=output_tile_size,
                 temp_location=temp_location,
+                machine_type=machine_type,
+                num_workers=num_workers,
+                max_workers=max_workers,
                 jar=jar,
                 max_depth=max_depth,
             )
@@ -851,6 +903,9 @@ def retry_cmd(
             runner=runner,  # type: ignore[arg-type]
             region_gcp=region_gcp,
             temp_location=temp_location,
+            machine_type=machine_type,
+            num_workers=num_workers,
+            max_workers=max_workers,
             jar=jar,
             max_depth=max_depth,
             dry_run=dry_run,
@@ -880,11 +935,9 @@ def retry_cmd(
         return
 
     if result.job_id:
-        console.print(f"[green]Job submitted:[/green] {result.job_id}")
-        console.print(
-            "  poll with: "
-            f"datensee status {result.job_id} --project {project} --region-gcp {region_gcp}"
-        )
+        # --project is optional for retry (the meta sidecar supplies it);
+        # quote the project the round actually ran under.
+        _announce_job(result.job_id, result.gee_project or project or "<project>", region_gcp)
 
     if result.tiles_failed_this_round is not None:
         succeeded = result.next_tiles_count - result.tiles_failed_this_round

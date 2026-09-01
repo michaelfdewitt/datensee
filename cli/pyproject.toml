@@ -1,6 +1,6 @@
 [project]
 name = "datensee"
-version = "0.1.0a2"
+version = "0.1.0a3"
 description = "DatensEE: Parallelize Google Earth Engine exports via Cloud Dataflow"
 readme = "README.md"
 requires-python = ">=3.12"

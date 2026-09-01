@@ -729,6 +729,9 @@ class RetryResult(BaseModel):
     carryover_count: int = 0
     stats: dict[str, int] = {}
     tiles_failed_this_round: int | None = None
+    gee_project: str | None = None
+    """The project the round ran under — resolved from the meta sidecar when
+    the caller passed none, so CLI hints can quote it."""
 
 
 def retry(
@@ -746,6 +749,9 @@ def retry(
     region_gcp: str = "us-central1",
     temp_location: str | None = None,
     labels: dict[str, str] | None = None,
+    machine_type: str | None = None,
+    num_workers: int | None = None,
+    max_workers: int | None = None,
     jar: Path | str | None = None,
     max_depth: int = 2,
     dry_run: bool = False,
@@ -876,7 +882,7 @@ def retry(
         else:
             journal = Path(output) / "_failures.json"
 
-    records = read_journal(journal)
+    records = read_journal(journal, credentials=credentials)
 
     # Splitting is legal for every export shape: retry rounds run with
     # merge_existing_output, so split children overlay their parent's
@@ -888,6 +894,7 @@ def retry(
             next_tiles_count=0,
             carryover_count=len(plan.carryover),
             stats=plan.stats,
+            gee_project=project,
         )
 
     # Stage the next-round tiles file and, when this round has
@@ -899,14 +906,13 @@ def retry(
     # asynchronous journal writer.
     def _stage(filename: str, write: Callable[[Path], None]) -> str:
         if output.startswith("gs://"):
-            staged_uri = output.rstrip("/") + "/" + filename
-            local_staging = Path(tempfile.mkdtemp()) / filename
-            write(local_staging)
-            from datensee.auth import gcs_client
+            from datensee.submit import _upload_to_gcs
 
-            client = gcs_client(credentials, project=project)
-            bucket_name, _, blob_path = staged_uri[len("gs://") :].partition("/")
-            client.bucket(bucket_name).blob(blob_path).upload_from_filename(str(local_staging))
+            staged_uri = output.rstrip("/") + "/" + filename
+            with tempfile.TemporaryDirectory() as scratch:
+                local_staging = Path(scratch) / filename
+                write(local_staging)
+                _upload_to_gcs(staged_uri, local_staging.read_bytes(), credentials=credentials)
             return staged_uri
         out_dir = Path(output)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -931,6 +937,16 @@ def retry(
 
     # Build pipeline config with tiles_file (no inline tiles).
     if runner == "dataflow":
+        # Same override surface as export(): a retry round after a
+        # ZONE_RESOURCE_POOL_EXHAUSTED stockout must be able to switch
+        # machine family too.
+        df_overrides: dict[str, Any] = {}
+        if machine_type is not None:
+            df_overrides["machine_type"] = machine_type
+        if num_workers is not None:
+            df_overrides["num_workers"] = num_workers
+        if max_workers is not None:
+            df_overrides["max_workers"] = max_workers
         runner_config = RunnerConfig(
             mode="dataflow",
             dataflow=DataflowRunnerConfig(
@@ -940,6 +956,7 @@ def retry(
                 staging_location=(temp_location or output.rstrip("/") + "/_tmp").rstrip("/")
                 + "/staging",
                 labels=labels,
+                **df_overrides,
             ),
         )
     else:
@@ -994,6 +1011,7 @@ def retry(
 
     if dry_run:
         return RetryResult(
+            gee_project=project,
             next_tiles_count=len(plan.next_tiles),
             carryover_count=len(plan.carryover),
             stats=plan.stats,

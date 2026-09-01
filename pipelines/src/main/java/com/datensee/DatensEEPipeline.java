@@ -35,7 +35,6 @@ import org.apache.beam.sdk.options.PipelineOptionsFactory;
 import org.apache.beam.sdk.transforms.Create;
 import org.apache.beam.sdk.transforms.Flatten;
 import org.apache.beam.sdk.transforms.ParDo;
-import org.apache.beam.sdk.transforms.Reshuffle;
 import org.apache.beam.sdk.values.PCollection;
 import org.apache.beam.sdk.values.PCollectionList;
 import org.apache.beam.sdk.values.PCollectionTuple;
@@ -113,14 +112,6 @@ public final class DatensEEPipeline {
                 Create.of(config.tileGrid().tiles())
             );
         }
-
-        // Fusion break. Both sources above are single-shard (an in-memory
-        // list, or one small NDJSON file), and Dataflow fuses the fetch
-        // ParDo into the read stage — so without this the whole fetch
-        // fan-out would run at the source's parallelism ("Shuffle session
-        // has a fixed number of shards … Parallelism will be set to 1").
-        // Redistributing by random key lets every worker pull tiles.
-        tiles = tiles.apply("FanOutTiles", Reshuffle.viaRandomKey());
 
         // --- Fetch tiles with dead-letter support ---
         PCollectionTuple fetchResult = tiles.apply(

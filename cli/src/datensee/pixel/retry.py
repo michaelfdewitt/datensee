@@ -26,8 +26,12 @@ import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from datensee.pixel.config import TileCoordinate
+
+if TYPE_CHECKING:
+    from google.auth.credentials import Credentials
 
 # Quadrant index → (x_low, y_low) flags.
 # 0=x_low/y_low, 1=x_high/y_low, 2=x_low/y_high, 3=x_high/y_high.
@@ -266,10 +270,10 @@ def plan_retry(
     return RetryPlan(next_tiles=next_tiles, carryover=carryover, stats=stats)
 
 
-def read_journal(path: Path | str) -> list[dict]:
+def read_journal(path: Path | str, *, credentials: Credentials | None = None) -> list[dict]:
     """Load an NDJSON failures journal from a local path or ``gs://`` URI."""
     if isinstance(path, str) and path.startswith("gs://"):
-        text = _download_gcs_text(path)
+        text = _download_gcs_text(path, credentials)
     else:
         text = Path(path).read_text(encoding="utf-8")
     records: list[dict] = []
@@ -281,12 +285,12 @@ def read_journal(path: Path | str) -> list[dict]:
     return records
 
 
-def _download_gcs_text(gs_uri: str) -> str:
+def _download_gcs_text(gs_uri: str, credentials: Credentials | None = None) -> str:
     """Download a GCS object as text (used for gs:// journals)."""
-    from datensee.auth import gcs_client
+    from datensee.auth import gcs_client, split_gcs_uri
 
-    bucket_name, _, blob_path = gs_uri[len("gs://") :].partition("/")
-    client = gcs_client()
+    bucket_name, blob_path = split_gcs_uri(gs_uri)
+    client = gcs_client(credentials)
     blob = client.bucket(bucket_name).blob(blob_path)
     if not blob.exists():
         raise FileNotFoundError(f"Journal not found: {gs_uri}")

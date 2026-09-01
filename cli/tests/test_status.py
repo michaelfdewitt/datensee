@@ -373,7 +373,7 @@ class TestPollJob:
         )
         # A FAILED terminal state triggers one messages lookup for the reason.
         httpx_mock.add_response(
-            url=f"{_BASE_URL}/messages?minimumImportance=JOB_MESSAGE_BASIC&pageSize=500",
+            url=f"{_BASE_URL}/messages?minimumImportance=JOB_MESSAGE_ERROR&pageSize=100",
             json={
                 "jobMessages": [
                     {"messageImportance": "JOB_MESSAGE_ERROR", "messageText": "Workflow failed."}
@@ -737,53 +737,74 @@ class TestFailureSummary:
 
     _MESSAGES_URL = (
         "https://dataflow.googleapis.com/v1b3/projects/p/locations/r/jobs/j/messages"
-        "?minimumImportance=JOB_MESSAGE_BASIC&pageSize=500"
+        "?minimumImportance=JOB_MESSAGE_ERROR&pageSize=100"
+    )
+    _JOB_URL = (
+        "https://dataflow.googleapis.com/v1b3/projects/p/locations/r/jobs/j?view=JOB_VIEW_ALL"
     )
 
-    def _stub(self, httpx_mock: HTTPXMock, messages: list[dict[str, str]]) -> None:
-        httpx_mock.add_response(url=self._MESSAGES_URL, json={"jobMessages": messages})
+    @staticmethod
+    def _error(text: str) -> dict[str, str]:
+        return {"messageImportance": "JOB_MESSAGE_ERROR", "messageText": text}
 
-    def test_collapses_repeated_errors_and_keeps_newest(self, httpx_mock: HTTPXMock) -> None:
+    def test_collapses_repeats_and_keeps_the_most_detailed(self, httpx_mock: HTTPXMock) -> None:
         from datensee.status import failure_summary
 
         stockout = (
             "Startup of the worker pool in r failed to bring up any of the desired 4 workers. "
             "ZONE_RESOURCE_POOL_EXHAUSTED: Instance 'harness-{}' creation failed."
         )
-        self._stub(
-            httpx_mock,
-            [
-                {"messageImportance": "JOB_MESSAGE_ERROR", "messageText": stockout.format("a")},
-                {"messageImportance": "JOB_MESSAGE_ERROR", "messageText": stockout.format("b")},
-                {"messageImportance": "JOB_MESSAGE_ERROR", "messageText": "Workflow failed."},
-                {"messageImportance": "JOB_MESSAGE_WARNING", "messageText": "S01 failed."},
-            ],
+        httpx_mock.add_response(
+            url=self._MESSAGES_URL,
+            json={
+                "jobMessages": [
+                    self._error(stockout.format("a")),
+                    self._error("\n" + stockout.format("b")),
+                    self._error("Workflow failed."),
+                    self._error("Workflow failed. Causes: S01:FetchTiles failed."),
+                ]
+            },
         )
         lines = failure_summary("j", "p", "r", FakeCredentials())
-        assert len(lines) == 2
-        assert lines[0].startswith("Dataflow: Startup of the worker pool")
-        assert lines[1] == "Dataflow: Workflow failed."
+        assert lines == [
+            "Dataflow: " + stockout.format("b"),
+            "Dataflow: Workflow failed. Causes: S01:FetchTiles failed.",
+        ]
+
+    def test_follows_pagination_to_reach_the_terminal_error(self, httpx_mock: HTTPXMock) -> None:
+        from datensee.status import failure_summary
+
+        httpx_mock.add_response(
+            url=self._MESSAGES_URL,
+            json={"jobMessages": [self._error("Early error.")], "nextPageToken": "t2"},
+        )
+        httpx_mock.add_response(
+            url=self._MESSAGES_URL + "&pageToken=t2",
+            json={"jobMessages": [self._error("Workflow failed.")]},
+        )
+        assert failure_summary("j", "p", "r", FakeCredentials()) == [
+            "Dataflow: Early error.",
+            "Dataflow: Workflow failed.",
+        ]
 
     def test_launcher_failure_points_at_console_log(self, httpx_mock: HTTPXMock) -> None:
         from datensee.status import failure_summary
 
-        self._stub(
-            httpx_mock,
-            [
-                {
-                    "messageImportance": "JOB_MESSAGE_BASIC",
-                    "messageText": (
-                        "Console log from launcher will be available at "
-                        "gs://b/tmp/staging/template_launches/j/console_logs."
-                    ),
-                },
-                {
-                    "messageImportance": "JOB_MESSAGE_ERROR",
-                    "messageText": (
-                        "Error occurred in the launcher container: Template launch failed."
-                    ),
-                },
-            ],
+        httpx_mock.add_response(
+            url=self._MESSAGES_URL,
+            json={
+                "jobMessages": [
+                    self._error("Error occurred in the launcher container: Template launch failed.")
+                ]
+            },
+        )
+        httpx_mock.add_response(
+            url=self._JOB_URL,
+            json={
+                "environment": {
+                    "sdkPipelineOptions": {"options": {"stagingLocation": "gs://b/tmp/staging"}}
+                }
+            },
         )
         lines = failure_summary("j", "p", "r", FakeCredentials())
         assert lines[-1] == (
@@ -796,3 +817,24 @@ class TestFailureSummary:
 
         httpx_mock.add_response(url=self._MESSAGES_URL, status_code=503)
         assert failure_summary("j", "p", "r", FakeCredentials()) == []
+
+    def test_poll_job_attaches_reasons_to_job_info(self, httpx_mock: HTTPXMock) -> None:
+        """Callback consumers get the reason structurally, not as console output."""
+        httpx_mock.add_response(
+            url=f"{_BASE_URL}?view=JOB_VIEW_ALL", json={"currentState": "JOB_STATE_FAILED"}
+        )
+        httpx_mock.add_response(
+            url=f"{_BASE_URL}/messages?minimumImportance=JOB_MESSAGE_ERROR&pageSize=100",
+            json={"jobMessages": [self._error("Workflow failed.")]},
+        )
+        seen: list[JobInfo] = []
+        state = poll_job(
+            "job-123",
+            "test-project",
+            "us-central1",
+            FakeCredentials(),
+            poll_interval_seconds=0,
+            status_callback=seen.append,
+        )
+        assert state == JobState.FAILED
+        assert seen[-1].failure_reasons == ["Dataflow: Workflow failed."]

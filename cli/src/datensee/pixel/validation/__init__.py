@@ -14,12 +14,13 @@ Usage: ``validate_output("./output", config, pixels=True).all_passed``
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import tempfile
 from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 from rich.panel import Panel
@@ -27,6 +28,7 @@ from rich.table import Table
 
 from datensee.config import PipelineConfig
 from datensee.pixel.validation.units import (
+    FAILURES_FILENAME,
     TILE_FILENAME_RE,
     TILES_FILE_SKIP_MESSAGE,
     OutputUnit,
@@ -35,6 +37,9 @@ from datensee.pixel.validation.units import (
     unit_filename,
     unit_keys_on_disk,
 )
+
+if TYPE_CHECKING:
+    from google.auth.credentials import Credentials
 
 _MIN_TILE_BYTES = 1024
 _ORIGIN_TOLERANCE = 1e-6
@@ -102,7 +107,8 @@ class ValidationReport(BaseModel):
         return Panel(table, title=title, border_style="green" if self.all_passed else "red")
 
 
-FAILURES_FILENAME = "_failures.json"
+DEFAULT_MAX_STAGE_BYTES = 8 * 1024**3
+"""Largest gs:// output ``validate`` will mirror locally by default (8 GiB)."""
 
 
 def _has_rasterio() -> bool:
@@ -252,26 +258,31 @@ def validate_output(
     pixels: bool = False,
     sample: int = 20,
     gee_project: str | None = None,
+    credentials: Credentials | None = None,
+    max_stage_bytes: int = DEFAULT_MAX_STAGE_BYTES,
 ) -> ValidationReport:
     """Run output checks against pipeline output and return a structured report.
 
     Args:
-        output_path: Directory containing the exported tile GeoTIFFs.
+        output_path: Directory (or ``gs://`` prefix) containing the exported
+            tile GeoTIFFs. A GCS prefix is mirrored into a temporary
+            directory first — see :func:`_stage_gcs_output`.
         config: Pipeline config that produced the output.
         pixels: Also run the ``pixels`` check (EE HV API re-fetch — costs EECUs).
         sample: Max compute tiles the ``pixels`` check re-fetches.
         gee_project: GCP project for reference fetches; defaults to the
             config's ``gee_project``.
+        credentials: Credentials for reading a ``gs://`` output. ``None``
+            uses Application Default Credentials.
+        max_stage_bytes: Refuse to mirror a ``gs://`` output larger than
+            this (the checks are local-file based; a multi-TB export is
+            not something to pull into ``$TMPDIR``).
 
     Returns:
-        ValidationReport with one result per check run.
+        ValidationReport with one result per check run. Staging failures
+        surface as an ``ERROR`` integrity result, never as an exception.
     """
-    staged: tempfile.TemporaryDirectory[str] | None = None
-    if str(output_path).startswith("gs://"):
-        staged = _stage_gcs_output(str(output_path), config.gee_project)
-        output = Path(staged.name)
-    else:
-        output = Path(output_path)
+    uri = str(output_path)
 
     def _run(check_id: str, runner: Callable[[], CheckResult]) -> CheckResult:
         try:
@@ -283,7 +294,38 @@ def validate_output(
                 message=f"Check raised {type(exc).__name__}: {exc}",
             )
 
-    try:
+    def _report(results: list[CheckResult]) -> ValidationReport:
+        return ValidationReport(results=results, output_path=uri, config=config)
+
+    # Externalized tile lists make both checks SKIP — decide that before
+    # touching GCS, or a large Dataflow export gets mirrored for nothing.
+    if uri.startswith("gs://") and expected_output_units(config) is None:
+        skipped = [
+            CheckResult(
+                check_id=check_id, status=CheckStatus.SKIPPED, message=TILES_FILE_SKIP_MESSAGE
+            )
+            for check_id in (["integrity", "pixels"] if pixels else ["integrity"])
+        ]
+        return _report(skipped)
+
+    with contextlib.ExitStack() as stack:
+        if uri.startswith("gs://"):
+            try:
+                staging = _stage_gcs_output(uri, credentials=credentials, max_bytes=max_stage_bytes)
+            except Exception as exc:
+                return _report(
+                    [
+                        CheckResult(
+                            check_id="integrity",
+                            status=CheckStatus.ERROR,
+                            message=f"Could not stage {uri}: {type(exc).__name__}: {exc}",
+                        )
+                    ]
+                )
+            output = Path(stack.enter_context(staging))
+        else:
+            output = Path(uri)
+
         results = [_run("integrity", lambda: check_integrity(output, config))]
         if pixels:
             from datensee.pixel.validation.pixels import check_pixels
@@ -295,35 +337,70 @@ def validate_output(
                     lambda: check_pixels(output, config, sample=sample, gee_project=project),
                 )
             )
-    finally:
-        if staged is not None:
-            staged.cleanup()
-    return ValidationReport(results=results, output_path=str(output_path), config=config)
+    return _report(results)
 
 
-def _stage_gcs_output(gcs_prefix: str, project: str) -> tempfile.TemporaryDirectory[str]:
+def _stage_gcs_output(
+    gcs_prefix: str,
+    *,
+    credentials: Credentials | None,
+    max_bytes: int,
+    parallelism: int = 8,
+) -> tempfile.TemporaryDirectory[str]:
     """Mirror a ``gs://`` output prefix into a temporary directory.
 
     The checks are written against a local directory (``Path.exists``,
     ``glob``, ``rasterio.open``); rather than teach every helper about
-    GCS, we stage the artifacts the checks read — output COGs and the
-    failures journal — and run the local code unchanged. Only the
-    prefix's own objects are copied, not nested "directories".
+    GCS, we stage what they read — the output COGs and the failures
+    journal — and run the local code unchanged. Only the prefix's own
+    objects are copied (no nested "directories"); the listing is one
+    request, the downloads run in parallel.
 
-    The caller owns the returned directory's lifetime.
+    Args:
+        gcs_prefix: ``gs://bucket/prefix`` of the export.
+        credentials: Credentials for the storage client (``None`` = ADC).
+        max_bytes: Refuse (``ValueError``) when the COGs exceed this size.
+        parallelism: Concurrent downloads.
+
+    Returns:
+        The staging directory; the caller owns its lifetime. On any
+        failure the partially filled directory is removed before the
+        exception propagates.
     """
-    from datensee.auth import gcs_client
+    from concurrent.futures import ThreadPoolExecutor
 
-    bucket_name, _, prefix = gcs_prefix[len("gs://") :].partition("/")
-    prefix = prefix.rstrip("/")
-    listing_prefix = f"{prefix}/" if prefix else ""
+    from datensee.auth import gcs_client, split_gcs_uri
+
+    bucket_name, prefix = split_gcs_uri(gcs_prefix)
+    listing_prefix = f"{prefix.rstrip('/')}/" if prefix.strip("/") else ""
+
+    client = gcs_client(credentials)
+    wanted = [
+        blob
+        for blob in client.list_blobs(bucket_name, prefix=listing_prefix, delimiter="/")
+        if (name := blob.name[len(listing_prefix) :])
+        and (TILE_FILENAME_RE.match(name) or name == FAILURES_FILENAME)
+    ]
+    total = sum(blob.size or 0 for blob in wanted)
+    if total > max_bytes:
+        raise ValueError(
+            f"{len(wanted)} files / {total / 1e9:.1f} GB under {gcs_prefix}; validate mirrors "
+            f"a gs:// output locally and refuses above {max_bytes / 1e9:.0f} GB. Run it on a "
+            "host with the disk for it (max_stage_bytes=…), or validate the local run."
+        )
 
     staging = tempfile.TemporaryDirectory(prefix="datensee-validate-")
     root = Path(staging.name)
-    client = gcs_client(project=project)
-    for blob in client.list_blobs(bucket_name, prefix=listing_prefix, delimiter="/"):
-        name = blob.name[len(listing_prefix) :]
-        if not name or not (TILE_FILENAME_RE.match(name) or name == FAILURES_FILENAME):
-            continue
-        blob.download_to_filename(str(root / name))
+    try:
+        with ThreadPoolExecutor(max_workers=parallelism) as pool:
+            for _ in pool.map(
+                lambda blob: blob.download_to_filename(
+                    str(root / blob.name[len(listing_prefix) :])
+                ),
+                wanted,
+            ):
+                pass
+    except BaseException:
+        staging.cleanup()
+        raise
     return staging

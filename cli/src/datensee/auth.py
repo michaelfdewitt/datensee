@@ -66,21 +66,44 @@ def get_access_token(scopes: list[str] | None = None) -> str:
 
 def gcs_client(
     credentials: google.auth.credentials.Credentials | None = None,
-    project: str | None = None,
 ) -> storage.Client:
     """Build a GCS client that never relies on ambient project inference.
 
-    ``storage.Client()`` with no project falls back to the gcloud SDK's
-    ``core/project`` setting — which a host with only ADC (``pip install
-    datensee``, no gcloud) does not have, so it raises "Project was not
-    passed and could not be determined". Object reads and writes don't
-    need a project at all; we resolve one only for quota attribution.
+    ``storage.Client()`` with the ``project`` argument *omitted* falls back
+    to the gcloud SDK's ``core/project`` setting — which a host with only
+    ADC (``pip install datensee``, no gcloud) does not have, so it raises
+    "Project was not passed and could not be determined". Passing
+    ``project=None`` explicitly opts out of that inference. Object reads
+    and writes need no project; quota attribution comes from the
+    credentials' own quota project (``x-goog-user-project``), not from
+    this argument.
 
-    Resolution order: explicit ``project`` → the credentials' quota
-    project (``gcloud auth application-default set-quota-project``) →
-    ``None`` (an explicit ``None`` opts out of inference).
+    Args:
+        credentials: Credentials to sign requests with. ``None`` resolves
+            Application Default Credentials inside the client.
+
+    Returns:
+        A ``storage.Client`` with no default project.
     """
     from google.cloud import storage
 
-    resolved = project or getattr(credentials, "quota_project_id", None)
-    return storage.Client(project=resolved, credentials=credentials)
+    return storage.Client(project=None, credentials=credentials)
+
+
+def split_gcs_uri(uri: str) -> tuple[str, str]:
+    """Split ``gs://bucket/object/path`` into ``(bucket, object_path)``.
+
+    Args:
+        uri: A ``gs://`` URI. The object path may be empty (bucket root)
+            and keeps any trailing slash the caller passed.
+
+    Returns:
+        The bucket name and the object path (without the leading slash).
+
+    Raises:
+        ValueError: If ``uri`` does not start with ``gs://``.
+    """
+    if not uri.startswith("gs://"):
+        raise ValueError(f"Not a gs:// URI: {uri!r}")
+    bucket, _, object_path = uri[len("gs://") :].partition("/")
+    return bucket, object_path
