@@ -42,7 +42,7 @@ jobs:
       - name: Unit tests
         working-directory: cli
         run: |
-          uv sync --locked
+          uv sync
           uv run ruff check .
           uv run ruff format --check .
           uv run pytest -q
