@@ -317,6 +317,8 @@ def export(
     tile_size: int = 512,
     output_tile_size: int | None = None,
     nodata: float | None = None,
+    band_count: int = 1,
+    data_type: str = "float32",
     runner: Literal["local", "dataflow"] = "dataflow",
     region_gcp: str = "us-central1",
     temp_location: str | None = None,
@@ -369,6 +371,12 @@ def export(
             GDAL_NODATA tag. EE returns masked pixels as 0 with no mask
             channel — unmask(sentinel) the expression and pass the
             sentinel here so GIS tools can tell nodata from real zeros.
+        band_count: Bands your expression produces (default 1). Informational
+            for the pipeline (EE responses are self-describing) but recorded
+            in the config and meta sidecar; `datensee validate` checks the
+            output against it.
+        data_type: Pixel dtype your expression produces (default 'float32';
+            e.g. 'int16' for SRTM). Same role as band_count.
         runner: 'local' or 'dataflow'.
         region_gcp: Dataflow region (e.g. 'us-central1').
         temp_location: GCS URI for Dataflow temp files (required for Dataflow).
@@ -507,6 +515,8 @@ def export(
             output_path=output,
             output_tile_size_pixels=output_tile_size,
             nodata=nodata,
+            band_count=band_count,
+            data_type=data_type,
         ),
         runner=runner_config,
         snapshot_time=snapshot_time_micros,
@@ -551,6 +561,8 @@ def export(
             snapshot_time=snapshot_time_micros,
             pixel_grid=tile_grid.pixel_grid,
             nodata=nodata,
+            band_count=band_count,
+            data_type=data_type,
         ),
         credentials=credentials,
     )
@@ -862,6 +874,9 @@ def retry(
         output_tile_size = persisted_meta.output_tile_size_pixels
     if nodata is None:
         nodata = persisted_meta.nodata
+    # Output shape declared by the original export; legacy meta → defaults.
+    band_count = persisted_meta.band_count or 1
+    data_type = persisted_meta.data_type or "float32"
     # Now verify everything (caller-passed values too) matches.
     verify_retry_compatibility(
         persisted_meta,
@@ -1003,6 +1018,8 @@ def retry(
             # (partial) tile set — see AssembledCogWriter's merge path.
             merge_existing_output=True,
             nodata=nodata,
+            band_count=band_count,
+            data_type=data_type,
         ),
         runner=runner_config,
         snapshot_time=snapshot_time_micros,

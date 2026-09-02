@@ -41,7 +41,11 @@ from datensee.pixel.validation.units import (
 if TYPE_CHECKING:
     from google.auth.credentials import Credentials
 
-_MIN_TILE_BYTES = 1024
+# Truncation heuristic for installs WITHOUT rasterio only. A legitimate
+# all-zero 512×512 int16 tile deflates to ~935 B (measured: ocean/void SRTM
+# tiles), so this must sit well below that — and when rasterio is present
+# the real check is opening the file, not guessing from its size.
+_MIN_TILE_BYTES = 512
 _ORIGIN_TOLERANCE = 1e-6
 
 RASTERIO_MISSING_NOTE = (
@@ -204,13 +208,15 @@ def check_integrity(output_dir: Path, config: PipelineConfig) -> CheckResult:
         issues: list[str] = []
         if not _tiff_magic_ok(path):
             issues.append("not a TIFF (bad magic bytes)")
-        elif path.stat().st_size < _MIN_TILE_BYTES:
-            issues.append(f"implausibly small ({path.stat().st_size} B < {_MIN_TILE_BYTES} B)")
         elif with_rasterio:
+            # rasterio opening the file IS the plausibility check — a valid
+            # COG of an all-zero (ocean/void) tile is under 1 KB and fine.
             try:
                 issues.extend(_metadata_issues(path, unit, config))
             except Exception as exc:
                 issues.append(f"unreadable: {exc}")
+        elif path.stat().st_size < _MIN_TILE_BYTES:
+            issues.append(f"implausibly small ({path.stat().st_size} B < {_MIN_TILE_BYTES} B)")
         if issues:
             problems.append({"unit": unit.filename, "issues": issues})
 
@@ -297,16 +303,24 @@ def validate_output(
     def _report(results: list[CheckResult]) -> ValidationReport:
         return ValidationReport(results=results, output_path=uri, config=config)
 
-    # Externalized tile lists make both checks SKIP — decide that before
-    # touching GCS, or a large Dataflow export gets mirrored for nothing.
-    if uri.startswith("gs://") and expected_output_units(config) is None:
-        skipped = [
-            CheckResult(
-                check_id=check_id, status=CheckStatus.SKIPPED, message=TILES_FILE_SKIP_MESSAGE
-            )
-            for check_id in (["integrity", "pixels"] if pixels else ["integrity"])
-        ]
-        return _report(skipped)
+    # Externalized tile lists (>= TILE_FILE_THRESHOLD exports — exactly the
+    # ones that live in GCS) are loaded back so the checks can run; an
+    # unreachable tiles file is an ERROR, not a silent pass.
+    try:
+        config = _inline_externalized_tiles(config, credentials)
+    except Exception as exc:
+        return _report(
+            [
+                CheckResult(
+                    check_id="integrity",
+                    status=CheckStatus.ERROR,
+                    message=(
+                        f"Could not load tile_grid.tiles_file "
+                        f"({config.tile_grid.tiles_file}): {type(exc).__name__}: {exc}"
+                    ),
+                )
+            ]
+        )
 
     with contextlib.ExitStack() as stack:
         if uri.startswith("gs://"):
@@ -338,6 +352,51 @@ def validate_output(
                 )
             )
     return _report(results)
+
+
+def _inline_externalized_tiles(
+    config: PipelineConfig, credentials: Credentials | None
+) -> PipelineConfig:
+    """Resolve ``tile_grid.tiles_file`` into inline tiles for validation.
+
+    Large exports externalize their tile list to ``{output}/_tiles.ndjson``
+    (local path or ``gs://``); the checks need the tiles to know which
+    output units to expect. Loads and inlines them, clearing ``tiles_file``
+    (the model allows exactly one source).
+
+    Args:
+        config: Pipeline config, possibly with externalized tiles.
+        credentials: For ``gs://`` tile files; ``None`` uses ADC.
+
+    Returns:
+        ``config`` unchanged when tiles are already inline; otherwise a
+        copy with the loaded tiles.
+
+    Raises:
+        FileNotFoundError, ValueError: Unreachable or malformed tile file.
+    """
+    tiles_file = config.tile_grid.tiles_file
+    if config.tile_grid.tiles is not None or not tiles_file:
+        return config
+
+    from datensee.pixel.config import TileCoordinate
+
+    if tiles_file.startswith("gs://"):
+        from datensee.pixel.retry import _download_gcs_text
+
+        text = _download_gcs_text(tiles_file, credentials)
+    else:
+        text = Path(tiles_file).read_text(encoding="utf-8")
+
+    tiles = [TileCoordinate.model_validate_json(line) for line in text.splitlines() if line.strip()]
+    if not tiles:
+        raise ValueError("tiles file is empty")
+    grid = config.tile_grid.model_copy(update={"tiles": tiles, "tiles_file": None})
+    # `tile_grid` on the envelope is a read-only property over the pixel
+    # payload — updating it directly is a silent no-op (the class property
+    # shadows the copied __dict__ entry). Go through the payload.
+    pixel = config.pixel.model_copy(update={"tile_grid": grid})
+    return config.model_copy(update={"pixel": pixel})
 
 
 def _stage_gcs_output(

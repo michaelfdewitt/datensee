@@ -239,6 +239,27 @@ def export(
         str | None,
         typer.Option("--temp-location", help="GCS URI for Dataflow temp files."),
     ] = None,
+    band_count: Annotated[
+        int,
+        typer.Option(
+            "--band-count",
+            min=1,
+            help=(
+                "Bands your expression produces. Recorded in the config/meta and "
+                "checked by `datensee validate`; the fetch itself is shape-agnostic."
+            ),
+        ),
+    ] = 1,
+    data_type: Annotated[
+        str,
+        typer.Option(
+            "--data-type",
+            help=(
+                "Pixel dtype your expression produces (e.g. int16 for SRTM, float32 "
+                "for NDVI). Recorded in the config/meta and checked by `datensee validate`."
+            ),
+        ),
+    ] = "float32",
     machine_type: Annotated[
         str | None,
         typer.Option(
@@ -313,6 +334,8 @@ def export(
             tile_size=tile_size,
             output_tile_size=output_tile_size,
             nodata=nodata,
+            band_count=band_count,
+            data_type=data_type,
             runner=runner,  # type: ignore[arg-type]
             region_gcp=region_gcp,
             temp_location=temp_location,
