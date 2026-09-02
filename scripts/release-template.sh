@@ -65,6 +65,13 @@ JAR="${PIPELINES_DIR}/build/libs/datensee-pipeline.jar"
 shasum -a 256 "${JAR}" | awk '{print $1 "  datensee-pipeline.jar"}' > "${JAR}.sha256"
 gcloud storage cp "${JAR}" "${JAR}.sha256" "gs://${BUCKET}/v${VERSION}/"
 
+# Bake the digest into the wheel: the published client verifies every JAR
+# download against it. Commit this change with the release.
+DIGEST=$(awk '{print $1}' "${JAR}.sha256")
+sed -i.bak -E "s|^JAR_SHA256: str \| None = .*$|JAR_SHA256: str \| None = \"${DIGEST}\"|" \
+    "${ROOT}/cli/src/datensee/_jar_digest.py" && rm -f "${ROOT}/cli/src/datensee/_jar_digest.py.bak"
+echo "  pinned in cli/src/datensee/_jar_digest.py — commit this with the release"
+
 echo
 echo "Release complete."
 echo "  pip wheel pinned default : ${SPEC_GCS}"

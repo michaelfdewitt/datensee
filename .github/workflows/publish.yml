@@ -2,8 +2,9 @@
 #
 #   1. verify   — the tag matches cli/pyproject.toml (the single source of
 #                 truth for the version), unit tests pass, wheel + sdist build.
-#   2. jar      — Gradle shadowJar, attached to the GitHub Release as
-#                 datensee-pipeline.jar (what `datensee jar download` fetches).
+#   2. jar      — downloads the bucket-staged JAR, verifies it against the
+#                 digest pinned in _jar_digest.py, attaches it to the GitHub
+#                 Release (what `datensee jar download` fetches).
 #   3. pypi     — `uv publish` via PyPI Trusted Publishing (OIDC; no token).
 #
 # One-time setup (see docs/releasing.md):
@@ -56,24 +57,37 @@ jobs:
           if-no-files-found: error
 
   jar:
+    # Mirror-and-verify, not rebuild: the release JAR is built exactly once
+    # by the template-staging step, which uploads it to the public bucket and
+    # commits its sha256 into cli/src/datensee/_jar_digest.py. This job
+    # downloads that artifact, verifies it against the committed pin, and
+    # attaches the identical bytes to the GitHub Release — so bucket, release
+    # asset, and wheel pin can never disagree. It also fails the release
+    # loudly when the template was never staged for this version.
     runs-on: ubuntu-latest
     needs: verify
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "25"
-      # gradle-wrapper.jar is gitignored, so install the version the wrapper
-      # pins (gradle/wrapper/gradle-wrapper.properties) and call gradle directly.
-      - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: "9.4.0"
-      - name: Build shadow JAR
-        working-directory: pipelines
-        run: gradle --no-daemon shadowJar
+      - name: Fetch the staged JAR and verify the committed digest pin
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          pinned=$(sed -nE 's/^JAR_SHA256: str \| None = "([0-9a-f]{64})"$/\1/p' \
+                     cli/src/datensee/_jar_digest.py)
+          if [[ -z "$pinned" ]]; then
+            echo "::error::cli/src/datensee/_jar_digest.py carries no pinned digest —" \
+                 "run scripts/release-template.sh $VERSION and commit the pin" >&2
+            exit 1
+          fi
+          url="https://storage.googleapis.com/datensee-templates/v${VERSION}/datensee-pipeline.jar"
+          echo "fetching $url"
+          curl -fSL --retry 3 -o datensee-pipeline.jar "$url" || {
+            echo "::error::no staged JAR at $url — run scripts/release-template.sh $VERSION first" >&2
+            exit 1
+          }
+          echo "${pinned}  datensee-pipeline.jar" | sha256sum -c -
       - name: Attach JAR to the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -82,7 +96,7 @@ jobs:
           gh release view "$TAG" >/dev/null 2>&1 \
             || gh release create "$TAG" --verify-tag --generate-notes \
                  $([[ "$TAG" == *a* || "$TAG" == *b* || "$TAG" == *rc* ]] && echo --prerelease)
-          gh release upload "$TAG" pipelines/build/libs/datensee-pipeline.jar --clobber
+          gh release upload "$TAG" datensee-pipeline.jar --clobber
 
   pypi:
     runs-on: ubuntu-latest

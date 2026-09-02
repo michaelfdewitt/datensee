@@ -111,6 +111,27 @@ def _run_cloud_build(
         time.sleep(20)
 
 
+def _write_digest_pin(jar_sha: str) -> None:
+    """Bake the JAR digest into the wheel (cli/src/datensee/_jar_digest.py).
+
+    Committed with the release: the published wheel then verifies every
+    JAR download against this value, so the hosts (GitHub Release, public
+    bucket) are availability only — swapped bytes fail loudly.
+    """
+    digest_file = ROOT / "cli" / "src" / "datensee" / "_jar_digest.py"
+    text = digest_file.read_text()
+    updated = re.sub(
+        r'^JAR_SHA256: str \| None = .*$',
+        f'JAR_SHA256: str | None = "{jar_sha}"',
+        text,
+        count=1,
+        flags=re.M,
+    )
+    assert updated != text or jar_sha in text, "JAR_SHA256 line not found in _jar_digest.py"
+    digest_file.write_text(updated)
+    print(f"      pinned in cli/src/datensee/_jar_digest.py — commit this with the release")
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -204,6 +225,8 @@ def main(argv: list[str]) -> int:
         jar_sha + "  " + JAR.name + "\n", content_type="text/plain"
     )
     print(f"[4/4] jar fallback staged: gs://{bucket}/{jar_blob} (sha256 {jar_sha[:12]}…)")
+
+    _write_digest_pin(jar_sha)
     print(
         f"\nRelease complete. Override at runtime: DATENSEE_TEMPLATE_SPEC=gs://{bucket}/{spec_path}"
     )

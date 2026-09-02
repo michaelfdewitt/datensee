@@ -53,3 +53,18 @@ def test_gradle_reads_version_from_pyproject() -> None:
     assert not any(line.strip().startswith('version = "') for line in text.splitlines()), (
         "Gradle version must be read from pyproject.toml, not hard-coded"
     )
+
+
+def test_jar_digest_pin_is_wellformed() -> None:
+    """The wheel ships either a 64-hex sha256 pin or an explicit None.
+
+    The release scripts rewrite the ``JAR_SHA256`` line with sed/regex, so
+    its exact shape is load-bearing; publish.yml greps the same shape.
+    """
+    import re
+
+    from datensee._jar_digest import JAR_SHA256
+
+    assert JAR_SHA256 is None or re.fullmatch(r"[0-9a-f]{64}", JAR_SHA256)
+    source = (Path(__file__).parents[1] / "src" / "datensee" / "_jar_digest.py").read_text()
+    assert re.search(r'^JAR_SHA256: str \| None = (None|"[0-9a-f]{64}")$', source, re.M)

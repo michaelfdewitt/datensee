@@ -34,12 +34,18 @@ it (`cli/tests/test_release_pins.py` enforces this).
 cd cli && uv version 0.1.0a2 && uv lock && cd ..
 git commit -am "chore: release 0.1.0a2"
 
-# 2. stage the Flex Template BEFORE the wheel exists on PyPI
+# 2. stage the Flex Template BEFORE the wheel exists on PyPI. This builds
+#    the release JAR exactly once, uploads it (+ .sha256) to the bucket, and
+#    bakes its digest into cli/src/datensee/_jar_digest.py — COMMIT that
+#    change with the release. publish.yml refuses to run without it, and the
+#    published wheel verifies every JAR download against the pin.
 scripts/release-template.sh 0.1.0a2
 #    (no Docker/gcloud at hand? scripts/release_template_cloudbuild.py 0.1.0a2
 #     does the same via Cloud Build with just ADC — ~60 s; it refuses a
 #     version that differs from pyproject unless --allow-version-mismatch)
-#    (Python-only release, Java unchanged? copying the previous spec is enough:
+#    (Python-only release, Java unchanged? copy the previous spec AND jar +
+#     sidecar to the new v-prefix, and re-pin the digest — or just re-run the
+#     script; the old shortcut:
 #     gcloud storage cp gs://datensee-templates/v0.1.0a1/datensee.json \
 #                       gs://datensee-templates/v0.1.0a2/datensee.json)
 

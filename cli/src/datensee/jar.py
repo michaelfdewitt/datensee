@@ -40,6 +40,7 @@ from rich.progress import (
     TransferSpeedColumn,
 )
 
+from datensee._jar_digest import JAR_SHA256
 from datensee._version import __version__
 from datensee.template import TEMPLATE_BUCKET
 
@@ -219,6 +220,7 @@ def download_jar(version: str = __version__, *, force: bool = False) -> Path:
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
     console.print(f"Downloading pipeline JAR v{version}...")
 
+    pinned = _pinned_digest(version)
     try:
         token = _github_token()
         url = (
@@ -226,31 +228,73 @@ def download_jar(version: str = __version__, *, force: bool = False) -> Path:
             if token
             else _GITHUB_RELEASE_ASSET_URL.format(version=version)
         )
-        _stream_download(url, destination, not_found=_no_release_message(version))
+        digest = _stream_download(url, destination, not_found=_no_release_message(version))
+        _verify_digest(digest, pinned, destination, source=url)
     except FileNotFoundError:
         # The GitHub Release is unreachable (asset missing, or the
         # repository is private and no token is set). Fall back to the
         # public bucket, whose per-version path never changes once
-        # published and whose .sha256 sidecar pins the bytes.
+        # published.
         console.print("  GitHub Release unavailable; trying the public bucket fallback.")
-        _download_from_bucket(version, destination)
+        _download_from_bucket(version, destination, pinned)
 
     console.print(f"  Saved to {destination}")
     return destination
 
 
-def _download_from_bucket(version: str, destination: Path) -> None:
-    """Fetch the JAR from the public bucket and verify its .sha256 sidecar."""
+def _pinned_digest(version: str) -> str | None:
+    """The wheel-pinned JAR digest, applicable only to the wheel's own version.
+
+    The pin is baked at release time for exactly one artifact; a download
+    of any *other* version has no trustworthy local pin and falls back to
+    the bucket's best-effort sidecar.
+    """
+    if version == __version__ and JAR_SHA256:
+        return JAR_SHA256.lower()
+    return None
+
+
+def _verify_digest(actual: str, pinned: str | None, destination: Path, *, source: str) -> None:
+    """Enforce the wheel-pinned digest on a completed download.
+
+    Raises:
+        RuntimeError: The bytes do not match the pin. The file is deleted
+            first — a mismatched executable must never remain in the
+            search path.
+    """
+    if pinned is None:
+        return
+    if actual != pinned:
+        destination.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Pipeline JAR from {source} does not match the digest pinned in this "
+            f"datensee release (expected sha256 {pinned}, got {actual}).\n"
+            "The artifact was refused and deleted. This should never happen for a "
+            "published release — the host may be compromised or misconfigured. "
+            "`datensee jar build` compiles from source instead."
+        )
+    console.print("  sha256 verified against the release pin.")
+
+
+def _download_from_bucket(version: str, destination: Path, pinned: str | None) -> None:
+    """Fetch the JAR from the public bucket, verifying against the strongest
+    available reference: the wheel-pinned digest when this is the wheel's own
+    version, else the bucket's best-effort ``.sha256`` sidecar."""
     url = _GCS_JAR_URL.format(version=version)
-    checksum_response = httpx.get(url + ".sha256", timeout=30)
-    expected: str | None = None
-    if checksum_response.status_code == 200:
-        expected = checksum_response.text.split()[0].strip().lower()
-    elif checksum_response.status_code != 404:
-        checksum_response.raise_for_status()
+
+    expected = pinned
+    if expected is None:
+        checksum_response = httpx.get(url + ".sha256", timeout=30)
+        if checksum_response.status_code == 200:
+            expected = checksum_response.text.split()[0].strip().lower()
+        elif checksum_response.status_code != 404:
+            checksum_response.raise_for_status()
 
     digest = _stream_download(url, destination, not_found=_no_release_message(version))
 
+    if pinned is not None:
+        _verify_digest(digest, pinned, destination, source=url)
+        return
     if expected is None:
         console.print(
             "  [yellow]No .sha256 sidecar published for this version; "

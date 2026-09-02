@@ -248,3 +248,65 @@ class TestBucketFallback:
 
         with pytest.raises(FileNotFoundError, match="GitHub Release.*fallback bucket"):
             download_jar("9.9.9")
+
+
+class TestWheelPinnedDigest:
+    """The digest baked into the wheel overrides all host-side trust."""
+
+    _GITHUB_URL = (
+        "https://github.com/michaelfdewitt/datensee/releases/download/v9.9.9/datensee-pipeline.jar"
+    )
+    _BUCKET_URL = "https://storage.googleapis.com/datensee-templates/v9.9.9/datensee-pipeline.jar"
+
+    @pytest.fixture
+    def pinned(self, monkeypatch: pytest.MonkeyPatch) -> str:
+        """Make 9.9.9 the wheel's own version, with a pin for b\"jar-bytes\"."""
+        import hashlib
+
+        digest = hashlib.sha256(b"jar-bytes").hexdigest()
+        monkeypatch.setattr("datensee.jar.__version__", "9.9.9")
+        monkeypatch.setattr("datensee.jar.JAR_SHA256", digest)
+        return digest
+
+    def test_github_asset_matching_pin_is_accepted(
+        self, empty_cache: Path, httpx_mock: HTTPXMock, pinned: str
+    ) -> None:
+        httpx_mock.add_response(url=self._GITHUB_URL, content=b"jar-bytes")
+        assert download_jar("9.9.9").read_bytes() == b"jar-bytes"
+
+    def test_github_asset_failing_pin_is_deleted_and_refused(
+        self, empty_cache: Path, httpx_mock: HTTPXMock, pinned: str
+    ) -> None:
+        httpx_mock.add_response(url=self._GITHUB_URL, content=b"swapped-asset")
+        with pytest.raises(RuntimeError, match="does not match the digest pinned"):
+            download_jar("9.9.9")
+        assert not (empty_cache / "datensee-pipeline-9.9.9.jar").exists()
+
+    def test_bucket_fallback_uses_pin_and_skips_sidecar(
+        self, empty_cache: Path, httpx_mock: HTTPXMock, pinned: str
+    ) -> None:
+        """With a wheel pin, the same-origin sidecar is not even fetched."""
+        httpx_mock.add_response(url=self._GITHUB_URL, status_code=404)
+        httpx_mock.add_response(url=self._BUCKET_URL, content=b"jar-bytes")
+        assert download_jar("9.9.9").read_bytes() == b"jar-bytes"
+        assert not any(str(r.url).endswith(".sha256") for r in httpx_mock.get_requests())
+
+    def test_bucket_fallback_failing_pin_is_refused(
+        self, empty_cache: Path, httpx_mock: HTTPXMock, pinned: str
+    ) -> None:
+        httpx_mock.add_response(url=self._GITHUB_URL, status_code=404)
+        httpx_mock.add_response(url=self._BUCKET_URL, content=b"mutated-bucket-object")
+        with pytest.raises(RuntimeError, match="does not match the digest pinned"):
+            download_jar("9.9.9")
+        assert not (empty_cache / "datensee-pipeline-9.9.9.jar").exists()
+
+    def test_other_versions_have_no_pin(
+        self, empty_cache: Path, httpx_mock: HTTPXMock, pinned: str
+    ) -> None:
+        """Downloading a version other than the wheel's own falls back to the sidecar."""
+        other_gh = self._GITHUB_URL.replace("9.9.9", "8.8.8")
+        other_bucket = self._BUCKET_URL.replace("9.9.9", "8.8.8")
+        httpx_mock.add_response(url=other_gh, status_code=404)
+        httpx_mock.add_response(url=other_bucket + ".sha256", status_code=404)
+        httpx_mock.add_response(url=other_bucket, content=b"anything")
+        assert download_jar("8.8.8").read_bytes() == b"anything"
