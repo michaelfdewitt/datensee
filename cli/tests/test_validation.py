@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 from pathlib import Path
 from unittest.mock import patch
 
@@ -31,7 +32,6 @@ from datensee.config import (
 )
 from datensee.pixel.tiling import tile_pixel_grid
 from datensee.pixel.validation import (
-    TILES_FILE_SKIP_MESSAGE,
     CheckStatus,
     check_integrity,
     validate_output,
@@ -320,7 +320,9 @@ class TestIntegrity:
         (tmp_path / unit_filename(0, 0)).write_bytes(b"II\x2a\x00" + b"\x00" * 10)
         result = check_integrity(tmp_path, config)
         assert result.status == CheckStatus.FAILED
-        assert "implausibly small" in str(result.details["problems"])
+        # With rasterio the junk file is flagged as unreadable; without it,
+        # the size heuristic fires. Either way the unit must be flagged.
+        assert re.search(r"implausibly small|unreadable", str(str(result.details["problems"])))
 
     @requires_rasterio
     def test_wrong_dimensions_fail(self, tmp_path: Path) -> None:
@@ -619,14 +621,14 @@ class TestValidateOutput:
         assert [r.check_id for r in report.results] == ["integrity"]
         assert report.all_passed
 
-    def test_tiles_file_config_skips_both_checks(self, tmp_path: Path) -> None:
+    def test_tiles_file_config_with_unreachable_file_is_an_error(self, tmp_path: Path) -> None:
+        """Externalized tiles are loaded for validation; a missing file is loud."""
         config = _make_tiles_file_config(output_path=str(tmp_path))
         with patch(_TOKEN, return_value="fake-token"):
             report = validate_output(tmp_path, config, pixels=True)
-        assert [r.check_id for r in report.results] == ["integrity", "pixels"]
-        assert all(r.status == CheckStatus.SKIPPED for r in report.results)
-        assert all(r.message == TILES_FILE_SKIP_MESSAGE for r in report.results)
-        assert report.all_passed  # skipped is not a failure
+        assert report.results[0].status == CheckStatus.ERROR
+        assert "tiles_file" in report.results[0].message
+        assert not report.all_passed
 
     def test_failed_check_flips_all_passed(self, tmp_path: Path) -> None:
         config = _make_config(_make_tiles(1, 1), output_path=str(tmp_path))
@@ -653,3 +655,136 @@ class TestValidateOutput:
         assert d["all_passed"] is True
         assert d["results"][0]["check_id"] == "integrity"
         assert d["results"][0]["status"] == "passed"
+
+
+# ---------------------------------------------------------------------------
+# gs:// output prefixes are staged locally, then validated with the same code
+# ---------------------------------------------------------------------------
+
+
+def test_validate_output_stages_gcs_prefix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A gs:// output is mirrored into a temp dir; the report keeps the URI."""
+    import tempfile
+
+    from datensee.pixel import validation
+
+    tiles = _make_tiles(1, 2)
+    config = _make_config(tiles, output_path="gs://bucket/exports/run")
+    mirror = tmp_path / "mirror"
+    mirror.mkdir()
+    for unit in _units(config):
+        _write_valid_unit(mirror, config, unit)
+
+    seen: dict[str, str] = {}
+
+    def fake_stage(
+        gcs_prefix: str, *, credentials: object, max_bytes: int
+    ) -> tempfile.TemporaryDirectory[str]:
+        seen["prefix"], seen["max_bytes"] = gcs_prefix, max_bytes
+        staging = tempfile.TemporaryDirectory()
+        for path in mirror.iterdir():
+            (Path(staging.name) / path.name).write_bytes(path.read_bytes())
+        return staging
+
+    monkeypatch.setattr(validation, "_stage_gcs_output", fake_stage)
+    report = validation.validate_output("gs://bucket/exports/run", config)
+
+    assert seen == {
+        "prefix": "gs://bucket/exports/run",
+        "max_bytes": validation.DEFAULT_MAX_STAGE_BYTES,
+    }
+    assert report.output_path == "gs://bucket/exports/run"
+    assert report.all_passed, report.results[0].message
+
+
+def test_validate_output_unreachable_tiles_file_is_an_error_before_staging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tiles_file that cannot be loaded is an ERROR — and nothing is mirrored."""
+    from datensee.pixel import validation
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise AssertionError("staging must not run")
+
+    def missing(gs_uri: str, credentials: object = None) -> str:
+        raise FileNotFoundError(f"Journal not found: {gs_uri}")
+
+    monkeypatch.setattr(validation, "_stage_gcs_output", boom)
+    monkeypatch.setattr("datensee.pixel.retry._download_gcs_text", missing)
+    report = validation.validate_output(
+        "gs://bucket/big", _make_tiles_file_config("gs://bucket/big"), pixels=True
+    )
+    assert report.results[0].status == CheckStatus.ERROR
+    assert "tiles_file" in report.results[0].message
+
+
+def test_validate_output_inlines_local_tiles_file(tmp_path: Path) -> None:
+    """Externalized tiles are loaded back; integrity then runs normally."""
+    from datensee.pixel import validation
+
+    tiles = _make_tiles(1, 2)
+    inline_config = _make_config(tiles, output_path=str(tmp_path))
+    tiles_path = tmp_path / "_tiles.ndjson"
+    tiles_path.write_text("\n".join(t.model_dump_json() for t in tiles) + "\n", encoding="utf-8")
+    # Rebuild from JSON with the tiles externalized — the envelope's
+    # `tile_grid` is a read-only property over the pixel payload, so a
+    # model_copy(update={"tile_grid": ...}) would be a silent no-op.
+    payload = json.loads(inline_config.model_dump_json(exclude_none=True))
+    payload["pixel"]["tile_grid"].pop("tiles")
+    payload["pixel"]["tile_grid"]["tiles_file"] = str(tiles_path)
+    config = PipelineConfig.model_validate(payload)
+    assert config.tile_grid.tiles is None  # the checks cannot see units yet
+    for unit in _units(inline_config):
+        _write_valid_unit(tmp_path, inline_config, unit)
+
+    report = validation.validate_output(str(tmp_path), config)
+    assert report.all_passed, report.results[0].message
+    # And a missing unit is detectable for tiles_file configs too.
+    (tmp_path / _units(inline_config)[0].filename).unlink()
+    report = validation.validate_output(str(tmp_path), config)
+    assert not report.all_passed
+
+
+def test_validate_output_reports_staging_failure_as_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datensee.pixel import validation
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise PermissionError("403 storage.objects.list denied")
+
+    monkeypatch.setattr(validation, "_stage_gcs_output", forbidden)
+    report = validation.validate_output("gs://bucket/run", _make_config(_make_tiles(1, 1)))
+    assert report.results[0].status == CheckStatus.ERROR
+    assert "403" in report.results[0].message
+    assert not report.all_passed
+
+
+@requires_rasterio
+def test_tiny_uniform_tile_is_valid(tmp_path: Path) -> None:
+    """An all-zero tile deflates below 1 KB and must PASS — rasterio is the
+    plausibility check, not the byte count (10,481 ocean tiles taught us)."""
+    import rasterio
+    from rasterio.transform import Affine
+
+    config = _make_config(_make_tiles(1, 1), data_type="int16")
+    unit = _units(config)[0]
+    path = tmp_path / unit.filename
+    ox, oy = _unit_origin(config, unit)
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        height=unit.height_px,
+        width=unit.width_px,
+        count=1,
+        dtype="int16",
+        crs=config.tile_grid.crs,
+        transform=Affine(_PIXEL_SIZE, 0.0, ox, 0.0, -_PIXEL_SIZE, oy),
+        compress="deflate",
+    ) as ds:
+        ds.write(np.zeros((1, unit.height_px, unit.width_px), dtype="int16"))
+    assert path.stat().st_size < 1024, "test premise: an all-zero tile is sub-1KB"
+
+    result = check_integrity(tmp_path, config)
+    assert result.status == CheckStatus.PASSED, result.message

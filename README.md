@@ -25,14 +25,35 @@ datensee export expression.json region.geojson \
 
 ## Why
 
-Earth Engine is great at computing things, but the built-in `Export.image.*` functions were designed in an era that predates the Cambrian explosion of easy and affordable cloud processing tools.
+DatensEE is not a new platform, and it doesn't try to solve every geospatial
+problem. It solves one specific, recurring moment: **the day a task outgrows
+`Export.image.toCloudStorage`.**
 
-DatensEE doesn't recompile or interpret your computation — EE does that.
-We just call the [High Volume API](https://developers.google.com/earth-engine/reference/rest/v1/projects.image/computePixels)
-thousands of times in parallel, with proper tiling, retries, and backoff,
-and stitch the results together.
+The usual story goes like this. A computation works beautifully in the Code
+Editor or a notebook. Then the region grows, or the resolution drops to 10 m,
+and the built-in export — designed in an era that predates the Cambrian
+explosion of cheap, elastic cloud compute — starts queueing for hours or
+failing outright. At that point most teams start over: new pipeline, new
+framework, re-express the science against raw assets, rebuild masking and
+compositing logic that already worked, and spend weeks re-validating that the
+new numbers match the old ones.
 
-**EE is the computation engine. DatensEE is the parallelism engine.**
+DatensEE is the graduation path that skips the rewrite. The computation you
+already have — the exact expression graph, untouched — comes with you; only the
+execution changes. We don't recompile or interpret it, EE still evaluates every
+pixel; DatensEE calls the
+[High Volume API](https://developers.google.com/earth-engine/reference/rest/v1/projects.image/computePixels)
+thousands of times in parallel, with proper tiling, retries, and backoff, and
+stitches the results into Cloud Optimized GeoTIFFs.
+
+**EE is the computation engine. DatensEE is the parallelism engine.** That
+division is the whole design: everything upstream of pixels (your algorithm,
+your assets, your masking) stays exactly as it was, so there is nothing to
+re-validate; everything downstream (tiling, fan-out, partial-failure recovery,
+pixel-exact assembly) is handled once, here, instead of from scratch by every
+team that hits the same wall.
+
+If a task fits `Export.image` or one machine, it hasn't graduated — stay there.
 
 ### Why isn't this fifty lines?
 
@@ -73,7 +94,8 @@ that's the price of the word "pixel-exact" above.
 
 If your exports fit comfortably on one machine, use
 [xee](https://github.com/google/xee) or `ee.batch.Export` and be happy. DatensEE
-exists for when they stop fitting.
+exists for when they stop fitting — and for nothing else: no catalog, no
+compute framework, no new way to write your science. One graduation, one tool.
 
 ## How it works
 
@@ -123,7 +145,7 @@ That's it. No `earthengine-api` dependency, no Java toolchain, no Gradle. The pa
 
 ### Where it lives
 
-DatensEE is published to PyPI as `datensee` and lives in the `earthengine` repo under `tools/datensee/`. It is **deliberately separate** from the `earthengine` package itself — installing `datensee` does **not** pull in `earthengine-api` or any other heavy GIS toolchain. Users who want to author EE expressions can `pip install earthengine-api` independently.
+DatensEE is published to PyPI as `datensee`; source lives at [github.com/michaelfdewitt/datensee](https://github.com/michaelfdewitt/datensee). It is **deliberately separate** from the `earthengine-api` package — installing `datensee` does **not** pull in `earthengine-api` or any other heavy GIS toolchain. Users who want to author EE expressions can `pip install earthengine-api` independently.
 
 ### Demo: Landsat 9 NDVI over SF Bay Area
 
@@ -131,7 +153,7 @@ DatensEE is published to PyPI as `datensee` and lives in the `earthengine` repo 
 datensee demo --project my-gcp-project --output ./ndvi-output
 ```
 
-This fetches a small Landsat 9 NDVI composite (~4 tiles at 30m) using the
+This fetches a small Landsat 9 NDVI composite (9 tiles of 512×512 px at 30 m) using the
 local direct runner. Output is a directory of Cloud Optimized GeoTIFFs
 (`tile_r0000_c0000.tif`, …) — self-describing files that QGIS, rasterio, or
 any modern GIS opens directly, no manifest needed.
@@ -213,6 +235,8 @@ See [`notebooks/datensee_quickstart.ipynb`](notebooks/datensee_quickstart.ipynb)
 | **Cost** | Free (your machine) | Dataflow vCPU/GB-hours |
 
 Dataflow has ~2 minutes of fixed overhead for VM provisioning, container startup, and shuffle infrastructure — regardless of workload size. For 9 tiles this dominates the wall time; for 10,000 tiles it's negligible. **Use local mode for anything under ~100 tiles.**
+
+Curious what a real run looks like at scale? A 21,316-tile SRTM export — wall time, EECU-seconds, and the itemized ~$0.18 bill — is written up in [docs/case-study-scale-run.md](docs/case-study-scale-run.md).
 
 ## Tiling & pixel alignment
 

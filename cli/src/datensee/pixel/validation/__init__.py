@@ -14,11 +14,13 @@ Usage: ``validate_output("./output", config, pixels=True).all_passed``
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import tempfile
 from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 from rich.panel import Panel
@@ -26,6 +28,8 @@ from rich.table import Table
 
 from datensee.config import PipelineConfig
 from datensee.pixel.validation.units import (
+    FAILURES_FILENAME,
+    TILE_FILENAME_RE,
     TILES_FILE_SKIP_MESSAGE,
     OutputUnit,
     expected_output_units,
@@ -34,7 +38,14 @@ from datensee.pixel.validation.units import (
     unit_keys_on_disk,
 )
 
-_MIN_TILE_BYTES = 1024
+if TYPE_CHECKING:
+    from google.auth.credentials import Credentials
+
+# Truncation heuristic for installs WITHOUT rasterio only. A legitimate
+# all-zero 512×512 int16 tile deflates to ~935 B (measured: ocean/void SRTM
+# tiles), so this must sit well below that — and when rasterio is present
+# the real check is opening the file, not guessing from its size.
+_MIN_TILE_BYTES = 512
 _ORIGIN_TOLERANCE = 1e-6
 
 RASTERIO_MISSING_NOTE = (
@@ -98,6 +109,10 @@ class ValidationReport(BaseModel):
         n_ok = sum(1 for r in self.results if r.status != CheckStatus.FAILED)
         title = f"Validation results — {n_ok}/{len(self.results)} passed"
         return Panel(table, title=title, border_style="green" if self.all_passed else "red")
+
+
+DEFAULT_MAX_STAGE_BYTES = 8 * 1024**3
+"""Largest gs:// output ``validate`` will mirror locally by default (8 GiB)."""
 
 
 def _has_rasterio() -> bool:
@@ -193,13 +208,15 @@ def check_integrity(output_dir: Path, config: PipelineConfig) -> CheckResult:
         issues: list[str] = []
         if not _tiff_magic_ok(path):
             issues.append("not a TIFF (bad magic bytes)")
-        elif path.stat().st_size < _MIN_TILE_BYTES:
-            issues.append(f"implausibly small ({path.stat().st_size} B < {_MIN_TILE_BYTES} B)")
         elif with_rasterio:
+            # rasterio opening the file IS the plausibility check — a valid
+            # COG of an all-zero (ocean/void) tile is under 1 KB and fine.
             try:
                 issues.extend(_metadata_issues(path, unit, config))
             except Exception as exc:
                 issues.append(f"unreadable: {exc}")
+        elif path.stat().st_size < _MIN_TILE_BYTES:
+            issues.append(f"implausibly small ({path.stat().st_size} B < {_MIN_TILE_BYTES} B)")
         if issues:
             problems.append({"unit": unit.filename, "issues": issues})
 
@@ -247,21 +264,31 @@ def validate_output(
     pixels: bool = False,
     sample: int = 20,
     gee_project: str | None = None,
+    credentials: Credentials | None = None,
+    max_stage_bytes: int = DEFAULT_MAX_STAGE_BYTES,
 ) -> ValidationReport:
     """Run output checks against pipeline output and return a structured report.
 
     Args:
-        output_path: Directory containing the exported tile GeoTIFFs.
+        output_path: Directory (or ``gs://`` prefix) containing the exported
+            tile GeoTIFFs. A GCS prefix is mirrored into a temporary
+            directory first — see :func:`_stage_gcs_output`.
         config: Pipeline config that produced the output.
         pixels: Also run the ``pixels`` check (EE HV API re-fetch — costs EECUs).
         sample: Max compute tiles the ``pixels`` check re-fetches.
         gee_project: GCP project for reference fetches; defaults to the
             config's ``gee_project``.
+        credentials: Credentials for reading a ``gs://`` output. ``None``
+            uses Application Default Credentials.
+        max_stage_bytes: Refuse to mirror a ``gs://`` output larger than
+            this (the checks are local-file based; a multi-TB export is
+            not something to pull into ``$TMPDIR``).
 
     Returns:
-        ValidationReport with one result per check run.
+        ValidationReport with one result per check run. Staging failures
+        surface as an ``ERROR`` integrity result, never as an exception.
     """
-    output = Path(output_path)
+    uri = str(output_path)
 
     def _run(check_id: str, runner: Callable[[], CheckResult]) -> CheckResult:
         try:
@@ -273,12 +300,166 @@ def validate_output(
                 message=f"Check raised {type(exc).__name__}: {exc}",
             )
 
-    results = [_run("integrity", lambda: check_integrity(output, config))]
-    if pixels:
-        from datensee.pixel.validation.pixels import check_pixels
+    def _report(results: list[CheckResult]) -> ValidationReport:
+        return ValidationReport(results=results, output_path=uri, config=config)
 
-        project = gee_project or config.gee_project
-        results.append(
-            _run("pixels", lambda: check_pixels(output, config, sample=sample, gee_project=project))
+    # Externalized tile lists (>= TILE_FILE_THRESHOLD exports — exactly the
+    # ones that live in GCS) are loaded back so the checks can run; an
+    # unreachable tiles file is an ERROR, not a silent pass.
+    try:
+        config = _inline_externalized_tiles(config, credentials)
+    except Exception as exc:
+        return _report(
+            [
+                CheckResult(
+                    check_id="integrity",
+                    status=CheckStatus.ERROR,
+                    message=(
+                        f"Could not load tile_grid.tiles_file "
+                        f"({config.tile_grid.tiles_file}): {type(exc).__name__}: {exc}"
+                    ),
+                )
+            ]
         )
-    return ValidationReport(results=results, output_path=str(output), config=config)
+
+    with contextlib.ExitStack() as stack:
+        if uri.startswith("gs://"):
+            try:
+                staging = _stage_gcs_output(uri, credentials=credentials, max_bytes=max_stage_bytes)
+            except Exception as exc:
+                return _report(
+                    [
+                        CheckResult(
+                            check_id="integrity",
+                            status=CheckStatus.ERROR,
+                            message=f"Could not stage {uri}: {type(exc).__name__}: {exc}",
+                        )
+                    ]
+                )
+            output = Path(stack.enter_context(staging))
+        else:
+            output = Path(uri)
+
+        results = [_run("integrity", lambda: check_integrity(output, config))]
+        if pixels:
+            from datensee.pixel.validation.pixels import check_pixels
+
+            project = gee_project or config.gee_project
+            results.append(
+                _run(
+                    "pixels",
+                    lambda: check_pixels(output, config, sample=sample, gee_project=project),
+                )
+            )
+    return _report(results)
+
+
+def _inline_externalized_tiles(
+    config: PipelineConfig, credentials: Credentials | None
+) -> PipelineConfig:
+    """Resolve ``tile_grid.tiles_file`` into inline tiles for validation.
+
+    Large exports externalize their tile list to ``{output}/_tiles.ndjson``
+    (local path or ``gs://``); the checks need the tiles to know which
+    output units to expect. Loads and inlines them, clearing ``tiles_file``
+    (the model allows exactly one source).
+
+    Args:
+        config: Pipeline config, possibly with externalized tiles.
+        credentials: For ``gs://`` tile files; ``None`` uses ADC.
+
+    Returns:
+        ``config`` unchanged when tiles are already inline; otherwise a
+        copy with the loaded tiles.
+
+    Raises:
+        FileNotFoundError, ValueError: Unreachable or malformed tile file.
+    """
+    tiles_file = config.tile_grid.tiles_file
+    if config.tile_grid.tiles is not None or not tiles_file:
+        return config
+
+    from datensee.pixel.config import TileCoordinate
+
+    if tiles_file.startswith("gs://"):
+        from datensee.pixel.retry import _download_gcs_text
+
+        text = _download_gcs_text(tiles_file, credentials)
+    else:
+        text = Path(tiles_file).read_text(encoding="utf-8")
+
+    tiles = [TileCoordinate.model_validate_json(line) for line in text.splitlines() if line.strip()]
+    if not tiles:
+        raise ValueError("tiles file is empty")
+    grid = config.tile_grid.model_copy(update={"tiles": tiles, "tiles_file": None})
+    # `tile_grid` on the envelope is a read-only property over the pixel
+    # payload — updating it directly is a silent no-op (the class property
+    # shadows the copied __dict__ entry). Go through the payload.
+    pixel = config.pixel.model_copy(update={"tile_grid": grid})
+    return config.model_copy(update={"pixel": pixel})
+
+
+def _stage_gcs_output(
+    gcs_prefix: str,
+    *,
+    credentials: Credentials | None,
+    max_bytes: int,
+    parallelism: int = 8,
+) -> tempfile.TemporaryDirectory[str]:
+    """Mirror a ``gs://`` output prefix into a temporary directory.
+
+    The checks are written against a local directory (``Path.exists``,
+    ``glob``, ``rasterio.open``); rather than teach every helper about
+    GCS, we stage what they read — the output COGs and the failures
+    journal — and run the local code unchanged. Only the prefix's own
+    objects are copied (no nested "directories"); the listing is one
+    request, the downloads run in parallel.
+
+    Args:
+        gcs_prefix: ``gs://bucket/prefix`` of the export.
+        credentials: Credentials for the storage client (``None`` = ADC).
+        max_bytes: Refuse (``ValueError``) when the COGs exceed this size.
+        parallelism: Concurrent downloads.
+
+    Returns:
+        The staging directory; the caller owns its lifetime. On any
+        failure the partially filled directory is removed before the
+        exception propagates.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from datensee.auth import gcs_client, split_gcs_uri
+
+    bucket_name, prefix = split_gcs_uri(gcs_prefix)
+    listing_prefix = f"{prefix.rstrip('/')}/" if prefix.strip("/") else ""
+
+    client = gcs_client(credentials)
+    wanted = [
+        blob
+        for blob in client.list_blobs(bucket_name, prefix=listing_prefix, delimiter="/")
+        if (name := blob.name[len(listing_prefix) :])
+        and (TILE_FILENAME_RE.match(name) or name == FAILURES_FILENAME)
+    ]
+    total = sum(blob.size or 0 for blob in wanted)
+    if total > max_bytes:
+        raise ValueError(
+            f"{len(wanted)} files / {total / 1e9:.1f} GB under {gcs_prefix}; validate mirrors "
+            f"a gs:// output locally and refuses above {max_bytes / 1e9:.0f} GB. Run it on a "
+            "host with the disk for it (max_stage_bytes=…), or validate the local run."
+        )
+
+    staging = tempfile.TemporaryDirectory(prefix="datensee-validate-")
+    root = Path(staging.name)
+    try:
+        with ThreadPoolExecutor(max_workers=parallelism) as pool:
+            for _ in pool.map(
+                lambda blob: blob.download_to_filename(
+                    str(root / blob.name[len(listing_prefix) :])
+                ),
+                wanted,
+            ):
+                pass
+    except BaseException:
+        staging.cleanup()
+        raise
+    return staging

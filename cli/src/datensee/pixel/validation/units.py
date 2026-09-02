@@ -24,6 +24,9 @@ from datensee.pixel.config import TileCoordinate
 # indices >= 10000, hence ``\d{4,}``.
 TILE_FILENAME_RE = re.compile(r"^tile_r(\d{4,})_c(\d{4,})\.tif$")
 
+FAILURES_FILENAME = "_failures.json"
+"""The pipeline's dead-letter journal, written next to the output COGs."""
+
 # Shared SKIPPED message for configs whose tiles are externalized to a
 # file — checks cannot enumerate output units without inline coordinates.
 TILES_FILE_SKIP_MESSAGE = (
@@ -127,7 +130,7 @@ def read_failure_keys(output_dir: Path) -> set[tuple[int, int]]:
     individually — one corrupt record (e.g. a partial flush at the end of
     a job) must not hide the valid entries above it.
     """
-    failures_path = output_dir / "_failures.json"
+    failures_path = output_dir / FAILURES_FILENAME
     if not failures_path.exists():
         return set()
     try:

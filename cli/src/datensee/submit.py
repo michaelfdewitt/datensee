@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -47,6 +48,13 @@ if TYPE_CHECKING:
 console = Console()
 
 TILE_FILE_THRESHOLD = 5000
+
+
+PIPELINE_CONFIG_FILENAME = "_pipeline-config.json"
+"""Config sidecar written next to the output so ``datensee validate`` can find it."""
+
+_MIN_JAVA_MAJOR = 21
+"""The Dataflow worker harness is Java 21, so the JAR is built for it (``--release 21``)."""
 
 
 def _count_completed_tiles(output_dir: Path) -> int:
@@ -122,9 +130,18 @@ def _submit_local(
 
     config = _maybe_externalize_tiles(config, dry_run=dry_run, credentials=credentials)
 
-    with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as tmp:
-        tmp_path = Path(tmp.name)
-        config.write_json(tmp_path)
+    # Local-filesystem outputs get the config as a sidecar next to the
+    # COGs (mirroring the gs://…/_pipeline-config.json that Dataflow mode
+    # stages), so `datensee validate OUTPUT` needs no --config. A gs://
+    # output in local mode keeps a temp file.
+    if config.output.output_path.startswith("gs://"):
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as tmp:
+            tmp_path = Path(tmp.name)
+    else:
+        out_dir = Path(config.output.output_path)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = out_dir / PIPELINE_CONFIG_FILENAME
+    config.write_json(tmp_path)
 
     cmd = _build_local_command(jar_path, tmp_path)
 
@@ -135,6 +152,7 @@ def _submit_local(
             console.print(f"[dim]Tiles would be uploaded to: {config.tile_grid.tiles_file}[/dim]")
         return None
 
+    _require_java()
     console.print("[bold]Submitting pipeline[/bold] (mode=local)")
     console.print(f"Config written to: {tmp_path}")
 
@@ -213,7 +231,7 @@ def _submit_dataflow(
 
     config = _maybe_externalize_tiles(config, dry_run=dry_run, credentials=credentials)
 
-    config_uri = config.output.output_path.rstrip("/") + "/_pipeline-config.json"
+    config_uri = config.output.output_path.rstrip("/") + "/" + PIPELINE_CONFIG_FILENAME
     config_json = config.model_dump_json(indent=2, exclude_none=True)
 
     job_name = _job_name()
@@ -472,14 +490,10 @@ def _upload_to_gcs(
     content_type: str = "application/x-ndjson",
 ) -> None:
     """Upload bytes to a GCS URI using caller-supplied credentials, if any."""
-    from google.cloud import storage
+    from datensee.auth import gcs_client, split_gcs_uri
 
-    parts = gcs_uri.replace("gs://", "").split("/", 1)
-    bucket_name = parts[0]
-    blob_name = parts[1] if len(parts) > 1 else ""
-
-    client = storage.Client(credentials=credentials) if credentials else storage.Client()
-    bucket = client.bucket(bucket_name)
+    bucket_name, blob_name = split_gcs_uri(gcs_uri)
+    bucket = gcs_client(credentials).bucket(bucket_name)
     blob = bucket.blob(blob_name)
     blob.upload_from_string(data, content_type=content_type)
 
@@ -488,11 +502,58 @@ def _build_local_command(jar_path: Path, config_path: Path) -> list[str]:
     """Build the java invocation for the Direct runner."""
     return [
         "java",
+        # Log lines carry non-ASCII; without an explicit encoding a JVM on
+        # a host with no UTF-8 locale (bare containers) mangles them to '?'.
+        # (Native-access policy lives in the JAR manifest, not here.)
+        "-Dstdout.encoding=UTF-8",
+        "-Dstderr.encoding=UTF-8",
         "-jar",
         str(jar_path),
         f"--configFile={config_path}",
         "--runner=DirectRunner",
     ]
+
+
+def _parse_java_major(version_output: str) -> int | None:
+    """Extract the major version from ``java -version`` output.
+
+    Handles both the modern ``"21.0.4"`` and the legacy ``"1.8.0_392"``
+    spellings. Returns ``None`` when no version string is present.
+    """
+    match = re.search(r'version "(\d+)(?:\.(\d+))?', version_output)
+    if match is None:
+        return None
+    major = int(match.group(1))
+    if major == 1 and match.group(2):
+        return int(match.group(2))
+    return major
+
+
+def _require_java(minimum_major: int = _MIN_JAVA_MAJOR) -> None:
+    """Fail before spawning the JVM if ``java`` is missing or too old.
+
+    The JAR is compiled for Java 21 (class-file 65); an older launcher
+    would die with an opaque ``UnsupportedClassVersionError``.
+
+    Raises:
+        RuntimeError: With install guidance, when ``java`` is absent or
+            older than ``minimum_major``.
+    """
+    try:
+        probe = subprocess.run(["java", "-version"], capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        raise RuntimeError(
+            "`java` was not found on PATH. The local runner needs a Java "
+            f"{minimum_major}+ runtime (e.g. Temurin) — install one, or use "
+            "--runner=dataflow, which needs no local Java."
+        ) from None
+    major = _parse_java_major(probe.stderr + probe.stdout)
+    if major is not None and major < minimum_major:
+        raise RuntimeError(
+            f"Java {major} found on PATH, but the pipeline JAR needs Java "
+            f"{minimum_major}+ (the Dataflow worker JDK). Install a newer JDK/JRE or "
+            "point PATH/JAVA_HOME at one."
+        )
 
 
 def _job_name() -> str:

@@ -192,7 +192,7 @@ public final class DatensEEPipeline {
     private static void applyUserCredentials(DatensEEOptions options) throws IOException {
         Integer fd = options.getUserTokenFd();
         if (fd == null || fd < 0) {
-            LOG.info("No --userTokenFd set — falling back to application default credentials.");
+            LOG.info("No --userTokenFd set; falling back to application default credentials.");
             return;
         }
 

@@ -39,6 +39,7 @@ _NANOS_THRESHOLD: int = 10**17
 
 if TYPE_CHECKING:
     from google.auth.credentials import Credentials
+    from google.cloud import storage
 
 EXPORT_META_FILENAME: str = "_export_meta.json"
 
@@ -71,6 +72,11 @@ class ExportMeta(BaseModel):
     snapshot_time: int | None = None
     pixel_grid: PixelGrid | None = None
     nodata: float | None = None
+    # Output raster shape as declared at export time. Informational for the
+    # pipeline (EE's responses are self-describing) but load-bearing for
+    # `validate` and inherited by retry rounds. Legacy meta lacks them.
+    band_count: int | None = None
+    data_type: str | None = None
 
     @model_validator(mode="after")
     def _migrate_nanos_snapshot_time(self) -> ExportMeta:
@@ -118,6 +124,8 @@ def build_meta(
     snapshot_time: int | None = None,
     pixel_grid: PixelGrid | None = None,
     nodata: float | None = None,
+    band_count: int | None = None,
+    data_type: str | None = None,
 ) -> ExportMeta:
     return ExportMeta(
         crs=crs,
@@ -129,16 +137,17 @@ def build_meta(
         snapshot_time=snapshot_time,
         pixel_grid=pixel_grid,
         nodata=nodata,
+        band_count=band_count,
+        data_type=data_type,
     )
 
 
-def _gcs_blob(output_path: str, credentials: Credentials | None):
+def _gcs_blob(output_path: str, credentials: Credentials | None) -> storage.Blob:
     """Resolve a GCS blob handle for the meta sidecar at ``output_path``."""
-    from google.cloud import storage as _gcs
+    from datensee.auth import gcs_client, split_gcs_uri
 
-    client = _gcs.Client(credentials=credentials)
-    gs_uri = output_path[len("gs://") :]
-    bucket_name, _, prefix = gs_uri.partition("/")
+    client = gcs_client(credentials)
+    bucket_name, prefix = split_gcs_uri(output_path)
     prefix = prefix.rstrip("/")
     blob_name = f"{prefix}/{EXPORT_META_FILENAME}" if prefix else EXPORT_META_FILENAME
     return client.bucket(bucket_name).blob(blob_name)
@@ -194,6 +203,8 @@ def verify_retry_compatibility(
     gee_project: str,
     ee_expression: str,
     nodata: float | None = None,
+    band_count: int | None = None,
+    data_type: str | None = None,
 ) -> None:
     """Raise :class:`ExportMetaMismatch` if any retry arg disagrees with ``meta``."""
     mismatches: list[str] = []
@@ -214,6 +225,10 @@ def verify_retry_compatibility(
         mismatches.append(f"gee_project: original={meta.gee_project!r}, retry={gee_project!r}")
     if meta.nodata != nodata:
         mismatches.append(f"nodata: original={meta.nodata}, retry={nodata}")
+    if meta.band_count is not None and band_count is not None and meta.band_count != band_count:
+        mismatches.append(f"band_count: original={meta.band_count}, retry={band_count}")
+    if meta.data_type is not None and data_type is not None and meta.data_type != data_type:
+        mismatches.append(f"data_type: original={meta.data_type}, retry={data_type}")
     if meta.ee_expression != ee_expression:
         meta_hash = meta.ee_expression_sha256
         retry_hash = _hash_expression(ee_expression)

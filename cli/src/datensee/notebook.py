@@ -112,15 +112,16 @@ def _export_adc_for_java() -> None:
 
 
 def ensure_jar() -> Path:
-    """Locate the pipeline JAR for local-mode submission.
+    """Locate the pipeline JAR for local-mode submission, downloading if absent.
 
     Cloud submission (Dataflow Flex Template) does not need a local JAR
-    and never calls this. Raises :class:`FileNotFoundError` with build
-    instructions when no JAR is on disk.
+    and never calls this. Delegates to :func:`datensee.jar.ensure_jar`,
+    which searches the usual locations and falls back to the prebuilt
+    JAR on the matching GitHub Release.
     """
-    from datensee.jar import find_jar
+    from datensee.jar import ensure_jar as _ensure_jar
 
-    return find_jar(None)
+    return _ensure_jar()
 
 
 # ---------------------------------------------------------------------------

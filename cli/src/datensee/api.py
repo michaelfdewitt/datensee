@@ -317,6 +317,8 @@ def export(
     tile_size: int = 512,
     output_tile_size: int | None = None,
     nodata: float | None = None,
+    band_count: int = 1,
+    data_type: str = "float32",
     runner: Literal["local", "dataflow"] = "dataflow",
     region_gcp: str = "us-central1",
     temp_location: str | None = None,
@@ -369,6 +371,12 @@ def export(
             GDAL_NODATA tag. EE returns masked pixels as 0 with no mask
             channel — unmask(sentinel) the expression and pass the
             sentinel here so GIS tools can tell nodata from real zeros.
+        band_count: Bands your expression produces (default 1). Informational
+            for the pipeline (EE responses are self-describing) but recorded
+            in the config and meta sidecar; `datensee validate` checks the
+            output against it.
+        data_type: Pixel dtype your expression produces (default 'float32';
+            e.g. 'int16' for SRTM). Same role as band_count.
         runner: 'local' or 'dataflow'.
         region_gcp: Dataflow region (e.g. 'us-central1').
         temp_location: GCS URI for Dataflow temp files (required for Dataflow).
@@ -381,7 +389,8 @@ def export(
             submit time. Override only when you need a deterministic
             snapshot (e.g. reproducing a prior export). Workers see a
             consistent view of mutable assets across the whole job.
-        dry_run: If True, validate but don't submit.
+        dry_run: If True, validate but don't submit. The export
+            summary callback still fires; nothing is written or fetched.
         progress_callback: Optional callback(completed, total) for local
             mode progress. Ignored for Dataflow mode.
         confirm_callback: Optional callback(PipelineConfig) invoked after
@@ -506,6 +515,8 @@ def export(
             output_path=output,
             output_tile_size_pixels=output_tile_size,
             nodata=nodata,
+            band_count=band_count,
+            data_type=data_type,
         ),
         runner=runner_config,
         snapshot_time=snapshot_time_micros,
@@ -550,6 +561,8 @@ def export(
             snapshot_time=snapshot_time_micros,
             pixel_grid=tile_grid.pixel_grid,
             nodata=nodata,
+            band_count=band_count,
+            data_type=data_type,
         ),
         credentials=credentials,
     )
@@ -615,7 +628,8 @@ def demo(
         project: GCP project ID with Earth Engine API enabled.
         output: Local directory for output tiles + VRT.
         jar: Path to the pipeline JAR (auto-detected if None).
-        dry_run: If True, validate but don't submit.
+        dry_run: If True, validate but don't submit. The export
+            summary callback still fires; nothing is written or fetched.
         progress_callback: Optional callback(completed, total) for progress.
         confirm_callback: See :func:`export`.
 
@@ -727,6 +741,9 @@ class RetryResult(BaseModel):
     carryover_count: int = 0
     stats: dict[str, int] = {}
     tiles_failed_this_round: int | None = None
+    gee_project: str | None = None
+    """The project the round ran under — resolved from the meta sidecar when
+    the caller passed none, so CLI hints can quote it."""
 
 
 def retry(
@@ -744,6 +761,9 @@ def retry(
     region_gcp: str = "us-central1",
     temp_location: str | None = None,
     labels: dict[str, str] | None = None,
+    machine_type: str | None = None,
+    num_workers: int | None = None,
+    max_workers: int | None = None,
     jar: Path | str | None = None,
     max_depth: int = 2,
     dry_run: bool = False,
@@ -854,6 +874,9 @@ def retry(
         output_tile_size = persisted_meta.output_tile_size_pixels
     if nodata is None:
         nodata = persisted_meta.nodata
+    # Output shape declared by the original export; legacy meta → defaults.
+    band_count = persisted_meta.band_count or 1
+    data_type = persisted_meta.data_type or "float32"
     # Now verify everything (caller-passed values too) matches.
     verify_retry_compatibility(
         persisted_meta,
@@ -874,7 +897,7 @@ def retry(
         else:
             journal = Path(output) / "_failures.json"
 
-    records = read_journal(journal)
+    records = read_journal(journal, credentials=credentials)
 
     # Splitting is legal for every export shape: retry rounds run with
     # merge_existing_output, so split children overlay their parent's
@@ -886,6 +909,7 @@ def retry(
             next_tiles_count=0,
             carryover_count=len(plan.carryover),
             stats=plan.stats,
+            gee_project=project,
         )
 
     # Stage the next-round tiles file and, when this round has
@@ -897,14 +921,13 @@ def retry(
     # asynchronous journal writer.
     def _stage(filename: str, write: Callable[[Path], None]) -> str:
         if output.startswith("gs://"):
-            staged_uri = output.rstrip("/") + "/" + filename
-            local_staging = Path(tempfile.mkdtemp()) / filename
-            write(local_staging)
-            from google.cloud import storage as _gcs
+            from datensee.submit import _upload_to_gcs
 
-            client = _gcs.Client(credentials=credentials, project=project)
-            bucket_name, _, blob_path = staged_uri[len("gs://") :].partition("/")
-            client.bucket(bucket_name).blob(blob_path).upload_from_filename(str(local_staging))
+            staged_uri = output.rstrip("/") + "/" + filename
+            with tempfile.TemporaryDirectory() as scratch:
+                local_staging = Path(scratch) / filename
+                write(local_staging)
+                _upload_to_gcs(staged_uri, local_staging.read_bytes(), credentials=credentials)
             return staged_uri
         out_dir = Path(output)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -929,6 +952,16 @@ def retry(
 
     # Build pipeline config with tiles_file (no inline tiles).
     if runner == "dataflow":
+        # Same override surface as export(): a retry round after a
+        # ZONE_RESOURCE_POOL_EXHAUSTED stockout must be able to switch
+        # machine family too.
+        df_overrides: dict[str, Any] = {}
+        if machine_type is not None:
+            df_overrides["machine_type"] = machine_type
+        if num_workers is not None:
+            df_overrides["num_workers"] = num_workers
+        if max_workers is not None:
+            df_overrides["max_workers"] = max_workers
         runner_config = RunnerConfig(
             mode="dataflow",
             dataflow=DataflowRunnerConfig(
@@ -938,6 +971,7 @@ def retry(
                 staging_location=(temp_location or output.rstrip("/") + "/_tmp").rstrip("/")
                 + "/staging",
                 labels=labels,
+                **df_overrides,
             ),
         )
     else:
@@ -984,6 +1018,8 @@ def retry(
             # (partial) tile set — see AssembledCogWriter's merge path.
             merge_existing_output=True,
             nodata=nodata,
+            band_count=band_count,
+            data_type=data_type,
         ),
         runner=runner_config,
         snapshot_time=snapshot_time_micros,
@@ -992,6 +1028,7 @@ def retry(
 
     if dry_run:
         return RetryResult(
+            gee_project=project,
             next_tiles_count=len(plan.next_tiles),
             carryover_count=len(plan.carryover),
             stats=plan.stats,

@@ -1,0 +1,60 @@
+# Pull-request / master CI. The release workflow (publish.yml) only runs on
+# tags, so this is what gates a merge: Python lint + unit tests + the
+# Python↔JSON-schema contract test, and the Java pipeline's JUnit suite.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Lint
+        working-directory: cli
+        run: |
+          uv sync --extra validation
+          uv run ruff check src tests
+          uv run ruff format --check src tests
+      - name: Unit + contract tests
+        working-directory: cli
+        run: uv run pytest -q
+      - name: Wheel builds
+        working-directory: cli
+        run: uv build
+
+  java:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+      # gradle-wrapper.jar is gitignored; install the version the wrapper pins.
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.4.0"
+      - name: JUnit + shadow JAR
+        working-directory: pipelines
+        run: gradle --no-daemon test shadowJar
+      - name: JAR targets the Dataflow worker JDK (class-file 65 = Java 21)
+        working-directory: pipelines
+        run: |
+          unzip -o -q build/libs/datensee-pipeline.jar com/datensee/DatensEEPipeline.class -d /tmp/cv
+          major=$(javap -verbose /tmp/cv/com/datensee/DatensEEPipeline.class | awk '/major version/ {print $3}')
+          echo "class-file major version: ${major}"
+          test "${major}" = "65"

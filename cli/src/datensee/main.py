@@ -12,13 +12,14 @@ import subprocess
 from pathlib import Path
 from typing import Annotated
 
+import httpx
 import typer
 from rich.console import Console
 
 from datensee import __version__, api
 from datensee.config import PipelineConfig
 from datensee.display import render_export_summary, render_post_run_summary
-from datensee.jar import build_jar
+from datensee.jar import build_jar, download_jar
 
 app = typer.Typer(
     name="datensee",
@@ -86,6 +87,14 @@ def main(
 # ---------------------------------------------------------------------------
 
 
+def _announce_job(job_id: str, project: str, region_gcp: str) -> None:
+    """Print the submitted job id and the exact command that polls it."""
+    console.print(f"[green]Job submitted:[/green] {job_id}")
+    console.print(
+        f"  poll with: datensee status {job_id} --project {project} --region-gcp {region_gcp}"
+    )
+
+
 @app.command()
 def demo(
     project: Annotated[
@@ -110,12 +119,14 @@ def demo(
     ] = None,
     dry_run: Annotated[
         bool,
-        typer.Option("--dry-run", help="Print the pipeline command without executing."),
+        typer.Option(
+            "--dry-run", help="Validate inputs and print the export summary without submitting."
+        ),
     ] = False,
 ) -> None:
     """Fetch Landsat 9 NDVI tiles over SF Bay Area locally.
 
-    Uses a hardcoded 0.25 x 0.25 degree region at 30 m/pixel (~4 tiles).
+    Uses a hardcoded 0.25 x 0.25 degree region at 30 m/pixel (9 tiles of 512×512 px).
     Output COGs are written to OUTPUT_DIR as ``tile_r{row}_c{col}.tif``;
     open them as a directory in QGIS or any GIS tool. To control output
     granularity (one big COG vs. many small COGs), use ``datensee export``
@@ -228,6 +239,46 @@ def export(
         str | None,
         typer.Option("--temp-location", help="GCS URI for Dataflow temp files."),
     ] = None,
+    band_count: Annotated[
+        int,
+        typer.Option(
+            "--band-count",
+            min=1,
+            help=(
+                "Bands your expression produces. Recorded in the config/meta and "
+                "checked by `datensee validate`; the fetch itself is shape-agnostic."
+            ),
+        ),
+    ] = 1,
+    data_type: Annotated[
+        str,
+        typer.Option(
+            "--data-type",
+            help=(
+                "Pixel dtype your expression produces (e.g. int16 for SRTM, float32 "
+                "for NDVI). Recorded in the config/meta and checked by `datensee validate`."
+            ),
+        ),
+    ] = "float32",
+    machine_type: Annotated[
+        str | None,
+        typer.Option(
+            "--machine-type",
+            help=(
+                "Dataflow worker machine type (default n2-standard-4). Switch "
+                "families (e.g. e2-standard-4) when a zone reports "
+                "ZONE_RESOURCE_POOL_EXHAUSTED."
+            ),
+        ),
+    ] = None,
+    num_workers: Annotated[
+        int | None,
+        typer.Option("--num-workers", min=1, help="Initial Dataflow worker count."),
+    ] = None,
+    max_workers: Annotated[
+        int | None,
+        typer.Option("--max-workers", min=1, help="Dataflow autoscaling ceiling (default 100)."),
+    ] = None,
     jar: Annotated[
         Path | None,
         typer.Option("--jar", help="Path to the pipeline JAR (auto-detected if omitted)."),
@@ -246,7 +297,9 @@ def export(
     ] = None,
     dry_run: Annotated[
         bool,
-        typer.Option("--dry-run", help="Print the pipeline command without executing."),
+        typer.Option(
+            "--dry-run", help="Validate inputs and print the export summary without submitting."
+        ),
     ] = False,
     yes: Annotated[
         bool,
@@ -281,9 +334,14 @@ def export(
             tile_size=tile_size,
             output_tile_size=output_tile_size,
             nodata=nodata,
+            band_count=band_count,
+            data_type=data_type,
             runner=runner,  # type: ignore[arg-type]
             region_gcp=region_gcp,
             temp_location=temp_location,
+            machine_type=machine_type,
+            num_workers=num_workers,
+            max_workers=max_workers,
             jar=jar,
             snapshot_time=snapshot_time_micros,
             dry_run=dry_run,
@@ -300,7 +358,7 @@ def export(
         return
 
     if result.job_id:
-        console.print(f"[green]Job submitted:[/green] {result.job_id}")
+        _announce_job(result.job_id, project, region_gcp)
 
     is_local_filesystem_output = runner == "local" and not output.startswith("gs://")
 
@@ -470,8 +528,27 @@ def jar_path_cmd() -> None:
         console.print(str(path))
     else:
         console.print("[red]Pipeline JAR not found.[/red]")
-        console.print("Build it with: datensee jar build")
+        console.print("Fetch it with: datensee jar download  (or build: datensee jar build)")
         raise typer.Exit(code=1)
+
+
+@jar_app.command("download")
+def jar_download_cmd(
+    version: Annotated[
+        str | None,
+        typer.Option("--version", help="Release version to fetch (default: this package's)."),
+    ] = None,
+    force: Annotated[
+        bool, typer.Option("--force", help="Re-download even if already cached.")
+    ] = False,
+) -> None:
+    """Download the prebuilt pipeline JAR from GitHub Releases."""
+    try:
+        path = download_jar(version or __version__, force=force)
+        console.print(f"[green]JAR ready:[/green] {path}")
+    except (FileNotFoundError, httpx.HTTPError) as exc:
+        console.print(f"[red]Download failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
 
 
 @jar_app.command("build")
@@ -490,6 +567,30 @@ def jar_build_cmd() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _load_pipeline_config(reference: str) -> PipelineConfig:
+    """Load a pipeline config from a local path or a ``gs://`` URI."""
+    if reference.startswith("gs://"):
+        from datensee.auth import gcs_client, split_gcs_uri
+
+        bucket, blob_name = split_gcs_uri(reference)
+        blob = gcs_client().bucket(bucket).blob(blob_name)
+        if not blob.exists():
+            raise FileNotFoundError(
+                f"No pipeline config at {reference}. Pass --config with the file the export "
+                "wrote (Dataflow mode stages it next to the output; local mode writes it "
+                "into the output directory)."
+            )
+        return PipelineConfig.model_validate_json(blob.download_as_text())
+    path = Path(reference)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"No pipeline config at {path}. Pass --config with the file the export wrote "
+            "(local mode writes OUTPUT/_pipeline-config.json; older outputs need the "
+            "temp-file path printed at submit time)."
+        )
+    return PipelineConfig.read_json(path)
+
+
 @app.command("validate")
 def validate_cmd(
     output_path: Annotated[
@@ -497,15 +598,14 @@ def validate_cmd(
         typer.Argument(help="Output directory (local) or GCS prefix to validate."),
     ],
     config_file: Annotated[
-        Path,
+        str | None,
         typer.Option(
             "--config",
             "-c",
-            help="Pipeline config JSON file that produced the output.",
-            exists=True,
-            readable=True,
+            help="Pipeline config JSON that produced the output (local path or gs:// URI). "
+            "Defaults to OUTPUT_PATH/_pipeline-config.json, which both runners write.",
         ),
-    ],
+    ] = None,
     pixels: Annotated[
         bool,
         typer.Option(
@@ -539,8 +639,14 @@ def validate_cmd(
     pipeline chain at the cost of a few EECU-seconds.
     """
     from datensee.pixel.validation import validate_output
+    from datensee.submit import PIPELINE_CONFIG_FILENAME
 
-    config = PipelineConfig.read_json(config_file)
+    config_ref = config_file or f"{output_path.rstrip('/')}/{PIPELINE_CONFIG_FILENAME}"
+    try:
+        config = _load_pipeline_config(config_ref)
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=2) from exc
 
     report = validate_output(
         output_path,
@@ -644,6 +750,22 @@ def retry_cmd(
     temp_location: Annotated[
         str | None,
         typer.Option("--temp-location", help="GCS URI for Dataflow temp files."),
+    ] = None,
+    machine_type: Annotated[
+        str | None,
+        typer.Option(
+            "--machine-type",
+            help="Dataflow worker machine type (default n2-standard-4); e.g. e2-standard-4 "
+            "when a zone reports ZONE_RESOURCE_POOL_EXHAUSTED.",
+        ),
+    ] = None,
+    num_workers: Annotated[
+        int | None,
+        typer.Option("--num-workers", min=1, help="Initial Dataflow worker count."),
+    ] = None,
+    max_workers: Annotated[
+        int | None,
+        typer.Option("--max-workers", min=1, help="Dataflow autoscaling ceiling (default 100)."),
     ] = None,
     max_depth: Annotated[
         int,
@@ -754,6 +876,9 @@ def retry_cmd(
                 tile_size=tile_size,
                 output_tile_size=output_tile_size,
                 temp_location=temp_location,
+                machine_type=machine_type,
+                num_workers=num_workers,
+                max_workers=max_workers,
                 jar=jar,
                 max_depth=max_depth,
             )
@@ -801,6 +926,9 @@ def retry_cmd(
             runner=runner,  # type: ignore[arg-type]
             region_gcp=region_gcp,
             temp_location=temp_location,
+            machine_type=machine_type,
+            num_workers=num_workers,
+            max_workers=max_workers,
             jar=jar,
             max_depth=max_depth,
             dry_run=dry_run,
@@ -830,7 +958,9 @@ def retry_cmd(
         return
 
     if result.job_id:
-        console.print(f"[green]Job submitted:[/green] {result.job_id}")
+        # --project is optional for retry (the meta sidecar supplies it);
+        # quote the project the round actually ran under.
+        _announce_job(result.job_id, result.gee_project or project or "<project>", region_gcp)
 
     if result.tiles_failed_this_round is not None:
         succeeded = result.next_tiles_count - result.tiles_failed_this_round
