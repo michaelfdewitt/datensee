@@ -17,7 +17,7 @@ import typer
 from rich.console import Console
 
 from datensee import __version__, api
-from datensee.config import PipelineConfig
+from datensee.config import AffineTransform, GridDimensions, PipelineConfig, PixelGrid
 from datensee.display import render_export_summary, render_post_run_summary
 from datensee.jar import build_jar, download_jar
 
@@ -163,6 +163,77 @@ def demo(
 # ---------------------------------------------------------------------------
 
 
+def _load_expression_and_region(
+    expression_file: Path, region_file: Path | None
+) -> tuple[str, dict | None]:
+    """Resolve the expression and region from files.
+
+    EXPRESSION_FILE is either a bare serialized expression, or a *bundle*
+    ``{"expression": {...}, "region": {...}}`` (what the Code Editor
+    snippet prints) — one file instead of two. A bundle plus a separate
+    region file is contradictory and rejected.
+    """
+    raw = expression_file.read_text().strip()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{expression_file} is not valid JSON: {exc}") from exc
+
+    if isinstance(parsed, dict) and "expression" in parsed:
+        if region_file is not None:
+            raise ValueError(
+                f"{expression_file} is a bundle (contains its own region), so a "
+                "separate REGION_FILE must not also be given."
+            )
+        expression = parsed["expression"]
+        expression_str = expression if isinstance(expression, str) else json.dumps(expression)
+        return expression_str, parsed.get("region")
+
+    region = json.loads(region_file.read_text()) if region_file is not None else None
+    return raw, region
+
+
+def _build_pixel_grid(
+    crs: str, crs_transform: str | None, dimensions: str | None
+) -> PixelGrid | None:
+    """Build an exact :class:`PixelGrid` from --crs-transform + --dimensions.
+
+    Returns ``None`` when neither is given (the scale path). Requires both
+    together.
+    """
+    if crs_transform is None and dimensions is None:
+        return None
+    if crs_transform is None or dimensions is None:
+        raise ValueError("--crs-transform and --dimensions must be given together.")
+
+    parts = [x.strip() for x in crs_transform.split(",")]
+    if len(parts) != 6:
+        raise ValueError(
+            "--crs-transform must be 6 comma-separated numbers "
+            "'scaleX,shearX,translateX,shearY,scaleY,translateY'."
+        )
+    try:
+        sx, kx, tx, ky, sy, ty = (float(x) for x in parts)
+    except ValueError as exc:
+        raise ValueError(f"--crs-transform has a non-numeric component: {exc}") from exc
+
+    try:
+        w_str, h_str = dimensions.lower().split("x")
+        width, height = int(w_str), int(h_str)
+    except ValueError as exc:
+        raise ValueError("--dimensions must be 'WIDTHxHEIGHT', e.g. 10240x10240.") from exc
+    if width <= 0 or height <= 0:
+        raise ValueError("--dimensions must be positive.")
+
+    return PixelGrid(
+        crs_code=crs,
+        affine_transform=AffineTransform(
+            scale_x=sx, shear_x=kx, translate_x=tx, shear_y=ky, scale_y=sy, translate_y=ty
+        ),
+        dimensions=GridDimensions(width=width, height=height),
+    )
+
+
 @app.command()
 def export(
     expression_file: Annotated[
@@ -174,17 +245,20 @@ def export(
         ),
     ],
     region_file: Annotated[
-        Path,
+        Path | None,
         typer.Argument(
-            help="GeoJSON file with the export region polygon (WGS84).",
+            help="GeoJSON file with the export region polygon (WGS84). Omit when "
+            "EXPRESSION_FILE is a bundle carrying both expression and region "
+            "(see `docs/code-editor-snippet.js`), or when --crs-transform/"
+            "--dimensions fully specify the grid.",
             exists=True,
             readable=True,
         ),
-    ],
+    ] = None,
     project: Annotated[
         str,
         typer.Option("--project", "-p", help="GCP project ID with EE API enabled."),
-    ],
+    ] = ...,
     output: Annotated[
         str,
         typer.Option(
@@ -192,15 +266,39 @@ def export(
             "-o",
             help="Output path: GCS URI (gs://…) or local directory.",
         ),
-    ],
+    ] = ...,
     scale: Annotated[
-        float,
-        typer.Option("--scale", "-s", help="Pixel size in meters.", min=0.1),
-    ] = 30.0,
+        float | None,
+        typer.Option(
+            "--scale",
+            "-s",
+            help="Pixel size in meters (default 30). Mutually exclusive with "
+            "--crs-transform/--dimensions.",
+            min=0.1,
+        ),
+    ] = None,
     crs: Annotated[
         str,
         typer.Option("--crs", help="Target CRS (EPSG code or proj string)."),
     ] = "EPSG:4326",
+    crs_transform: Annotated[
+        str | None,
+        typer.Option(
+            "--crs-transform",
+            help="Exact grid: the 6-number affine 'scaleX,shearX,translateX,shearY,"
+            "scaleY,translateY' in --crs units (as EE's crsTransform). Requires "
+            "--dimensions; mutually exclusive with --scale. Pins the output grid "
+            "pixel-for-pixel for exact cross-export comparison.",
+        ),
+    ] = None,
+    dimensions: Annotated[
+        str | None,
+        typer.Option(
+            "--dimensions",
+            help="Exact grid: output size as 'WIDTHxHEIGHT' in pixels (whole "
+            "multiple of --tile-size). Use with --crs-transform.",
+        ),
+    ] = None,
     tile_size: Annotated[
         int,
         typer.Option("--tile-size", help="Compute tile edge size in pixels."),
@@ -314,8 +412,15 @@ def export(
     ] = False,
 ) -> None:
     """Submit an Earth Engine export job to Cloud Dataflow (or local runner)."""
-    ee_expression = expression_file.read_text().strip()
-    geojson_geometry = json.loads(region_file.read_text())
+    try:
+        ee_expression, geojson_geometry = _load_expression_and_region(expression_file, region_file)
+        pixel_grid = _build_pixel_grid(crs, crs_transform, dimensions)
+    except ValueError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    if pixel_grid is not None and geojson_geometry is None and region_file is None:
+        # An exact grid needs no region; leave it None to tile the whole grid.
+        pass
     snapshot_time_micros = _parse_snapshot_time(snapshot_time)
 
     def confirm(config: PipelineConfig) -> None:
@@ -331,6 +436,7 @@ def export(
             output=output,
             scale=scale,
             crs=crs,
+            pixel_grid=pixel_grid,
             tile_size=tile_size,
             output_tile_size=output_tile_size,
             nodata=nodata,

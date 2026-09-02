@@ -1,4 +1,6 @@
-# CLAUDE.md — DatensEE Orchestrator
+# DatensEE — Architecture & Conventions
+
+High-level architecture, core design decisions, and coding conventions for DatensEE.
 
 > See also: [`docs/handoff.md`](docs/handoff.md) for deployment story, COG pipeline gotchas, recent fixes, known limitations, and the test runbook.
 
@@ -89,7 +91,6 @@ The shape splits cleanly between *shared infrastructure* (auth, snapshot pinning
 
 ```
 datensee/
-├── CLAUDE.md
 ├── LICENSE
 ├── cli/
 │   ├── pyproject.toml
@@ -265,13 +266,3 @@ Unit tests (no network):
 ```bash
 cd cli && uv run pytest -v
 ```
-
-## Notes for Claude
-
-- When generating code, always include type hints (Python) or type annotations (Java). No untyped code.
-- Prefer small, composable functions/methods over large monolithic ones.
-- When in doubt about a Beam API, check https://beam.apache.org/documentation/ — don't guess.
-- When in doubt about the EE HV API, check https://developers.google.com/earth-engine/reference — don't guess.
-- The user is a staff engineer. Skip boilerplate explanations; be direct and precise.
-- If a design decision has tradeoffs, name them explicitly rather than picking silently.
-- The EE computation is opaque. Never parse, optimize, or interpret the expression graph — but composing with it (wrapping in clip, cast, etc.) is fine.

@@ -462,3 +462,231 @@ def test_pixel_size_native_geographic_uses_equator_constant() -> None:
 def test_pixel_size_native_projected_passes_through() -> None:
     assert _pixel_size_native("EPSG:32610", 30.0) == 30.0
     assert _pixel_size_native("EPSG:3857", 100.0) == 100.0
+
+
+# ---------------------------------------------------------------------------
+# Exact-grid decomposition (decompose_pixel_grid / tiles_for_grid)
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Exact-grid decomposition (decompose_pixel_grid / tiles_for_grid)
+#
+# The grid math is load-bearing for exact cross-export pixel comparison, so
+# this is covered exhaustively: verbatim preservation, per-tile transforms,
+# every divisibility rule, two-tier partial edges, region filtering, and the
+# round-trip that guarantees a fetched tile lands on the intended pixels.
+# ---------------------------------------------------------------------------
+
+from datensee.pixel.tiling import (  # noqa: E402
+    decompose_pixel_grid,
+    tiles_for_grid,
+)
+
+
+def _utm_grid(
+    width: int, height: int, *, e0: float = 500000.0, n1: float = 4200000.0, scale: float = 10.0
+) -> PixelGrid:
+    return PixelGrid(
+        crs_code="EPSG:32610",
+        affine_transform=AffineTransform(
+            scale_x=scale, translate_x=e0, scale_y=-scale, translate_y=n1
+        ),
+        dimensions=GridDimensions(width=width, height=height),
+    )
+
+
+class TestExactGridPreservation:
+    def test_parent_grid_is_returned_verbatim(self) -> None:
+        grid = _utm_grid(1024, 1024)
+        tg = decompose_pixel_grid(grid, tile_size_pixels=512)
+        assert tg.pixel_grid == grid  # byte-identical: no snapping, no re-derivation
+        assert tg.tile_size_pixels == 512
+
+    def test_tile_count_and_indices(self) -> None:
+        tg = decompose_pixel_grid(_utm_grid(1536, 1024), tile_size_pixels=512)
+        assert len(tg.tiles) == 3 * 2
+        assert {(t.row, t.col) for t in tg.tiles} == {(r, c) for r in range(2) for c in range(3)}
+
+    def test_tiles_are_full_size_and_offsets_are_multiples(self) -> None:
+        tg = decompose_pixel_grid(_utm_grid(1024, 1536), tile_size_pixels=512)
+        for t in tg.tiles:
+            assert (t.width_px, t.height_px) == (512, 512)
+            assert t.col_px % 512 == 0 and t.row_px % 512 == 0
+            assert t.col_px == t.col * 512 and t.row_px == t.row * 512
+
+    def test_non_square_tile_grid(self) -> None:
+        # 3 wide x 1 tall
+        tg = decompose_pixel_grid(_utm_grid(1536, 512), tile_size_pixels=512)
+        assert len(tg.tiles) == 3
+        assert max(t.col for t in tg.tiles) == 2
+        assert max(t.row for t in tg.tiles) == 0
+
+    def test_single_tile_grid(self) -> None:
+        tg = decompose_pixel_grid(_utm_grid(512, 512), tile_size_pixels=512)
+        assert len(tg.tiles) == 1
+        assert (tg.tiles[0].row, tg.tiles[0].col) == (0, 0)
+
+    def test_geographic_crs_grid_preserved(self) -> None:
+        grid = PixelGrid(
+            crs_code="EPSG:4326",
+            affine_transform=AffineTransform(
+                scale_x=0.001, translate_x=-122.5, scale_y=-0.001, translate_y=38.0
+            ),
+            dimensions=GridDimensions(width=1024, height=512),
+        )
+        tg = decompose_pixel_grid(grid, tile_size_pixels=512)
+        assert tg.pixel_grid == grid
+        assert len(tg.tiles) == 2
+
+
+class TestExactGridPerTileTransform:
+    """Each tile's per-fetch grid is the parent transform shifted to its NW
+    corner — this is what is sent verbatim to computePixels."""
+
+    def test_every_tile_transform_is_exact(self) -> None:
+        grid = _utm_grid(1024, 1024, e0=512340.0, n1=4183400.0, scale=10.0)
+        tg = decompose_pixel_grid(grid, tile_size_pixels=512)
+        for t in tg.tiles:
+            pg = tile_pixel_grid(tg.pixel_grid, t)
+            a = pg.affine_transform
+            assert a.scale_x == 10.0 and a.scale_y == -10.0
+            # NW corner = parent origin + integer pixel offset * scale, exact.
+            assert a.translate_x == 512340.0 + t.col_px * 10.0
+            assert a.translate_y == 4183400.0 - t.row_px * 10.0
+            assert (pg.dimensions.width, pg.dimensions.height) == (512, 512)
+
+    def test_tiles_tile_the_grid_without_gaps_or_overlap(self) -> None:
+        grid = _utm_grid(1024, 1536)
+        tg = decompose_pixel_grid(grid, tile_size_pixels=512)
+        covered = {
+            (t.col_px + dx, t.row_px + dy) for t in tg.tiles for dx in (0, 511) for dy in (0, 511)
+        }
+        # 6 tiles × 4 corner-ish samples, all distinct → no overlap.
+        assert len(covered) == len(tg.tiles) * 4
+        # And the union spans exactly [0,1024) × [0,1536).
+        assert max(t.col_px for t in tg.tiles) + 512 == 1024
+        assert max(t.row_px for t in tg.tiles) + 512 == 1536
+
+
+class TestExactGridDivisibility:
+    def test_width_not_multiple_of_tile_size_rejected(self) -> None:
+        with pytest.raises(ValueError, match="whole multiple of tile_size"):
+            decompose_pixel_grid(_utm_grid(1000, 1024), tile_size_pixels=512)
+
+    def test_height_not_multiple_of_tile_size_rejected(self) -> None:
+        with pytest.raises(ValueError, match="whole multiple of tile_size"):
+            decompose_pixel_grid(_utm_grid(1024, 700), tile_size_pixels=512)
+
+    def test_output_tile_size_not_multiple_of_tile_size_rejected(self) -> None:
+        with pytest.raises(ValueError, match="multiple of tile_size"):
+            decompose_pixel_grid(
+                _utm_grid(1024, 1024), tile_size_pixels=512, output_tile_size_pixels=600
+            )
+
+    def test_odd_tile_size_that_divides_is_accepted(self) -> None:
+        # 900 = 3*300; a non-power-of-two tile size must still work.
+        tg = decompose_pixel_grid(_utm_grid(900, 300), tile_size_pixels=300)
+        assert len(tg.tiles) == 3
+
+
+class TestExactGridTwoTier:
+    def test_out_indices_are_floor_of_local_offset(self) -> None:
+        # tile 512, output 1024 → 2 compute tiles per output tile per axis.
+        tg = decompose_pixel_grid(
+            _utm_grid(2048, 1024), tile_size_pixels=512, output_tile_size_pixels=1024
+        )
+        for t in tg.tiles:
+            assert t.out_col == t.col_px // 1024
+            assert t.out_row == t.row_px // 1024
+        assert {(t.out_row, t.out_col) for t in tg.tiles} == {(0, 0), (0, 1)}
+
+    def test_partial_final_output_tile_allowed(self) -> None:
+        # 1536 = 3*512 wide, output 1024 → out cols {0 (2 tiles), 1 (1 tile)}.
+        tg = decompose_pixel_grid(
+            _utm_grid(1536, 512), tile_size_pixels=512, output_tile_size_pixels=1024
+        )
+        by_out = {}
+        for t in tg.tiles:
+            by_out.setdefault(t.out_col, []).append(t)
+        assert sorted(by_out) == [0, 1]
+        assert len(by_out[0]) == 2 and len(by_out[1]) == 1
+
+    def test_non_two_tier_out_indices_mirror_compute_indices(self) -> None:
+        tg = decompose_pixel_grid(_utm_grid(1024, 1024), tile_size_pixels=512)
+        for t in tg.tiles:
+            assert (t.out_row, t.out_col) == (t.row, t.col)
+
+
+class TestExactGridRegionFilter:
+    def _wgs_box_over_utm(self, e_lo, e_hi, n_lo, n_hi) -> dict:
+        from pyproj import Transformer
+
+        to_wgs = Transformer.from_crs("EPSG:32610", "EPSG:4326", always_xy=True)
+        corners = [to_wgs.transform(e, n) for e in (e_lo, e_hi) for n in (n_lo, n_hi)]
+        lons = [c[0] for c in corners]
+        lats = [c[1] for c in corners]
+        return {
+            "type": "Polygon",
+            "coordinates": [
+                [
+                    [min(lons), min(lats)],
+                    [max(lons), min(lats)],
+                    [max(lons), max(lats)],
+                    [min(lons), max(lats)],
+                    [min(lons), min(lats)],
+                ]
+            ],
+        }
+
+    def test_no_region_tiles_whole_grid(self) -> None:
+        tg = decompose_pixel_grid(_utm_grid(1024, 1024), tile_size_pixels=512)
+        assert len(tg.tiles) == 4
+
+    def test_region_covering_whole_grid_keeps_all_tiles(self) -> None:
+        grid = _utm_grid(1024, 1024)
+        region = self._wgs_box_over_utm(499000, 511000, 4188000, 4201000)
+        tg = decompose_pixel_grid(grid, tile_size_pixels=512, geojson_geometry=region)
+        assert len(tg.tiles) == 4
+
+    def test_region_over_one_corner_trims_tiles(self) -> None:
+        grid = _utm_grid(1024, 1024)
+        # NW compute tile only: 500000..505120 E, 4194880..4200000 N.
+        region = self._wgs_box_over_utm(500100, 505000, 4195000, 4199900)
+        tg = decompose_pixel_grid(grid, tile_size_pixels=512, geojson_geometry=region)
+        assert 0 < len(tg.tiles) < 4
+
+    def test_non_intersecting_region_raises(self) -> None:
+        far = {
+            "type": "Polygon",
+            "coordinates": [[[10.0, 10.0], [10.1, 10.0], [10.1, 10.1], [10.0, 10.1], [10.0, 10.0]]],
+        }
+        with pytest.raises(ValueError, match="does not intersect"):
+            decompose_pixel_grid(_utm_grid(1024, 1024), tile_size_pixels=512, geojson_geometry=far)
+
+
+class TestExactVsScaleGridIndependence:
+    """The exact grid bypasses scale derivation, snapping, and the equator
+    constant — the reasons a scale export and an asset can disagree by a pixel."""
+
+    def test_exact_grid_origin_is_not_snapped_to_global(self) -> None:
+        # A deliberately un-aligned origin (not a multiple of scale*tilesize)
+        # is preserved exactly; decompose_region would have snapped it.
+        grid = _utm_grid(1024, 1024, e0=512345.0, n1=4183397.0)
+        tg = decompose_pixel_grid(grid, tile_size_pixels=512)
+        assert tg.pixel_grid.affine_transform.translate_x == 512345.0
+        assert tg.pixel_grid.affine_transform.translate_y == 4183397.0
+
+    def test_two_exports_on_same_grid_are_pixel_identical(self) -> None:
+        grid = _utm_grid(1024, 1024)
+        a = decompose_pixel_grid(grid, tile_size_pixels=512)
+        b = decompose_pixel_grid(grid, tile_size_pixels=512)
+        assert a.pixel_grid == b.pixel_grid
+        assert [t.model_dump() for t in a.tiles] == [t.model_dump() for t in b.tiles]
+
+    def test_tiles_for_grid_and_decompose_pixel_grid_agree(self) -> None:
+        grid = _utm_grid(1024, 512)
+        via_public = decompose_pixel_grid(grid, tile_size_pixels=512)
+        via_direct = tiles_for_grid(grid, tile_size_pixels=512)
+        assert via_public.pixel_grid == via_direct.pixel_grid
+        assert len(via_public.tiles) == len(via_direct.tiles) == 2

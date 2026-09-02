@@ -25,6 +25,7 @@ from datensee.config import (
     DataflowRunnerConfig,
     OutputConfig,
     PipelineConfig,
+    PixelGrid,
     RunnerConfig,
     TileGrid,
 )
@@ -209,12 +210,16 @@ _GCS_URI_PATTERN = "gs://"
 
 def validate_inputs(
     ee_expression: str,
-    geojson_geometry: dict[str, Any],
+    geojson_geometry: dict[str, Any] | None,
     crs: str,
     output: str,
     runner: str,
 ) -> list[str]:
-    """Validate export inputs before job submission. Returns list of errors."""
+    """Validate export inputs before job submission. Returns list of errors.
+
+    ``geojson_geometry`` may be ``None`` when an exact ``pixel_grid`` fully
+    defines the export — the region check is then skipped.
+    """
     errors: list[str] = []
 
     # 1. ee_expression must be valid JSON
@@ -227,21 +232,24 @@ def validate_inputs(
             "(output of ee.serializer.encode())."
         )
 
-    # 2. Region must be a Polygon or MultiPolygon (or Feature wrapping one)
-    geom_type = geojson_geometry.get("type")
-    if geom_type == "Feature":
-        geom_type = (geojson_geometry.get("geometry") or {}).get("type")
-    if geom_type == "FeatureCollection":
-        errors.append(
-            "Region GeoJSON type is 'FeatureCollection', but a single "
-            "Polygon or MultiPolygon is required. Extract one feature first."
-        )
-    elif geom_type not in _VALID_GEOJSON_TYPES:
-        errors.append(
-            f"Region GeoJSON type is '{geom_type}', but must be one of "
-            f"{sorted(_VALID_GEOJSON_TYPES)}. Points and lines cannot define "
-            f"an export region."
-        )
+    # 2. Region (when present) must be a Polygon or MultiPolygon. A None
+    # region is legal only alongside an exact pixel_grid; the caller has
+    # already enforced that, so here None simply skips the check.
+    if geojson_geometry is not None:
+        geom_type = geojson_geometry.get("type")
+        if geom_type == "Feature":
+            geom_type = (geojson_geometry.get("geometry") or {}).get("type")
+        if geom_type == "FeatureCollection":
+            errors.append(
+                "Region GeoJSON type is 'FeatureCollection', but a single "
+                "Polygon or MultiPolygon is required. Extract one feature first."
+            )
+        elif geom_type not in _VALID_GEOJSON_TYPES:
+            errors.append(
+                f"Region GeoJSON type is '{geom_type}', but must be one of "
+                f"{sorted(_VALID_GEOJSON_TYPES)}. Points and lines cannot define "
+                f"an export region."
+            )
 
     # 3. CRS must be parseable by pyproj
     try:
@@ -308,12 +316,13 @@ def tile(
 
 def export(
     ee_expression: Any,
-    region: Any,
-    project: str,
-    output: str,
+    region: Any = None,
+    project: str = "",
+    output: str = "",
     *,
-    scale: float = 30.0,
+    scale: float | None = None,
     crs: str = "EPSG:4326",
+    pixel_grid: PixelGrid | None = None,
     tile_size: int = 512,
     output_tile_size: int | None = None,
     nodata: float | None = None,
@@ -423,11 +432,29 @@ def export(
     if credentials is None and not dry_run:
         ensure_auth()
 
+    # scale derives a grid; pixel_grid *is* the grid. Exactly one.
+    if pixel_grid is not None and scale is not None:
+        raise ValueError(
+            "scale and pixel_grid are mutually exclusive: scale derives an output "
+            "grid from the region, while pixel_grid specifies it exactly. Pass one."
+        )
+    effective_scale = 30.0 if scale is None else scale
+    effective_crs = pixel_grid.crs_code if pixel_grid is not None else crs
+
     ee_expression = _normalize_expression(ee_expression)
-    geojson_geometry = _normalize_region(region)
+    # Region is optional only when an exact grid is supplied (then it merely
+    # trims tiles outside the polygon); otherwise it defines the grid.
+    geojson_geometry = _normalize_region(region) if region is not None else None
+    if geojson_geometry is None and pixel_grid is None:
+        raise ValueError(
+            "region is required unless an exact pixel_grid is supplied "
+            "(a region defines the grid; a pixel_grid is the grid)."
+        )
 
     # Validate
-    validation_errors = validate_inputs(ee_expression, geojson_geometry, crs, output, runner)
+    validation_errors = validate_inputs(
+        ee_expression, geojson_geometry, effective_crs, output, runner
+    )
     _reject_collection_expression(ee_expression)
     if runner == "dataflow" and not temp_location:
         validation_errors.append(
@@ -438,7 +465,7 @@ def export(
         raise ValueError("\n".join(validation_errors))
 
     # Unwrap Feature → geometry
-    if geojson_geometry.get("type") == "Feature":
+    if geojson_geometry is not None and geojson_geometry.get("type") == "Feature":
         geojson_geometry = geojson_geometry["geometry"]
 
     # Snapshot the *user-supplied* expression for the meta sidecar before
@@ -470,14 +497,25 @@ def export(
     # masking can .clip() the image themselves before passing it in —
     # composing with the expression is the caller's prerogative.
 
-    # Tile
-    tile_grid = decompose_region(
-        geojson_geometry=geojson_geometry,
-        scale_meters=scale,
-        crs=crs,
-        tile_size_pixels=tile_size,
-        output_tile_size_pixels=output_tile_size,
-    )
+    # Tile — either derive the grid from region+scale, or tile the exact
+    # caller-supplied grid verbatim (pixel-for-pixel reproducible).
+    if pixel_grid is not None:
+        from datensee.pixel.tiling import decompose_pixel_grid
+
+        tile_grid = decompose_pixel_grid(
+            pixel_grid,
+            tile_size_pixels=tile_size,
+            output_tile_size_pixels=output_tile_size,
+            geojson_geometry=geojson_geometry,
+        )
+    else:
+        tile_grid = decompose_region(
+            geojson_geometry=geojson_geometry,
+            scale_meters=effective_scale,
+            crs=crs,
+            tile_size_pixels=tile_size,
+            output_tile_size_pixels=output_tile_size,
+        )
 
     # Build config — worker-pool kwargs are optional; we only override
     # the DataflowRunnerConfig defaults when the caller set them.
@@ -552,8 +590,12 @@ def export(
     write_meta(
         output,
         build_meta(
-            crs=crs,
-            scale_meters=scale,
+            crs=effective_crs,
+            scale_meters=(
+                effective_scale
+                if pixel_grid is None
+                else abs(tile_grid.pixel_grid.affine_transform.scale_x)
+            ),
             tile_size_pixels=tile_size,
             output_tile_size_pixels=output_tile_size,
             gee_project=project,

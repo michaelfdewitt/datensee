@@ -1,8 +1,8 @@
 # Handoff Notes
 
-A reference for an agent picking up DatensEE for polish work. Read after `CLAUDE.md`.
+A reference for a developer picking up DatensEE for polish work. Read after [`architecture.md`](architecture.md).
 
-`CLAUDE.md` already covers the high-level architecture, core design decisions, and conventions; do not duplicate it. This file captures **non-obvious decisions, recent fixes, current invariants, and known limitations** that you would otherwise have to spelunk for.
+[`architecture.md`](architecture.md) already covers the high-level architecture, core design decisions, and conventions; do not duplicate it. This file captures **non-obvious decisions, recent fixes, current invariants, and known limitations** that you would otherwise have to spelunk for.
 
 ---
 
@@ -17,7 +17,7 @@ The two facts the next agent must internalize:
 
 Concretely the dep set is small: typer, pydantic, httpx, rich, pyproj, shapely, google-auth, google-cloud-storage. One optional extra: `[validation]` adds rasterio. Keep it that way.
 
-When you make changes that affect the install surface, update `cli/pyproject.toml` and the README's "Install" section in lockstep. The README is the source of truth for what users see; the handoff doc and CLAUDE.md are for developers.
+When you make changes that affect the install surface, update `cli/pyproject.toml` and the README's "Install" section in lockstep. The README is the source of truth for what users see; the handoff and architecture docs are for developers.
 
 ---
 
@@ -242,4 +242,4 @@ The COG-specific suites are `pipelines/src/test/java/com/datensee/pixel/io/CogTr
 - Java: records + sealed interfaces + pattern matching. Java 25 source, but `--release 21` for Dataflow workers (don't accidentally use Java 22+ APIs). Google Java Style via Checkstyle.
 - Errors are user-facing: say what went wrong AND what to do (e.g. the ImageCollection rejection's "Reduce the collection first (e.g. .median(), .mosaic(), .first())").
 - Conventional Commits.
-- `CLAUDE.md` says don't write multi-paragraph docstrings or speculative comments. **Comments are reserved for non-obvious why, not what.** This handoff doc is the exception.
+- The coding conventions say don't write multi-paragraph docstrings or speculative comments. **Comments are reserved for non-obvious why, not what.** This handoff doc is the exception.

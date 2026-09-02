@@ -202,9 +202,41 @@ datensee export expr.json region.geojson \
   --runner dataflow --temp-location gs://my-bucket/tmp
 ```
 
-Coming from the Code Editor (JavaScript)? See
-[`docs/task-import.md`](docs/task-import.md) for the planned
-copy-the-job-description path.
+#### From the Code Editor — one file, not two
+
+Prototyping in the Earth Engine Code Editor (JavaScript)? Drop in the
+snippet from [`docs/code-editor-snippet.js`](docs/code-editor-snippet.js):
+it prints a single **bundle** carrying both the serialized computation
+and the region. Paste that into one file and run —
+
+```bash
+datensee export bundle.json --project my-gcp-project \
+  --output gs://my-bucket/exports/ndvi --scale 10 --crs EPSG:32610
+```
+
+— no separate `expr.json` / `region.geojson`. (In Python you can also omit
+the region entirely and DatensEE derives it from `image.geometry()`.)
+
+#### Exact grid — for pixel-for-pixel comparison
+
+`--scale` derives an output grid (snapped to a global origin; for
+geographic CRSs the pixel size uses the equator constant). When you need
+the output to line up **exactly** with another export or an existing
+asset — so a per-pixel diff is meaningful and not perturbed by
+reprojected-edge tessellation — pin the grid verbatim instead, mirroring
+EE's own `crsTransform` + `dimensions`:
+
+```bash
+datensee export expr.json region.geojson \
+  --project my-gcp-project --output gs://my-bucket/exports/ndvi \
+  --crs EPSG:32610 \
+  --crs-transform "10,0,512340,0,-10,4183400" \
+  --dimensions 10240x10240
+```
+
+`--scale` and `--crs-transform`/`--dimensions` are mutually exclusive.
+Dimensions must be a whole multiple of `--tile-size` (partial edge tiles
+are not supported yet). In Python, pass `pixel_grid=datensee.PixelGrid(...)`.
 
 ## Notebook / Colab
 
@@ -326,7 +358,7 @@ datensee/
 │       └── pixel/       Pixel pipeline: fetch DoFns + COG writers (io/)
 ├── notebooks/           Colab/Jupyter examples
 ├── contract/            JSON schema + examples
-└── CLAUDE.md            Development guide
+└── docs/                Architecture, releasing, case study
 ```
 
 ## Development setup

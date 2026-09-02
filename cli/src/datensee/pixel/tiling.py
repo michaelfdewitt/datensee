@@ -26,6 +26,7 @@ from typing import Any
 
 import pyproj
 from shapely.geometry import Polygon, shape
+from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform
 
 from datensee.pixel.config import (
@@ -200,34 +201,120 @@ def decompose_region(
         dimensions=GridDimensions(width=width_px, height=height_px),
     )
 
-    # With the parent origin snapped to output-tile boundaries, output
-    # indices are pure local arithmetic: an output tile (out_row, out_col)
-    # occupies the local pixel rect [out_col * out_px, out_row * out_px,
-    # out_px, out_px]. The Java assembler relies on exactly this.
+    return tiles_for_grid(
+        parent_grid,
+        tile_size_pixels=tile_size_pixels,
+        output_tile_size_pixels=output_tile_size_pixels,
+        geom_native=geom_native,
+    )
+
+
+def decompose_pixel_grid(
+    pixel_grid: PixelGrid,
+    *,
+    tile_size_pixels: int = 512,
+    output_tile_size_pixels: int | None = None,
+    geojson_geometry: dict[str, Any] | None = None,
+) -> TileGrid:
+    """Tile an exact, caller-supplied :class:`PixelGrid` verbatim.
+
+    Unlike :func:`decompose_region`, the CRS, affine transform, and
+    dimensions are taken exactly as given — no ``scale``→pixel-size
+    derivation, no outward snapping to a global origin, no equator
+    constant. Two exports that pass the *same* ``pixel_grid`` therefore
+    address pixel-for-pixel identical grids, so a per-pixel diff between
+    them (or against an existing asset on that grid) is exact rather than
+    subject to reprojected-bbox tessellation.
+
+    This mirrors Earth Engine's own ``Export.image({crs, crsTransform,
+    dimensions})`` parameters. The grid's ``dimensions`` must be a whole
+    multiple of ``tile_size_pixels`` on both axes (and of
+    ``output_tile_size_pixels`` in two-tier mode) — partial edge tiles are
+    not supported; :func:`tiles_for_grid` raises otherwise.
+
+    Args:
+        pixel_grid: The exact output grid (CRS + affine + dimensions).
+        tile_size_pixels: Compute tile edge in pixels.
+        output_tile_size_pixels: Output COG edge (multiple of tile size);
+            ``None`` for one COG per compute tile.
+        geojson_geometry: Optional WGS84 geometry; when given, tiles that
+            do not intersect it are skipped (their pixels would be nodata).
+            When ``None``, every tile of the grid is emitted.
+
+    Returns:
+        :class:`TileGrid` over the given grid.
+    """
+    geom_native: BaseGeometry | None = None
+    if geojson_geometry is not None:
+        geom_wgs84 = shape(geojson_geometry)
+        geom_native = (
+            geom_wgs84
+            if pixel_grid.crs_code == "EPSG:4326"
+            else _reproject_geometry(geom_wgs84, "EPSG:4326", pixel_grid.crs_code)
+        )
+    return tiles_for_grid(
+        pixel_grid,
+        tile_size_pixels=tile_size_pixels,
+        output_tile_size_pixels=output_tile_size_pixels,
+        geom_native=geom_native,
+    )
+
+
+def tiles_for_grid(
+    parent_grid: PixelGrid,
+    *,
+    tile_size_pixels: int,
+    output_tile_size_pixels: int | None = None,
+    geom_native: BaseGeometry | None = None,
+) -> TileGrid:
+    """Cut a parent :class:`PixelGrid` into a regular tile grid.
+
+    Shared by :func:`decompose_region` (parent derived from region+scale)
+    and :func:`decompose_pixel_grid` (parent given verbatim). Tiles are
+    full-size integer pixel rectangles; ``geom_native`` (in the grid's
+    own CRS) is an optional intersection filter — ``None`` keeps every
+    tile.
+
+    Raises:
+        ValueError: The grid dimensions are not a whole multiple of the
+            tile size (partial edge tiles are unsupported), or the output
+            tile size is not a multiple of the compute tile size / does
+            not evenly divide the grid.
+    """
+    width_px = parent_grid.dimensions.width
+    height_px = parent_grid.dimensions.height
+    if width_px % tile_size_pixels or height_px % tile_size_pixels:
+        raise ValueError(
+            f"grid dimensions {width_px}x{height_px} are not a whole multiple of "
+            f"tile_size_pixels ({tile_size_pixels}); partial edge tiles are not "
+            "supported. Pad the grid to a tile-size multiple, or change --tile-size."
+        )
+    if output_tile_size_pixels is not None and output_tile_size_pixels % tile_size_pixels != 0:
+        raise ValueError(
+            f"output_tile_size_pixels ({output_tile_size_pixels}) must be a multiple "
+            f"of tile_size_pixels ({tile_size_pixels})"
+        )
+    # Note: the grid need NOT be a whole multiple of output_tile_size_pixels.
+    # A partial final output tile is legal — the assembler zero-fills the
+    # missing compute-tile blocks (out indices are floor(local_px / OTS)).
+
+    p = parent_grid.affine_transform
     out_px = output_tile_size_pixels or tile_size_pixels
 
     tiles: list[TileCoordinate] = []
     for row_offset_px in range(0, height_px, tile_size_pixels):
         for col_offset_px in range(0, width_px, tile_size_pixels):
-            # Bbox derived from the parent transform — used only to test
-            # intersection with the region; not stored on the tile.
-            tile_xmin = parent_grid.affine_transform.translate_x + (
-                col_offset_px * parent_grid.affine_transform.scale_x
-            )
-            tile_ymax = parent_grid.affine_transform.translate_y + (
-                row_offset_px * parent_grid.affine_transform.scale_y
-            )
-            tile_xmax = tile_xmin + tile_size_pixels * parent_grid.affine_transform.scale_x
-            tile_ymin = tile_ymax + tile_size_pixels * parent_grid.affine_transform.scale_y
-
-            tile_box = Polygon.from_bounds(tile_xmin, tile_ymin, tile_xmax, tile_ymax)
-            if not geom_native.intersects(tile_box):
-                continue
-
-            local_row = row_offset_px // tile_size_pixels
-            local_col = col_offset_px // tile_size_pixels
-            out_col = col_offset_px // out_px
-            out_row = row_offset_px // out_px
+            if geom_native is not None:
+                # Bbox from transform × pixel offsets — only for the
+                # intersection test; never stored on the tile.
+                tile_xmin = p.translate_x + col_offset_px * p.scale_x
+                tile_ymax = p.translate_y + row_offset_px * p.scale_y
+                tile_xmax = tile_xmin + tile_size_pixels * p.scale_x
+                tile_ymin = tile_ymax + tile_size_pixels * p.scale_y
+                if not geom_native.intersects(
+                    Polygon.from_bounds(tile_xmin, tile_ymin, tile_xmax, tile_ymax)
+                ):
+                    continue
 
             tiles.append(
                 TileCoordinate(
@@ -235,13 +322,19 @@ def decompose_region(
                     row_px=row_offset_px,
                     width_px=tile_size_pixels,
                     height_px=tile_size_pixels,
-                    row=local_row,
-                    col=local_col,
-                    out_row=out_row,
-                    out_col=out_col,
+                    row=row_offset_px // tile_size_pixels,
+                    col=col_offset_px // tile_size_pixels,
+                    out_row=row_offset_px // out_px,
+                    out_col=col_offset_px // out_px,
                 )
             )
 
+    if not tiles:
+        raise ValueError(
+            "no tiles were produced: the supplied region does not intersect the "
+            "target grid. Check the region and CRS, or omit the region to tile the "
+            "whole grid."
+        )
     return TileGrid(
         pixel_grid=parent_grid,
         tile_size_pixels=tile_size_pixels,
