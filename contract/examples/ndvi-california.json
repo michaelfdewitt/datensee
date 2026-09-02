@@ -1,0 +1,37 @@
+{
+  "pipeline_kind": "pixel",
+  "ee_expression": "{\"result\":\"0\",\"values\":{\"0\":{\"functionInvocationValue\":{\"functionName\":\"Image.normalizedDifference\",\"arguments\":{\"input\":{\"functionInvocationValue\":{\"functionName\":\"Image.select\",\"arguments\":{\"input\":{\"functionInvocationValue\":{\"functionName\":\"ImageCollection.mosaic\",\"arguments\":{\"collection\":{\"functionInvocationValue\":{\"functionName\":\"Collection.filter\",\"arguments\":{\"collection\":{\"functionInvocationValue\":{\"functionName\":\"ImageCollection.load\",\"arguments\":{\"id\":{\"constantValue\":\"LANDSAT/LC09/C02/T1_L2\"}}}},\"filter\":{\"functionInvocationValue\":{\"functionName\":\"Filter.date\",\"arguments\":{\"start\":{\"constantValue\":\"2023-06-01\"},\"end\":{\"constantValue\":\"2023-09-01\"}}}}}}}}}}}},\"bandSelectors\":{\"constantValue\":[\"SR_B5\",\"SR_B4\"]}}}}}}}",
+  "gee_project": "my-gcp-project",
+  "runner": {
+    "mode": "local"
+  },
+  "pixel": {
+    "tile_grid": {
+      "pixel_grid": {
+        "crs_code": "EPSG:4326",
+        "affine_transform": {
+          "scale_x": 0.000269458,
+          "shear_x": 0,
+          "translate_x": -122.5,
+          "shear_y": 0,
+          "scale_y": -0.000269458,
+          "translate_y": 38.5
+        },
+        "dimensions": { "width": 1024, "height": 1024 }
+      },
+      "tile_size_pixels": 512,
+      "tiles": [
+        { "col_px":   0, "row_px":   0, "width_px": 512, "height_px": 512, "row": 0, "col": 0 },
+        { "col_px": 512, "row_px":   0, "width_px": 512, "height_px": 512, "row": 0, "col": 1 },
+        { "col_px":   0, "row_px": 512, "width_px": 512, "height_px": 512, "row": 1, "col": 0 },
+        { "col_px": 512, "row_px": 512, "width_px": 512, "height_px": 512, "row": 1, "col": 1 }
+      ]
+    },
+    "output": {
+      "output_path": "gs://my-bucket/exports/ndvi-california-2023",
+      "band_count": 1,
+      "data_type": "float32",
+      "compression": "deflate"
+    }
+  }
+}
