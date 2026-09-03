@@ -47,6 +47,13 @@ outright. If it still fits `Export.image` or one machine, use
 [xee](https://github.com/google/xee) or `ee.batch.Export`. Curious why this is
 not fifty lines of `ThreadPoolExecutor`? See [docs/design.md](docs/design.md).
 
+> **Cloud exports cost money.** Dataflow bills for the worker VMs, plus GCS
+> storage and egress, even when your Earth Engine project is noncommercial.
+> Noncommercial EE waives Earth Engine's compute charges (EECUs), not the Google
+> Cloud orchestration DatensEE drives. Local runs use only your machine. A real
+> 21,316-tile export cost about $0.18; see the
+> [case study](docs/case-study-scale-run.md).
+
 ## How it works
 
 ```
