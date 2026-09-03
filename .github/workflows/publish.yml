@@ -1,0 +1,150 @@
+# Release on tag push: `git tag v<version> && git push origin v<version>`.
+#
+#   1. jar      — builds the pipeline JAR from the tagged source (Gradle,
+#                 Java 25 toolchain emitting Java 21 bytecode), runs the Java
+#                 tests, and records the JAR's sha256.
+#   2. verify   — the tag matches cli/pyproject.toml (the single source of
+#                 truth for the version), lint + unit tests pass, then the JAR
+#                 digest from step 1 is stamped into cli/src/datensee/_jar_digest.py
+#                 BEFORE the wheel + sdist are built. The published wheel
+#                 therefore pins exactly the JAR this run built.
+#   3. release  — attaches that JAR to the GitHub Release (what
+#                 `datensee jar download` fetches and verifies against the pin).
+#   4. pypi     — `uv publish` via PyPI Trusted Publishing (OIDC; no token).
+#
+# One-time setup (see docs/releasing.md):
+#   - PyPI: add a Trusted Publisher for this repo/workflow/environment `pypi`.
+#   - GitHub: create the `pypi` environment (optionally with required reviewers).
+#   - Stage the Flex Template first: scripts/release_template_cloudbuild.py <version>.
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  jar:
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+      # gradle-wrapper.jar is gitignored; install the version the wrapper pins.
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.4.0"
+      - name: JUnit + shadow JAR
+        working-directory: pipelines
+        run: gradle --no-daemon test shadowJar
+      - name: JAR targets the Dataflow worker JDK (class-file 65 = Java 21)
+        working-directory: pipelines
+        run: |
+          unzip -o -q build/libs/datensee-pipeline.jar com/datensee/DatensEEPipeline.class -d /tmp/cv
+          major=$(javap -verbose /tmp/cv/com/datensee/DatensEEPipeline.class | awk '/major version/ {print $3}')
+          echo "class-file major version: ${major}"
+          test "${major}" = "65"
+      - name: Record the JAR digest
+        id: digest
+        working-directory: pipelines
+        run: |
+          digest=$(sha256sum build/libs/datensee-pipeline.jar | cut -d' ' -f1)
+          echo "sha256 ${digest}"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jar
+          path: pipelines/build/libs/datensee-pipeline.jar
+          if-no-files-found: error
+
+  verify:
+    runs-on: ubuntu-latest
+    needs: jar
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Resolve version from pyproject and check the tag
+        id: version
+        working-directory: cli
+        run: |
+          version="$(uv version --short)"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          if [[ "${GITHUB_REF_NAME}" != "v${version}" ]]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match pyproject version ${version}" >&2
+            exit 1
+          fi
+      - name: Stamp the JAR digest into the wheel source
+        env:
+          DIGEST: ${{ needs.jar.outputs.digest }}
+        run: |
+          [[ "$DIGEST" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad JAR digest '$DIGEST'" >&2; exit 1; }
+          sed -i -E "s/^JAR_SHA256: str \| None = .*$/JAR_SHA256: str | None = \"${DIGEST}\"/" \
+            cli/src/datensee/_jar_digest.py
+          grep -q "\"${DIGEST}\"" cli/src/datensee/_jar_digest.py
+          echo "wheel will pin sha256 ${DIGEST}"
+      - name: Lint and unit tests
+        working-directory: cli
+        run: |
+          uv sync
+          uv run ruff check src tests
+          uv run ruff format --check src tests
+          uv run pytest -q
+      - name: Build wheel and sdist
+        working-directory: cli
+        run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: cli/dist/
+          if-no-files-found: error
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [jar, verify]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: jar
+      - name: Verify the artifact still matches the recorded digest
+        env:
+          DIGEST: ${{ needs.jar.outputs.digest }}
+        run: echo "${DIGEST}  datensee-pipeline.jar" | sha256sum -c -
+      - name: Attach JAR to the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release view "$TAG" -R "$REPO" >/dev/null 2>&1 \
+            || gh release create "$TAG" -R "$REPO" --verify-tag --generate-notes \
+                 $([[ "$TAG" == *a* || "$TAG" == *b* || "$TAG" == *rc* ]] && echo --prerelease)
+          gh release upload "$TAG" datensee-pipeline.jar -R "$REPO" --clobber
+
+  pypi:
+    runs-on: ubuntu-latest
+    needs: [verify, release]
+    environment:
+      name: pypi
+      url: https://pypi.org/project/datensee/${{ needs.verify.outputs.version }}/
+    permissions:
+      id-token: write
+    steps:
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to PyPI (Trusted Publishing)
+        run: uv publish dist/*

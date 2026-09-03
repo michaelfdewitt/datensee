@@ -1,0 +1,304 @@
+"""Adaptive retry: read a failures journal, split or retry each entry.
+
+A failure journal record (`FailedTileRecord` shape) is a superset of a
+`TileCoordinate` record. The retry pipeline reads the journal, applies a
+split-or-retry decision per entry, and emits a new tiles file that the
+existing `tiles_file` input path consumes, allowing retries to flow through
+the same fetch, assembly, and write pipeline as the original export.
+
+Conservative defaults:
+
+- Split allowlist: ``MEMORY_EXCEEDED`` and ``COMPUTATION_TIMEOUT`` only.
+- Retry-same allowlist: ``RATE_LIMITED``, ``RETRYABLE_SERVER``, ``UNKNOWN``.
+- Other kinds (``AUTH_ERROR``, ``FATAL_REQUEST``) are excluded from the
+  retry stream and remain in the next round's failures journal.
+- Max split depth: 2 (one root tile becomes at most 16 sub-tiles).
+- Adaptive splitting is opt-in via `datensee retry`. Splitting works for every
+  export shape: retry rounds run with ``merge_existing_output``, so split
+  children overlay their parent's output COG in place regardless of two-tier
+  configuration.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from datensee.pixel.config import TileCoordinate
+
+if TYPE_CHECKING:
+    from google.auth.credentials import Credentials
+
+# Quadrant index → (x_low, y_low) flags.
+# 0=x_low/y_low, 1=x_high/y_low, 2=x_low/y_high, 3=x_high/y_high.
+# Defined in CRS bbox terms (not compass directions) so the encoding is
+# stable across CRS axis orientations. Note that "y-low" means smaller CRS
+# y, which (given our NW-corner pixel convention with negative scale_y)
+# maps to larger row_px in pixel space.
+_QUADRANT_BBOX_FLAGS: dict[int, tuple[bool, bool]] = {
+    0: (True, True),  # x-low / y-low
+    1: (False, True),  # x-high / y-low
+    2: (True, False),  # x-low / y-high
+    3: (False, False),  # x-high / y-high
+}
+
+# Kinds that trigger a quadtree split. Kept conservative to avoid cascade splits.
+SPLIT_ELIGIBLE_KINDS: frozenset[str] = frozenset({"MEMORY_EXCEEDED", "COMPUTATION_TIMEOUT"})
+
+# Kinds where the same bbox is retried after backoff.
+RETRY_SAME_KINDS: frozenset[str] = frozenset({"RATE_LIMITED", "RETRYABLE_SERVER", "UNKNOWN"})
+
+# Terminal error kinds that cannot be retried.
+TERMINAL_KINDS: frozenset[str] = frozenset({"AUTH_ERROR", "FATAL_REQUEST"})
+
+DEFAULT_MAX_DEPTH: int = 2
+
+
+# Canonical journal_reason values, kept synchronized with
+# FailedTileRecord.JOURNAL_REASON_* constants on the Java side.
+JOURNAL_REASON_FAILED: str = "failed"
+JOURNAL_REASON_DEPTH_CAP: str = "depth_cap"
+JOURNAL_REASON_TERMINAL: str = "terminal"
+JOURNAL_REASON_UNKNOWN_KIND: str = "unknown_kind"
+
+# Maps the action returned by `decide()` to the canonical journal_reason
+# stamped on a carryover record. Only carryover actions appear here:
+# `split` and `retry_same` records don't go to the journal; they go
+# back into the fetch pipeline.
+_ACTION_TO_JOURNAL_REASON: dict[str, str] = {
+    "depth_cap": JOURNAL_REASON_DEPTH_CAP,
+    "terminal": JOURNAL_REASON_TERMINAL,
+    "unknown_kind": JOURNAL_REASON_UNKNOWN_KIND,
+}
+
+
+class JournalParseError(ValueError):
+    """Raised when a journal line is malformed or missing required fields."""
+
+
+@dataclass(frozen=True)
+class RetryDecision:
+    """Outcome of evaluating one journal entry against the policy."""
+
+    # Children to feed back into the pipeline. Empty if the entry is
+    # terminal (kind not in any allowlist) or at the depth cap.
+    children: tuple[TileCoordinate, ...]
+
+    # Why we made this decision. One of: "split", "retry_same",
+    # "depth_cap", "terminal", "unknown_kind".
+    action: str
+
+    # Original journal entry, kept for re-emission into the next-round
+    # journal when the action is non-progressing (depth_cap, terminal).
+    record: dict
+
+
+def _parse_record(line: str) -> dict:
+    line = line.strip()
+    if not line:
+        raise JournalParseError("empty journal line")
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise JournalParseError(f"invalid JSON: {exc}") from exc
+    for required in ("col_px", "row_px", "width_px", "height_px", "row", "col"):
+        if required not in record:
+            raise JournalParseError(f"missing required field {required!r}: {line[:120]}")
+    return record
+
+
+def _record_to_tile(record: dict) -> TileCoordinate:
+    """Reconstruct a TileCoordinate from a journal entry's TileCoordinate-shaped fields."""
+    return TileCoordinate(
+        col_px=int(record["col_px"]),
+        row_px=int(record["row_px"]),
+        width_px=int(record["width_px"]),
+        height_px=int(record["height_px"]),
+        row=int(record["row"]),
+        col=int(record["col"]),
+        out_row=int(record.get("out_row", record["row"])),
+        out_col=int(record.get("out_col", record["col"])),
+        lineage=list(record.get("lineage", [])),
+    )
+
+
+def _quadrant_child(
+    parent: TileCoordinate,
+    quadrant: int,
+    half_w: int,
+    half_h: int,
+) -> TileCoordinate:
+    x_low, y_low = _QUADRANT_BBOX_FLAGS[quadrant]
+    return TileCoordinate(
+        col_px=parent.col_px if x_low else parent.col_px + half_w,
+        row_px=parent.row_px + half_h if y_low else parent.row_px,
+        width_px=half_w,
+        height_px=half_h,
+        row=parent.row,
+        col=parent.col,
+        out_row=parent.out_row,
+        out_col=parent.out_col,
+        lineage=[*parent.lineage, quadrant],
+    )
+
+
+def split_tile(
+    parent: TileCoordinate,
+) -> tuple[TileCoordinate, TileCoordinate, TileCoordinate, TileCoordinate]:
+    """Split a tile into its 4 quadrants by halving each axis.
+
+    Children inherit ``(row, col, out_row, out_col)`` from the parent —
+    they belong to the same output tile and the same root compute tile.
+    Each child's lineage extends the parent's by one quadrant index.
+
+    Pixel math is integer; quadrant indexing is in bbox terms (so it's
+    independent of CRS axis orientation). ``row_px`` counts downward
+    (rows increase southward), so ``y-low`` (smaller CRS y) maps to a
+    *larger* ``row_px``. Halving requires even ``width_px``/``height_px``;
+    callers feed root tiles whose dimensions are powers of two.
+    """
+    if parent.width_px % 2 != 0 or parent.height_px % 2 != 0:
+        raise ValueError(
+            f"split_tile requires even width_px and height_px (got "
+            f"width_px={parent.width_px}, height_px={parent.height_px})."
+        )
+    half_w = parent.width_px // 2
+    half_h = parent.height_px // 2
+    return tuple(_quadrant_child(parent, q, half_w, half_h) for q in range(4))  # type: ignore[return-value]
+
+
+def decide(
+    record: dict,
+    *,
+    max_depth: int = DEFAULT_MAX_DEPTH,
+    split_allowlist: frozenset[str] = SPLIT_ELIGIBLE_KINDS,
+    retry_allowlist: frozenset[str] = RETRY_SAME_KINDS,
+) -> RetryDecision:
+    """Decide split-vs-retry-same-vs-drop for one journal entry.
+
+    Args:
+        record: Parsed journal record (dict).
+        max_depth: Maximum total quadtree depth. A tile already at this
+            depth gets ``action="depth_cap"`` and no children are emitted
+            (the entry remains in the next round's failures journal).
+        split_allowlist: Error kinds that trigger splitting. Default is
+            EE-specific complexity signals only.
+        retry_allowlist: Error kinds that retry the same bbox. Default
+            is transient infrastructure failures.
+
+    Returns:
+        RetryDecision describing the outcome and any emitted children.
+    """
+    parent = _record_to_tile(record)
+    kind = record.get("error_kind", "UNKNOWN")
+
+    if kind in split_allowlist:
+        if len(parent.lineage) >= max_depth:
+            return RetryDecision((), "depth_cap", record)
+        children = split_tile(parent)
+        return RetryDecision(children, "split", record)
+    if kind in retry_allowlist:
+        return RetryDecision((parent,), "retry_same", record)
+    if kind in TERMINAL_KINDS:
+        return RetryDecision((), "terminal", record)
+    return RetryDecision((), "unknown_kind", record)
+
+
+@dataclass(frozen=True)
+class RetryPlan:
+    """Result of planning a retry round.
+
+    ``next_tiles`` is a list of TileCoordinate ready to feed into the
+    pipeline via ``tiles_file``. ``carryover`` contains the original
+    journal records that didn't make progress this round (depth-capped
+    or terminal) and should be re-emitted into the next failures journal.
+    ``stats`` is a dict of action → count for reporting.
+    """
+
+    next_tiles: list[TileCoordinate]
+    carryover: list[dict]
+    stats: dict[str, int]
+
+
+def _stamp_carryover(record: dict, action: str) -> dict:
+    """Return a shallow copy of a carryover record with its canonical journal_reason."""
+    stamped = dict(record)
+    stamped["journal_reason"] = _ACTION_TO_JOURNAL_REASON.get(action, JOURNAL_REASON_FAILED)
+    return stamped
+
+
+def plan_retry(
+    journal_records: Iterable[dict],
+    *,
+    max_depth: int = DEFAULT_MAX_DEPTH,
+    split_allowlist: frozenset[str] = SPLIT_ELIGIBLE_KINDS,
+    retry_allowlist: frozenset[str] = RETRY_SAME_KINDS,
+) -> RetryPlan:
+    """Apply :func:`decide` to every record in a journal and return the plan.
+
+    Carryover records are stamped with the appropriate ``journal_reason``
+    (``depth_cap``, ``terminal``, or ``unknown_kind``) so the pipeline can
+    union them into the next ``_failures.json``.
+    """
+    decisions = [
+        decide(
+            record,
+            max_depth=max_depth,
+            split_allowlist=split_allowlist,
+            retry_allowlist=retry_allowlist,
+        )
+        for record in journal_records
+    ]
+    next_tiles = [tile for d in decisions for tile in d.children]
+    carryover = [_stamp_carryover(d.record, d.action) for d in decisions if not d.children]
+    stats = {d.action: sum(1 for x in decisions if x.action == d.action) for d in decisions}
+
+    return RetryPlan(
+        next_tiles=next_tiles,
+        carryover=carryover,
+        stats=stats,
+    )
+
+
+def read_journal(path: Path | str, *, credentials: Credentials | None = None) -> list[dict]:
+    """Load an NDJSON failures journal from a local path or ``gs://`` URI."""
+    if isinstance(path, str) and path.startswith("gs://"):
+        text = _download_gcs_text(path, credentials)
+    else:
+        text = Path(path).read_text(encoding="utf-8")
+    records: list[dict] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        records.append(_parse_record(line))
+    return records
+
+
+def _download_gcs_text(gs_uri: str, credentials: Credentials | None = None) -> str:
+    """Download a GCS object as text (used for gs:// journals)."""
+    from datensee.auth import gcs_client, split_gcs_uri
+
+    bucket_name, blob_path = split_gcs_uri(gs_uri)
+    client = gcs_client(credentials)
+    blob = client.bucket(bucket_name).blob(blob_path)
+    if not blob.exists():
+        raise FileNotFoundError(f"Journal not found: {gs_uri}")
+    return blob.download_as_text()
+
+
+def write_tiles_file(tiles: Iterable[TileCoordinate], path: Path) -> None:
+    """Write a list of TileCoordinates as NDJSON to ``path``.
+
+    Format matches the schema that ``TileCoordinateParser`` (Java) reads
+    from ``tile_grid.tiles_file``: one JSON object per line with the
+    full TileCoordinate fields (bbox, row, col, out_row, out_col, lineage).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for t in tiles:
+            f.write(t.model_dump_json())
+            f.write("\n")
